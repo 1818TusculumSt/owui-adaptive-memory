@@ -9,9 +9,10 @@ import asyncio
 import pytz
 import difflib
 from difflib import SequenceMatcher
-import random
 import time
 import os  # Added for local embedding model discovery
+import hashlib  # For message de-duplication
+import random  # For jitter in background task loops
 
 # ----------------------------
 # Metrics & Monitoring Imports
@@ -112,6 +113,10 @@ class Filter:
     _memory_embeddings = {}
     _relevance_cache = {}
 
+    # Class-level locks for message deduplication (shared across all instances)
+    _message_locks = {}  # Dict of message_hash -> asyncio.Lock
+    _locks_lock = asyncio.Lock()  # Lock to protect the _message_locks dict itself
+
     @property
     def _local_embedding_model(self): # RENAMED from embedding_model
         if self._embedding_model is None:
@@ -128,15 +133,13 @@ class Filter:
 
     @property
     def memory_embeddings(self):
-        if not hasattr(self, "_memory_embeddings") or self._memory_embeddings is None:
-            self._memory_embeddings = {}
-        return self._memory_embeddings
+        """Return the class-level shared embedding cache"""
+        return Filter._memory_embeddings
 
     @property
     def relevance_cache(self):
-        if not hasattr(self, "_relevance_cache") or self._relevance_cache is None:
-            self._relevance_cache = {}
-        return self._relevance_cache
+        """Return the class-level shared relevance cache"""
+        return Filter._relevance_cache
 
     class Valves(BaseModel):
         """Configuration valves for the filter"""
@@ -754,6 +757,11 @@ Your output must be valid JSON only. No additional text.""",
 
     def __init__(self):
         """Initialize filter and schedule background tasks"""
+        # Log instance creation for debugging multiple execution issue
+        import uuid
+        self._instance_id = str(uuid.uuid4())[:8]
+        logger.info(f"Filter instance {self._instance_id} initializing (PID: {os.getpid()})")
+
         # Force re-initialization of valves using the current class definition
         default_valves_instance = self.Valves() # Create instance to access defaults easily
         self.config: Dict[str, Any] = {}
@@ -856,11 +864,8 @@ Your output must be valid JSON only. No additional text.""",
         # Initialize MiniLM embedding model (singleton)
         # self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2") # Removed: Property handles lazy init
 
-        # In-memory store: memory_id -> embedding vector (np.array)
-        self._memory_embeddings = {}
-
-        # In-memory cache: (hash of user_emb + mem_emb) -> (score, timestamp)
-        self._relevance_cache = {}
+        # NOTE: _memory_embeddings and _relevance_cache are class-level shared caches
+        # accessed via properties. No instance-level initialization needed.
 
         # Error counter tracking for guard mechanism (Point 8)
         from collections import deque
@@ -927,7 +932,7 @@ Your output must be valid JSON only. No additional text.""",
 
         # --- Embedding Clustering --- (Only if strategy is 'embeddings' or 'hybrid')
         embedding_clusters = []
-        if strategy in ["embeddings", "hybrid"] and self._local_embedding_model:
+        if strategy in ["embeddings", "hybrid"]:
             logger.debug(f"Clustering eligible memories using embeddings (threshold: {threshold})...")
             # Ensure all eligible memories have embeddings
             for mem in eligible_memories:
@@ -975,6 +980,35 @@ Your output must be valid JSON only. No additional text.""",
                          
                     # Calculate similarity
                     try:
+                        # Check for dimension mismatch before dot product
+                        if current_emb.shape[0] != other_emb.shape[0]:
+                            logger.warning(
+                                f"Dimension mismatch for memories {current_id} ({current_emb.shape[0]}) and {other_id} ({other_emb.shape[0]})"
+                            )
+
+                            # Re-embed the memory with smaller dimension (likely the old one)
+                            if other_emb.shape[0] < current_emb.shape[0]:
+                                # Re-embed other_mem to match current_emb dimension
+                                other_text = other_mem.get("memory", "")
+                                if other_text:
+                                    new_emb = await self._re_embed_memory_if_needed(
+                                        other_id, other_text, other_emb.shape[0], current_emb.shape[0]
+                                    )
+                                    if new_emb is not None:
+                                        other_emb = new_emb  # Use re-embedded version
+                                        self.memory_embeddings[other_id] = new_emb
+                                    else:
+                                        remaining_after_pop.append(other_mem)
+                                        continue
+                                else:
+                                    remaining_after_pop.append(other_mem)
+                                    continue
+                            else:
+                                # Current memory has smaller dimension, skip clustering for now
+                                # (current memory will be re-embedded when accessed later)
+                                remaining_after_pop.append(other_mem)
+                                continue
+
                         similarity = float(np.dot(current_emb, other_emb))
                         if similarity >= threshold:
                             cluster.append(other_mem)
@@ -1421,11 +1455,37 @@ Your output must be valid JSON only. No additional text.""",
             return body
         user_id = __user__["id"]
 
+        # --- Extract Message for De-duplication ---
+        # Extract message content BEFORE doing any heavy processing
+        final_message = None
+        if body.get("stream") is False and body.get("messages"):
+            final_message = body["messages"][-1].get("content")
+        elif body.get("stream") is True and body.get("done", False):
+            final_message = body.get("message", {}).get("content")
+        if final_message is None and body.get("messages"):
+            final_message = body["messages"][-1].get("content")
+
+        # --- MESSAGE DE-DUPLICATION - ACQUIRE LOCK IMMEDIATELY ---
+        # Prevent multiple worker processes from processing the same message
+        # This MUST happen before any heavy processing (valve loading, background tasks, etc.)
+        message_hash = None
+        if final_message:
+            message_hash = self._create_message_hash(user_id, final_message)
+
+            if not await self._try_acquire_message_lock(message_hash):
+                logger.info(
+                    f"Inlet: Message {message_hash[:8]}... already being processed by another instance, "
+                    f"skipping duplicate inlet execution"
+                )
+                return body  # Early return - another instance is handling this
+
+            logger.info(f"Inlet: Acquired lock for message {message_hash[:8]}..., proceeding with processing")
+
         # --- Initialization & Valve Loading ---
         # Load valves early, handle potential errors
         try:
-            # Reload global valves if OWUI injected config exists; otherwise keep defaults
-            self.valves = self.Valves(**getattr(self, "config", {}).get("valves", {}))
+            # NOTE: Do NOT reload self.valves here! Open WebUI sets it directly with user configuration.
+            # Reloading from self.config (which is empty) would overwrite user settings with defaults.
 
             # Load user-specific valves (may override some per-user settings)
             user_valves = self._get_user_valves(__user__)
@@ -1465,21 +1525,6 @@ Your output must be valid JSON only. No additional text.""",
             logger.warning("LLM feature guard active. Skipping LLM-dependent memory operations.")
         if self._embedding_feature_guard_active:
             logger.warning("Embedding feature guard active. Skipping embedding-dependent memory operations.")
-
-
-        # --- Process Incoming Message ---
-        final_message = None
-        # 1) Explicit stream=False (non-streaming completion requests)
-        if body.get("stream") is False and body.get("messages"):
-            final_message = body["messages"][-1].get("content")
-
-        # 2) Streaming mode – grab final message when "done" flag arrives
-        elif body.get("stream") is True and body.get("done", False):
-            final_message = body.get("message", {}).get("content")
-
-        # 3) Fallback – many WebUI front-ends don't set a "stream" key at all.
-        if final_message is None and body.get("messages"):
-            final_message = body["messages"][-1].get("content")
 
         # --- Command Handling ---
         # Check if the final message is a command before processing memories
@@ -1631,6 +1676,11 @@ Your output must be valid JSON only. No additional text.""",
                     {"type": "error", "content": "Error retrieving relevant memories."},
                 )
 
+        # Release the message lock before returning
+        if message_hash:
+            self._release_message_lock(message_hash)
+            logger.debug(f"Inlet: Released lock for message {message_hash[:8]}... before returning")
+
         return body
 
     async def outlet(
@@ -1642,8 +1692,9 @@ Your output must be valid JSON only. No additional text.""",
         """Process LLM response, extract memories, and update the response"""
         # logger.debug("****** OUTLET FUNCTION CALLED ******") # REMOVED
 
-        # Log function entry
-        logger.debug("Outlet called - making deep copy of body dictionary")
+        # Log function entry with user info for debugging 5x execution issue
+        debug_user_id = __user__.get("id") if __user__ else "NO_USER"
+        logger.info(f"Outlet called for user_id: {debug_user_id}")
 
         # DEFENSIVE: Make a deep copy of the body to avoid dictionary changed size during iteration
         # This was a source of many subtle bugs
@@ -1660,59 +1711,84 @@ Your output must be valid JSON only. No additional text.""",
             logger.warning("User object contains no ID - skipping memory processing")
             return body_copy
 
+        # --- Extract Message for De-duplication ---
+        # Extract message content BEFORE doing any heavy processing
+        last_user_message_content = None
+        messages_copy = copy.deepcopy(body_copy.get("messages", []))
+        if messages_copy:
+            # Find the actual last user message in the history included in the body
+            for msg in reversed(messages_copy):
+                if msg.get("role") == "user" and msg.get("content"):
+                    last_user_message_content = msg.get("content")
+                    break
+
+        # --- MESSAGE DE-DUPLICATION - ACQUIRE LOCK IMMEDIATELY ---
+        # Prevent multiple worker processes from processing the same message
+        # This MUST happen before any heavy processing (valve loading, background tasks, etc.)
+        message_hash = None
+        if last_user_message_content:
+            message_hash = self._create_message_hash(user_id, last_user_message_content)
+
+            if not await self._try_acquire_message_lock(message_hash):
+                logger.info(
+                    f"Outlet: Message {message_hash[:8]}... already being processed by another instance, "
+                    f"skipping duplicate outlet execution"
+                )
+                return body_copy  # Early return - another instance is handling this
+
+            logger.info(f"Outlet: Acquired lock for message {message_hash[:8]}..., proceeding with processing")
+
         # Check if user has enabled memory function
         user_valves = self._get_user_valves(__user__)
         if not user_valves.enabled:
             logger.info(f"Memory function is disabled for user {user_id}")
+            # Release lock before returning
+            if message_hash:
+                self._release_message_lock(message_hash)
             return body_copy
 
         # Get user's timezone if set
         user_timezone = user_valves.timezone or self.valves.timezone
 
-        # --- BEGIN MEMORY PROCESSING IN OUTLET --- 
+        # --- BEGIN MEMORY PROCESSING IN OUTLET ---
         # Process the *last user message* for memory extraction *after* the LLM response
-        last_user_message_content = None
         message_history_for_context = []
-        try:
-            messages_copy = copy.deepcopy(body_copy.get("messages", []))
-            if messages_copy:
-                 # Find the actual last user message in the history included in the body
-                 for msg in reversed(messages_copy):
-                     if msg.get("role") == "user" and msg.get("content"):
-                         last_user_message_content = msg.get("content")
-                         break
-                 # Get up to N messages *before* the last user message for context
-                 if last_user_message_content:
-                     user_msg_index = -1
-                     for i, msg in enumerate(messages_copy):
-                         if msg.get("role") == "user" and msg.get("content") == last_user_message_content:
-                             user_msg_index = i
-                             break
-                     if user_msg_index != -1:
-                         start_index = max(0, user_msg_index - self.valves.recent_messages_n)
-                         message_history_for_context = messages_copy[start_index:user_msg_index]
 
+        try:
+            # Get up to N messages *before* the last user message for context
             if last_user_message_content:
-                 logger.info(f"Starting memory processing in outlet for user message: {last_user_message_content[:60]}...")
-                 # Use asyncio.create_task for non-blocking processing
-                 # Reload valves inside _process_user_memories ensures latest config
-                 memory_task = asyncio.create_task(
-                     self._process_user_memories(
-                         user_message=last_user_message_content,
-                         user_id=user_id,
-                         event_emitter=__event_emitter__,
-                         show_status=user_valves.show_status, # Still show status if user wants
-                         user_timezone=user_timezone,
-                         recent_chat_history=message_history_for_context,
-                     )
-                 )
-                 # Optional: Add callback or handle task completion if needed, but allow it to run in background
-                 # memory_task.add_done_callback(lambda t: logger.info(f"Outlet memory task finished: {t.result()}"))
+                user_msg_index = -1
+                for i, msg in enumerate(messages_copy):
+                    if msg.get("role") == "user" and msg.get("content") == last_user_message_content:
+                        user_msg_index = i
+                        break
+                if user_msg_index != -1:
+                    start_index = max(0, user_msg_index - self.valves.recent_messages_n)
+                    message_history_for_context = messages_copy[start_index:user_msg_index]
+
+                logger.info(f"Starting memory processing in outlet for user message: {last_user_message_content[:60]}...")
+                # Use asyncio.create_task for non-blocking processing
+                # Reload valves inside _process_user_memories ensures latest config
+                memory_task = asyncio.create_task(
+                    self._process_user_memories(
+                        user_message=last_user_message_content,
+                        user_id=user_id,
+                        event_emitter=__event_emitter__,
+                        show_status=user_valves.show_status, # Still show status if user wants
+                        user_timezone=user_timezone,
+                        recent_chat_history=message_history_for_context,
+                    )
+                )
+                # Optional: Add callback or handle task completion if needed, but allow it to run in background
+                # memory_task.add_done_callback(lambda t: logger.info(f"Outlet memory task finished: {t.result()}"))
             else:
                  logger.warning("Could not find last user message in outlet body to process for memories.")
 
         except Exception as e:
             logger.error(f"Error initiating memory processing in outlet: {e}\n{traceback.format_exc()}")
+            # Release lock on error
+            if message_hash:
+                self._release_message_lock(message_hash)
         # --- END MEMORY PROCESSING IN OUTLET --- 
 
         # Process the response content for injecting memories
@@ -1740,6 +1816,11 @@ Your output must be valid JSON only. No additional text.""",
                 await self._add_confirmation_message(body_copy)
         except Exception as e:
             logger.error(f"Error adding confirmation message: {e}")
+
+        # Release the message lock before returning
+        if message_hash:
+            self._release_message_lock(message_hash)
+            logger.debug(f"Released lock for message {message_hash[:8]}... before returning")
 
         # Return the modified response
         return body_copy
@@ -1786,6 +1867,63 @@ Your output must be valid JSON only. No additional text.""",
                 f"Could not determine user valves settings from data {user_valves_data}: {e}"
             )
             return self.UserValves()  # Return default UserValves on error
+
+    def _create_message_hash(self, user_id: str, message_content: str) -> str:
+        """
+        Create a unique hash for a message to use as a de-duplication key.
+        Uses user_id + message_content + time bucket (5 second intervals) to allow
+        the same message to be processed again after a short delay.
+        """
+        # Round timestamp to 5-second buckets to allow reprocessing after a delay
+        time_bucket = int(time.time() / 5) * 5
+
+        # Create hash from user_id, message, and time bucket
+        hash_input = f"{user_id}:{message_content}:{time_bucket}"
+        return hashlib.sha256(hash_input.encode()).hexdigest()[:16]  # Use first 16 chars
+
+    async def _try_acquire_message_lock(self, message_hash: str) -> bool:
+        """
+        Try to acquire an exclusive lock for processing this message.
+        Returns True if lock was acquired, False if another instance is processing it.
+        Uses class-level asyncio locks shared across all Filter instances.
+        """
+        try:
+            # Protect access to the _message_locks dict itself
+            async with self._locks_lock:
+                # Get or create a lock for this specific message
+                if message_hash not in self._message_locks:
+                    self._message_locks[message_hash] = asyncio.Lock()
+                message_lock = self._message_locks[message_hash]
+
+            # Try to acquire the lock atomically using acquire() with immediate check
+            # This prevents race condition where multiple instances check locked() before any acquires
+            await asyncio.wait_for(
+                message_lock.acquire(),
+                timeout=0.001  # 1ms timeout - effectively non-blocking
+            )
+            # If we reach here, lock was successfully acquired
+            logger.debug(f"Acquired lock for message {message_hash[:8]}...")
+            return True
+
+        except asyncio.TimeoutError:
+            # Lock is held by another instance
+            logger.debug(f"Message {message_hash[:8]}... is being processed by another instance (timeout)")
+            return False
+        except Exception as e:
+            logger.error(f"Error acquiring message lock: {e}")
+            # On error, allow processing to continue (fail-open)
+            return True
+
+    def _release_message_lock(self, message_hash: str) -> None:
+        """Release the lock for a message after processing is complete."""
+        try:
+            if message_hash in self._message_locks:
+                lock = self._message_locks[message_hash]
+                if lock.locked():
+                    lock.release()
+                    logger.debug(f"Released lock for message {message_hash[:8]}...")
+        except Exception as e:
+            logger.warning(f"Error releasing message lock: {e}")
 
     async def _get_formatted_memories(self, user_id: str) -> List[Dict[str, Any]]:
         """Get all memories for a user and format them for processing"""
@@ -1936,17 +2074,10 @@ Your output must be valid JSON only. No additional text.""",
         Returns:
             List of stored memory operations
         """
-        # --- ADD LOGGING TO INSPECT self.config ---
-        config_content = getattr(self, "config", "<Not Set>")
-        logger.info(f"Inspecting self.config at start of _process_user_memories: {config_content}")
-        # --- END LOGGING --- 
-
         # Start timer
         start_time = time.perf_counter()
 
-        # Reset stored memories and error message
-        # This variable held identified memories, not saved ones. We'll get saved count from process_memories return.
-        # self.stored_memories = [] # Remove or repurpose if needed elsewhere, currently unused after this point.
+        # Reset error message
         self._error_message = None
 
         # Emit "processing memories" status if enabled
@@ -2333,8 +2464,33 @@ Your output must be valid JSON only. No additional text.""",
                                         mem_emb = None # Mark as failed
                                 
                                 if mem_emb is not None:
-                                    sim_score = float(np.dot(user_embedding, mem_emb))
-                                    memories_with_relevance.append({"id": mem_id, "relevance": sim_score})
+                                    # Check for dimension mismatch before dot product
+                                    if user_embedding.shape[0] != mem_emb.shape[0]:
+                                        logger.warning(
+                                            f"Dimension mismatch in relevance scoring: user={user_embedding.shape[0]}, "
+                                            f"memory={mem_emb.shape[0]}. Attempting to re-embed memory."
+                                        )
+
+                                        # Try to re-embed the memory with current provider
+                                        mem_text = mem_data.get("memory", "")
+                                        if mem_text:
+                                            new_mem_emb = await self._re_embed_memory_if_needed(
+                                                mem_id, mem_text, mem_emb.shape[0], user_embedding.shape[0]
+                                            )
+                                            if new_mem_emb is not None:
+                                                # Successfully re-embedded, calculate relevance
+                                                sim_score = float(np.dot(user_embedding, new_mem_emb))
+                                                memories_with_relevance.append({"id": mem_id, "relevance": sim_score})
+                                            else:
+                                                # Re-embedding failed, assign low relevance
+                                                logger.warning(f"Re-embedding failed for memory {mem_id}, assigning low relevance")
+                                                memories_with_relevance.append({"id": mem_id, "relevance": 0.0})
+                                        else:
+                                            # No memory text to re-embed, assign low relevance
+                                            memories_with_relevance.append({"id": mem_id, "relevance": 0.0})
+                                    else:
+                                        sim_score = float(np.dot(user_embedding, mem_emb))
+                                        memories_with_relevance.append({"id": mem_id, "relevance": sim_score})
                                 else:
                                     # Assign low relevance if embedding fails
                                     memories_with_relevance.append({"id": mem_id, "relevance": 0.0})
@@ -2958,7 +3114,15 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 logger.warning("Could not generate embeddings for similarity calculation. Falling back to text-based similarity.")
                 # Fallback to text-based on failure
                 return self._calculate_memory_similarity(memory1, memory2)
-            
+
+            # Check for dimension mismatch before dot product
+            if mem1_embedding.shape[0] != mem2_embedding.shape[0]:
+                logger.warning(
+                    f"Dimension mismatch in embedding similarity: mem1={mem1_embedding.shape[0]}, "
+                    f"mem2={mem2_embedding.shape[0]}. Falling back to text similarity."
+                )
+                return self._calculate_memory_similarity(memory1, memory2)
+
             # Calculate cosine similarity (dot product of normalized vectors)
             # _get_embedding should return normalized vectors
             similarity = float(np.dot(mem1_embedding, mem2_embedding))
@@ -3048,10 +3212,24 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
 
                     if mem_emb is not None:
                         try:
-                            # --- NEW: Dimension Check ---
+                            # --- NEW: Dimension Check with Re-embedding ---
                             if user_embedding_dim is not None and mem_emb.shape[0] != user_embedding_dim:
-                                logger.warning(f"Skipping similarity for memory {mem_id}: Dimension mismatch ({mem_emb.shape[0]} vs user {user_embedding_dim})")
-                                continue # Skip this memory
+                                logger.warning(f"Dimension mismatch for memory {mem_id}: {mem_emb.shape[0]} vs user {user_embedding_dim}")
+
+                                # Attempt to re-embed with current configured provider
+                                mem_text = mem.get("memory", "")
+                                if mem_text:
+                                    new_emb = await self._re_embed_memory_if_needed(
+                                        mem_id, mem_text, mem_emb.shape[0], user_embedding_dim
+                                    )
+                                    if new_emb is not None:
+                                        mem_emb = new_emb  # Use re-embedded version
+                                    else:
+                                        logger.warning(f"Re-embedding failed for memory {mem_id}, skipping")
+                                        continue # Skip this memory if re-embedding failed
+                                else:
+                                    logger.warning(f"Cannot re-embed memory {mem_id}: no memory text available")
+                                    continue # Skip this memory
 
                             # Cosine similarity (embeddings are normalized in _get_embedding)
                             sim = float(np.dot(user_embedding, mem_emb))
@@ -3418,9 +3596,36 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                         # On failure, mark duplicate check using text sim for this item
                                         existing_emb = None
                                 if existing_emb is not None:
-                                    similarity = float(np.dot(new_embedding, existing_emb))
-                                    similarity_score = similarity # Store score
-                                    similarity_method = 'embedding'
+                                    # Check for dimension mismatch before dot product
+                                    if new_embedding.shape[0] != existing_emb.shape[0]:
+                                        logger.warning(
+                                            f"Dimension mismatch during deduplication: new={new_embedding.shape[0]}, "
+                                            f"existing={existing_emb.shape[0]}. Attempting to re-embed existing memory."
+                                        )
+
+                                        # Try to re-embed the existing memory with current provider
+                                        new_existing_emb = await self._re_embed_memory_if_needed(
+                                            existing_id, existing_content, existing_emb.shape[0], new_embedding.shape[0]
+                                        )
+
+                                        if new_existing_emb is not None:
+                                            # Successfully re-embedded, use embedding similarity
+                                            existing_emb = new_existing_emb
+                                            similarity = float(np.dot(new_embedding, existing_emb))
+                                            similarity_score = similarity
+                                            similarity_method = 'embedding'
+                                        else:
+                                            # Re-embedding failed, fall back to text similarity
+                                            logger.warning(f"Re-embedding failed for existing memory {existing_id}, using text similarity")
+                                            similarity = self._calculate_memory_similarity(
+                                                formatted_content, existing_content
+                                            )
+                                            similarity_score = similarity
+                                            similarity_method = 'text_fallback'
+                                    else:
+                                        similarity = float(np.dot(new_embedding, existing_emb))
+                                        similarity_score = similarity # Store score
+                                        similarity_method = 'embedding'
                                 else:
                                     similarity = self._calculate_memory_similarity(
                                         formatted_content, existing_content
@@ -3541,7 +3746,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                             logger.debug(f"Generated and cached embedding for new memory ID: {mem_id}")
                     except Exception as e:
                         logger.warning(f"Failed to generate embedding for new memory: {e}")
-                            # Non-critical error, don't raise
+                        # Non-critical error, don't raise
 
             except Exception as e:
                 self.error_counters["memory_crud_errors"] += 1
@@ -3585,11 +3790,11 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 # Remove old embedding if ID changed
                                 if operation.id != new_mem_id and operation.id in self.memory_embeddings:
                                     del self.memory_embeddings[operation.id]
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to update embedding for memory ID {new_mem_id}: {e}"
-                                )
-                                # Non-critical error, don't raise
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to update embedding for memory ID {new_mem_id}: {e}"
+                            )
+                            # Non-critical error, don't raise
 
                 else:
                     logger.warning(f"Memory {operation.id} not found for UPDATE")
@@ -3973,11 +4178,11 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         # Close any open sessions
         if self._aiohttp_session and not self._aiohttp_session.closed:
             await self._aiohttp_session.close()
-            
-        # Clear memory caches to help with GC
-        self._memory_embeddings = {}
-        self._relevance_cache = {}
-        
+
+        # Clear shared class-level memory caches to help with GC
+        Filter._memory_embeddings.clear()
+        Filter._relevance_cache.clear()
+
         logger.info("Adaptive Memory Filter cleanup complete")
 
     def _convert_dict_to_memory_operations(
@@ -4241,18 +4446,16 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         return None
 
     async def _get_embedding(self, text: str) -> Optional[np.array]:
-        """Unified embedding getter with metrics and retries"""
-        provider = self.valves.embedding_provider_type
-        EMBEDDING_REQUESTS.labels(provider).inc()
-        _embed_start = time.perf_counter()
-        """Primary function to get embedding, uses local or API based on valves."""
-        provider_type = self.valves.embedding_provider_type
-        
+        """Get embedding using configured provider (local or API) with metrics and retries."""
         if not text:
             logger.debug("Skipping embedding for empty text.")
             return None
 
-        start_time = time.time()
+        # Metrics instrumentation
+        provider_type = self.valves.embedding_provider_type
+        EMBEDDING_REQUESTS.labels(provider_type).inc()
+        start_time = time.perf_counter()
+
         embedding_vector = None
         try:
             if provider_type == "local":
@@ -4302,11 +4505,46 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 logger.warning("Generated embedding vector has near-zero norm. Cannot normalize.")
             
             logger.debug(f"Generated embedding via {provider_type} in {end_time - start_time:.3f}s, dim: {embedding_vector.shape}")
-            EMBEDDING_LATENCY.labels(provider).observe(time.perf_counter() - _embed_start)
+            EMBEDDING_LATENCY.labels(provider_type).observe(time.perf_counter() - start_time)
             return embedding_vector
         else:
             logger.warning(f"Failed to generate embedding via {provider_type} in {end_time - start_time:.3f}s")
-            EMBEDDING_ERRORS.labels(provider).inc()
-            EMBEDDING_LATENCY.labels(provider).observe(time.perf_counter() - _embed_start)
+            EMBEDDING_ERRORS.labels(provider_type).inc()
+            EMBEDDING_LATENCY.labels(provider_type).observe(time.perf_counter() - start_time)
             return None
+
+    async def _re_embed_memory_if_needed(self, memory_id: str, memory_text: str, current_dim: int, expected_dim: int) -> Optional[np.array]:
+        """
+        Re-embed a memory with dimension mismatch using the current configured provider.
+        Returns the new embedding or None if re-embedding fails.
+        """
+        try:
+            logger.info(
+                f"Re-embedding memory {memory_id} due to dimension mismatch "
+                f"(old: {current_dim}, expected: {expected_dim})"
+            )
+
+            # Get new embedding using current configured provider
+            new_embedding = await self._get_embedding(memory_text)
+
+            if new_embedding is not None and new_embedding.shape[0] == expected_dim:
+                # Update cache with new embedding
+                self.memory_embeddings[memory_id] = new_embedding
+                logger.info(
+                    f"Successfully re-embedded memory {memory_id} with new dimension: {new_embedding.shape[0]}"
+                )
+                return new_embedding
+            elif new_embedding is not None:
+                logger.warning(
+                    f"Re-embedding produced unexpected dimension {new_embedding.shape[0]}, expected {expected_dim}"
+                )
+                return None
+            else:
+                logger.warning(f"Failed to re-embed memory {memory_id}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error re-embedding memory {memory_id}: {e}\n{traceback.format_exc()}")
+            return None
+
     # --- END NEW Embedding Functions ---
