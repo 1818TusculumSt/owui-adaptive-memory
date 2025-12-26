@@ -936,8 +936,9 @@ Your output must be valid JSON only. No additional text.""",
                     try:
                         mem_text = mem.get("memory", "")
                         if mem_text:
-                            mem_emb = self._local_embedding_model.encode(mem_text, normalize_embeddings=True)
-                            self.memory_embeddings[mem_id] = mem_emb
+                            mem_emb = await self._get_embedding(mem_text)
+                            if mem_emb is not None:
+                                self.memory_embeddings[mem_id] = mem_emb
                         else:
                              # Mark as None if no text to prevent repeated attempts
                              self.memory_embeddings[mem_id] = None
@@ -2304,11 +2305,10 @@ Your output must be valid JSON only. No additional text.""",
                         # Re-use logic similar to get_relevant_memories but for *all* memories
                         
                         user_embedding = None
-                        if self._local_embedding_model:
-                            try:
-                                user_embedding = self._local_embedding_model.encode(user_message, normalize_embeddings=True)
-                            except Exception as e:
-                                logger.warning(f"Could not encode user message for relevance pruning: {e}")
+                        try:
+                            user_embedding = await self._get_embedding(user_message)
+                        except Exception as e:
+                            logger.warning(f"Could not encode user message for relevance pruning: {e}")
 
                         # Determine if we can use vectors or need LLM fallback (respecting valve)
                         can_use_vectors = user_embedding is not None
@@ -2321,12 +2321,13 @@ Your output must be valid JSON only. No additional text.""",
                                 mem_id = mem_data.get("id")
                                 mem_emb = self.memory_embeddings.get(mem_id)
                                 # Ensure embedding exists or try to compute it
-                                if mem_emb is None and self._local_embedding_model is not None:
+                                if mem_emb is None:
                                     try:
                                         mem_text = mem_data.get("memory") or ""
                                         if mem_text:
-                                            mem_emb = self._local_embedding_model.encode(mem_text, normalize_embeddings=True)
-                                            self.memory_embeddings[mem_id] = mem_emb # Cache it
+                                            mem_emb = await self._get_embedding(mem_text)
+                                            if mem_emb is not None:
+                                                self.memory_embeddings[mem_id] = mem_emb # Cache it
                                     except Exception as e:
                                         logger.warning(f"Failed to compute embedding for existing memory {mem_id}: {e}")
                                         mem_emb = None # Mark as failed
@@ -3032,13 +3033,14 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                     # Ensure embedding exists in our cache for this memory
                     mem_emb = self.memory_embeddings.get(mem_id)
                     # Lazily compute and cache the memory embedding if not present
-                    if mem_emb is None and self._local_embedding_model is not None:
+                    if mem_emb is None:
                         try:
                             mem_text = mem.get("memory") or ""
                             if mem_text:
                                 mem_emb = await self._get_embedding(mem_text)
                                 # Cache for future similarity checks
-                                self.memory_embeddings[mem_id] = mem_emb
+                                if mem_emb is not None:
+                                    self.memory_embeddings[mem_id] = mem_emb
                         except Exception as e:
                             logger.warning(
                                 f"Error computing embedding for memory {mem_id}: {e}"
@@ -3390,11 +3392,11 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         if use_embeddings:
                             # Precompute embedding for the new memory once
                             try:
-                                if self._local_embedding_model is None:
-                                    raise ValueError("Embedding model not available")
-                                new_embedding = self._local_embedding_model.encode(
-                                    formatted_content.lower().strip(), normalize_embeddings=True
+                                new_embedding = await self._get_embedding(
+                                    formatted_content.lower().strip()
                                 )
+                                if new_embedding is None:
+                                    raise ValueError("Failed to generate embedding")
                             except Exception as e:
                                 logger.warning(f"Failed to encode new memory for deduplication; falling back to text sim. Error: {e}")
                                 use_embeddings = False  # fall back
@@ -3405,12 +3407,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 existing_mem_dict = existing_memories[existing_idx]
                                 existing_id = existing_mem_dict.get("id")
                                 existing_emb = self.memory_embeddings.get(existing_id)
-                                if existing_emb is None and self._local_embedding_model is not None:
+                                if existing_emb is None:
                                     try:
-                                        existing_emb = self._local_embedding_model.encode(
-                                            existing_content.lower().strip(), normalize_embeddings=True
+                                        existing_emb = await self._get_embedding(
+                                            existing_content.lower().strip()
                                         )
-                                        self.memory_embeddings[existing_id] = existing_emb
+                                        if existing_emb is not None:
+                                            self.memory_embeddings[existing_id] = existing_emb
                                     except Exception:
                                         # On failure, mark duplicate check using text sim for this item
                                         existing_emb = None
@@ -3525,21 +3528,19 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
 
                 # Generate and cache embedding for new memory if embedding model is available
                 # This helps with future deduplication checks when using embedding-based similarity
-                if self._local_embedding_model is not None:
-                    # Handle both Pydantic model and dict response forms
-                    mem_id = getattr(result, "id", None)
-                    if mem_id is None and isinstance(result, dict):
-                        mem_id = result.get("id")
-                    if mem_id is not None:
-                        try:
-                            memory_clean = re.sub(r"\[Tags:.*?\]\s*", "", formatted_content).lower().strip()
-                            memory_embedding = self._local_embedding_model.encode(
-                                memory_clean, normalize_embeddings=True
-                            )
+                # Handle both Pydantic model and dict response forms
+                mem_id = getattr(result, "id", None)
+                if mem_id is None and isinstance(result, dict):
+                    mem_id = result.get("id")
+                if mem_id is not None:
+                    try:
+                        memory_clean = re.sub(r"\[Tags:.*?\]\s*", "", formatted_content).lower().strip()
+                        memory_embedding = await self._get_embedding(memory_clean)
+                        if memory_embedding is not None:
                             self.memory_embeddings[mem_id] = memory_embedding
                             logger.debug(f"Generated and cached embedding for new memory ID: {mem_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to generate embedding for new memory: {e}")
+                    except Exception as e:
+                        logger.warning(f"Failed to generate embedding for new memory: {e}")
                             # Non-critical error, don't raise
 
             except Exception as e:
@@ -3565,19 +3566,17 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     )
 
                     # Update embedding for modified memory
-                    if self._local_embedding_model is not None:
-                        # Handle both Pydantic model and dict response forms
-                        new_mem_id = getattr(result, "id", None)
-                        if new_mem_id is None and isinstance(result, dict):
-                            new_mem_id = result.get("id")
+                    # Handle both Pydantic model and dict response forms
+                    new_mem_id = getattr(result, "id", None)
+                    if new_mem_id is None and isinstance(result, dict):
+                        new_mem_id = result.get("id")
 
-                        if new_mem_id is not None:
-                            try:
-                                memory_clean = re.sub(r"\[Tags:.*?\]\s*", "", formatted_content).lower().strip()
-                                memory_embedding = self._local_embedding_model.encode(
-                                    memory_clean, normalize_embeddings=True
-                                )
-                                # Store with the new ID from the result
+                    if new_mem_id is not None:
+                        try:
+                            memory_clean = re.sub(r"\[Tags:.*?\]\s*", "", formatted_content).lower().strip()
+                            memory_embedding = await self._get_embedding(memory_clean)
+                            # Store with the new ID from the result
+                            if memory_embedding is not None:
                                 self.memory_embeddings[new_mem_id] = memory_embedding
                                 logger.debug(
                                     f"Updated embedding for memory ID: {new_mem_id} (was: {operation.id})"
