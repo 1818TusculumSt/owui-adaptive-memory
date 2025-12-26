@@ -1909,6 +1909,9 @@ Your output must be valid JSON only. No additional text.""",
     async def _get_formatted_memories(self, user_id: str) -> List[Dict[str, Any]]:
         """Get all memories for a user and format them for processing"""
         memories_list = []
+        embeddings_loaded = 0
+        embeddings_missing = 0
+
         try:
             # Get memories using Memories.get_memories_by_user_id
             user_memories = Memories.get_memories_by_user_id(user_id=str(user_id))
@@ -1921,6 +1924,38 @@ Your output must be valid JSON only. No additional text.""",
                     created_at = getattr(memory, "created_at", None)
                     updated_at = getattr(memory, "updated_at", None)
 
+                    # Load embedding from database if available
+                    embedding_data = getattr(memory, "embedding", None)
+                    if embedding_data is not None:
+                        try:
+                            # Convert embedding to numpy array if it's a list/string
+                            if isinstance(embedding_data, str):
+                                # Deserialize JSON string
+                                embedding_array = np.array(json.loads(embedding_data), dtype=np.float32)
+                            elif isinstance(embedding_data, (list, tuple)):
+                                # Already a list, convert to numpy
+                                embedding_array = np.array(embedding_data, dtype=np.float32)
+                            elif isinstance(embedding_data, np.ndarray):
+                                # Already numpy array
+                                embedding_array = embedding_data.astype(np.float32)
+                            else:
+                                # Unknown format, skip
+                                logger.warning(f"Unknown embedding format for memory {memory_id}: {type(embedding_data)}")
+                                embedding_array = None
+
+                            if embedding_array is not None and len(embedding_array) > 0:
+                                # Cache the embedding
+                                self.memory_embeddings[memory_id] = embedding_array
+                                embeddings_loaded += 1
+                                logger.debug(f"Loaded embedding from DB for memory {memory_id}, dim: {len(embedding_array)}")
+                            else:
+                                embeddings_missing += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to deserialize embedding for memory {memory_id}: {e}")
+                            embeddings_missing += 1
+                    else:
+                        embeddings_missing += 1
+
                     memories_list.append(
                         {
                             "id": memory_id,
@@ -1930,7 +1965,10 @@ Your output must be valid JSON only. No additional text.""",
                         }
                     )
 
-            logger.debug(f"Retrieved {len(memories_list)} memories for user {user_id}")
+            logger.info(
+                f"Retrieved {len(memories_list)} memories for user {user_id} "
+                f"(embeddings: {embeddings_loaded} loaded, {embeddings_missing} missing)"
+            )
             return memories_list
 
         except Exception as e:
