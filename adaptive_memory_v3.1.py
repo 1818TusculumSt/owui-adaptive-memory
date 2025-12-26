@@ -1789,26 +1789,7 @@ Your output must be valid JSON only. No additional text.""",
             # Release lock on error
             if message_hash:
                 self._release_message_lock(message_hash)
-        # --- END MEMORY PROCESSING IN OUTLET --- 
-
-        # Process the response content for injecting memories
-        try:
-            # Get relevant memories for context injection on next interaction
-            memories = await self.get_relevant_memories(
-                current_message=last_user_message_content or "", # Use the variable holding the user message
-                user_id=user_id,
-                user_timezone=user_timezone,
-            )
-
-            # If we found relevant memories and the user wants to see them
-            if memories and self.valves.show_memories:
-                # Inject memories into the context for the next interaction
-                self._inject_memories_into_context(body_copy, memories)
-                logger.debug(f"Injected {len(memories)} memories into context")
-        except Exception as e:
-            logger.error(
-                f"Error processing memories for context: {e}\n{traceback.format_exc()}"
-            )
+        # --- END MEMORY PROCESSING IN OUTLET ---
 
         # Add confirmation message if memories were processed
         try:
