@@ -758,125 +758,136 @@ Your output must be valid JSON only. No additional text.""",
 
     def __init__(self):
         """Initialize filter and schedule background tasks"""
-        # Log instance creation for debugging multiple execution issue
-        import uuid
-        self._instance_id = str(uuid.uuid4())[:8]
-        logger.info(f"Filter instance {self._instance_id} initializing (PID: {os.getpid()})")
-
-        # Force re-initialization of valves using the current class definition
-        default_valves_instance = self.Valves() # Create instance to access defaults easily
-        self.config: Dict[str, Any] = {}
-
-        # --- Attempt to load valves from config during init ---
-        loaded_config_valves_dict = {}
         try:
-            # Check if config attribute exists and has valves
-            if hasattr(self, "config") and isinstance(self.config, dict) and "valves" in self.config and isinstance(self.config["valves"], dict):
-                 loaded_config_valves_dict = self.config["valves"]
-                 logger.info("Found 'valves' key in self.config during __init__.")
-            else:
-                 logger.info("self.config did not exist or lacked a 'valves' key during __init__, will use Pydantic defaults.")
+            # Log instance creation for debugging multiple execution issue
+            import uuid
+            self._instance_id = str(uuid.uuid4())[:8]
+            logger.info(f"Filter instance {self._instance_id} initializing (PID: {os.getpid()})")
+            
+            # Force re-initialization of valves using the current class definition
+            default_valves_instance = self.Valves() # Create instance to access defaults easily
+            self.config: Dict[str, Any] = {}
 
-            # Initialize self.valves using loaded config OR defaults if load failed/missing
-            # Pydantic will automatically use defaults for missing keys in loaded_config_valves_dict
-            self.valves = self.Valves(**loaded_config_valves_dict)
-            logger.info("Successfully initialized self.valves using loaded config and/or Pydantic defaults.")
+            # --- Attempt to load valves from config during init ---
+            loaded_config_valves_dict = {}
+            try:
+                # Check if config attribute exists and has valves
+                if hasattr(self, "config") and isinstance(self.config, dict) and "valves" in self.config and isinstance(self.config["valves"], dict):
+                    loaded_config_valves_dict = self.config["valves"]
+                    logger.info("Found 'valves' key in self.config during __init__.")
+                else:
+                    logger.info("self.config did not exist or lacked a 'valves' key during __init__, will use Pydantic defaults.")
 
-            # --- Explicit Check for allowed_memory_banks Post-Initialization ---
-            # Re-validate allowed_memory_banks specifically, as it seems prone to loading issues
-            if not isinstance(self.valves.allowed_memory_banks, list) or not self.valves.allowed_memory_banks or self.valves.allowed_memory_banks == ['']:
-                 logger.warning(f"Post-init check found invalid allowed_memory_banks: {self.valves.allowed_memory_banks}. Resetting to default.")
-                 self.valves.allowed_memory_banks = default_valves_instance.allowed_memory_banks # Use default from instance
+                # Initialize self.valves using loaded config OR defaults if load failed/missing
+                # Pydantic will automatically use defaults for missing keys in loaded_config_valves_dict
+                self.valves = self.Valves(**loaded_config_valves_dict)
+                logger.info("Successfully initialized self.valves using loaded config and/or Pydantic defaults.")
 
+                # --- Explicit Check for allowed_memory_banks Post-Initialization ---
+                # Re-validate allowed_memory_banks specifically, as it seems prone to loading issues
+                if not isinstance(self.valves.allowed_memory_banks, list) or not self.valves.allowed_memory_banks or self.valves.allowed_memory_banks == ['']:
+                    logger.warning(f"Post-init check found invalid allowed_memory_banks: {self.valves.allowed_memory_banks}. Resetting to default.")
+                    self.valves.allowed_memory_banks = default_valves_instance.allowed_memory_banks # Use default from instance
+
+            except Exception as e:
+                logger.error(f"Error initializing/loading valves from self.config during __init__ (using defaults): {e}\n{traceback.format_exc()}")
+                # Ensure self.valves is still a valid Valves instance using defaults on error
+                self.valves = default_valves_instance
+            # --- End valve loading attempt ---
+
+            self.stored_memories = None
+            self._error_message = None # Stores the reason for the last failure (e.g., json_parse_error)
+            self._aiohttp_session = None
+
+            # --- Added initialisations to prevent AttributeError ---
+            # Track already-processed user messages to avoid duplicate extraction
+            self._processed_messages: Set[str] = set()
+            # Simple metrics counter dictionary
+            self.metrics: Dict[str, int] = {"llm_call_count": 0}
+            # Hold last processed body for confirmation tagging
+            self._last_body: Dict[str, Any] = {}
+
+            # Background tasks tracking
+            self._background_tasks = set()
+
+            # Error counters
+            self.error_counters = {
+                "embedding_errors": 0,
+                "llm_call_errors": 0,
+                "json_parse_errors": 0,
+                "memory_crud_errors": 0,
+            }
+            
+            # Log configuration for deduplication, helpful for testing and validation
+            logger.debug(f"Memory deduplication settings:")
+            try:
+                logger.debug(f"  - deduplicate_memories: {self.valves.deduplicate_memories}")
+                logger.debug(f"  - use_embeddings_for_deduplication: {self.valves.use_embeddings_for_deduplication}")
+                logger.debug(f"  - similarity_threshold: {self.valves.similarity_threshold}")
+            except Exception as e:
+                logger.error(f"Error logging dedupe settings: {e}")
+
+            # Model discovery results
+            self.available_ollama_models = []
+            self.available_openai_models = []
+            # NEW: store locally available SentenceTransformer models
+            self.available_local_embedding_models = []
+
+            # Add current date awareness for prompts
+            self.current_date = datetime.now()
+            try:
+                self.date_info = self._update_date_info()
+            except Exception as e:
+                 logger.error(f"Error updating date info: {e}")
+                 self.date_info = {}
+
+            # Note: _memory_embeddings and _relevance_cache are properties, no init needed.
+
+            # Error counter tracking for guard mechanism
+            from collections import deque
+            self.error_timestamps = {
+                "json_parse_errors": deque(),
+                # Add other error types here if needed for guarding
+            }
+            self._guard_active = False
+            self._guard_activated_at = 0
+
+            # Initialize duplicate counters (used in process_memories)
+            self._duplicate_skipped = 0
+            self._duplicate_refreshed = 0
+
+            # ------------------------------------------------------------
+            # Guard/feature-flag initialisation
+            # ------------------------------------------------------------
+            self._llm_feature_guard_active: bool = False
+            self._embedding_feature_guard_active: bool = False
+
+            # Track that background tasks are not yet re-initialised via inlet()
+            self._background_tasks_started: bool = False
+
+            # Initialize background tasks immediately on startup
+            try:
+                self._initialize_background_tasks()
+            except Exception as e:
+                logger.error(f"Error in _initialize_background_tasks call: {e}")
+            
         except Exception as e:
-            logger.error(f"Error initializing/loading valves from self.config during __init__ (using defaults): {e}\n{traceback.format_exc()}")
-            # Ensure self.valves is still a valid Valves instance using defaults on error
-            self.valves = default_valves_instance
-        # --- End valve loading attempt ---
-
-        self.stored_memories = None
-        self._error_message = None # Stores the reason for the last failure (e.g., json_parse_error)
-        self._aiohttp_session = None
-
-        # --- Added initialisations to prevent AttributeError ---
-        # Track already-processed user messages to avoid duplicate extraction
-        self._processed_messages: Set[str] = set()
-        # Simple metrics counter dictionary
-        self.metrics: Dict[str, int] = {"llm_call_count": 0}
-        # Hold last processed body for confirmation tagging
-        self._last_body: Dict[str, Any] = {}
-
-        # Background tasks tracking
-        self._background_tasks = set()
-
-        # Error counters
-        self.error_counters = {
-            "embedding_errors": 0,
-            "llm_call_errors": 0,
-            "json_parse_errors": 0,
-            "memory_crud_errors": 0,
-        }
-        
-        # Log configuration for deduplication, helpful for testing and validation
-        logger.debug(f"Memory deduplication settings:")
-        logger.debug(f"  - deduplicate_memories: {self.valves.deduplicate_memories}")
-        logger.debug(f"  - use_embeddings_for_deduplication: {self.valves.use_embeddings_for_deduplication}")
-        logger.debug(f"  - similarity_threshold: {self.valves.similarity_threshold}")
-
-
-
-        # Model discovery results
-        self.available_ollama_models = []
-        self.available_openai_models = []
-        # NEW: store locally available SentenceTransformer models
-        self.available_local_embedding_models = []
-
-        # Add current date awareness for prompts
-        self.current_date = datetime.now()
-        self.date_info = self._update_date_info()
-
-
-
-        # Initialize MiniLM embedding model (singleton)
-        # self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2") # Removed: Property handles lazy init
-
-        # NOTE: _memory_embeddings and _relevance_cache are class-level shared caches
-        # accessed via properties. No instance-level initialization needed.
-
-        # Error counter tracking for guard mechanism (Point 8)
-        from collections import deque
-        self.error_timestamps = {
-            "json_parse_errors": deque(),
-            # Add other error types here if needed for guarding
-        }
-        self._guard_active = False
-        self._guard_activated_at = 0
-
-        # Initialize duplicate counters (used in process_memories)
-        self._duplicate_skipped = 0
-        self._duplicate_refreshed = 0
-
-        # ------------------------------------------------------------
-        # Guard/feature-flag initialisation (missing previously)
-        # These flags can be toggled elsewhere in the codebase to
-        # temporarily disable LLM-dependent or embedding-dependent
-        # functionality when error thresholds are exceeded.
-        # ------------------------------------------------------------
-        self._llm_feature_guard_active: bool = False
-        self._embedding_feature_guard_active: bool = False
-
-        # Track that background tasks are not yet re-initialised via inlet()
-        self._background_tasks_started: bool = False
+            logger.error(f"CRITICAL INIT FAILURE in Adaptive Memory: {e}\n{traceback.format_exc()}")
+            # Attempt to set safe defaults so basic chat *might* work even if memory fails
+            if not hasattr(self, 'valves'):
+                 self.valves = self.Valves()
 
     def _initialize_background_tasks(self):
         """Initialize background tasks if they are not already running."""
+        logger.info(f"Initializing background tasks. Summarization enabled: {self.valves.enable_summarization_task}")
+
         # Error logging task
         if self.valves.enable_error_logging_task:
             if not hasattr(self, "_error_log_task") or self._error_log_task is None or self._error_log_task.done():
                 self._error_log_task = asyncio.create_task(self._log_error_counters_loop())
                 self._background_tasks.add(self._error_log_task)
                 self._error_log_task.add_done_callback(self._background_tasks.discard)
-                logger.debug("Started error logging background task")
+                logger.info("Started error logging background task")
 
         # Summarization task
         if self.valves.enable_summarization_task:
@@ -886,19 +897,19 @@ Your output must be valid JSON only. No additional text.""",
                 )
                 self._background_tasks.add(self._summarization_task)
                 self._summarization_task.add_done_callback(self._background_tasks.discard)
-                logger.debug("Started memory summarization background task")
+                logger.info("Started memory summarization background task")
 
         # Date update task
         if self.valves.enable_date_update_task:
              if not hasattr(self, "_date_update_task") or self._date_update_task is None or (hasattr(self._date_update_task, 'done') and self._date_update_task.done()):
                 self._date_update_task = self._schedule_date_update()
-                logger.debug("Scheduled date update background task")
+                logger.info("Scheduled date update background task")
         
         # Model discovery task
         if self.valves.enable_model_discovery_task:
              if not hasattr(self, "_model_discovery_task") or self._model_discovery_task is None or (hasattr(self._model_discovery_task, 'done') and self._model_discovery_task.done()):
                 self._model_discovery_task = self._schedule_model_discovery()
-                logger.debug("Scheduled model discovery background task")
+                logger.info("Scheduled model discovery background task")
 
     async def _calculate_memory_age_days(self, memory: Dict[str, Any]) -> float:
         """Calculate age of a memory in days."""
@@ -1088,9 +1099,17 @@ Your output must be valid JSON only. No additional text.""",
         try:
             while True:
                 # Use configurable interval with small random jitter to prevent thundering herd
-                jitter = random.uniform(0.9, 1.1)  # ±10% randomization
-                interval = self.valves.summarization_interval * jitter
-                await asyncio.sleep(interval)
+                # Re-check interval every 5 seconds to allow responsive updates
+                jitter = random.uniform(0.9, 1.1)
+                
+                # Dynamic sleep loop
+                elapsed = 0
+                while elapsed < (self.valves.summarization_interval * jitter):
+                    await asyncio.sleep(5)
+                    elapsed += 5
+                    # If interval setting was drastically reduced, break early
+                    if elapsed > (self.valves.summarization_interval * jitter):
+                        break
                 logger.info("Starting periodic memory summarization run...")
                 
                 try:
@@ -4376,27 +4395,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         return operations
 
     # ------------------------------------------------------------------
-    # Helper: background task initialisation (called once from inlet())
-    # ------------------------------------------------------------------
-    def _initialize_background_tasks(self) -> None:
-        """(Idempotent) Ensure any background tasks that rely on the event
-        loop are started the first time `inlet` is executed.
 
-        Earlier versions attempted to call this but the helper did not
-        exist, causing an `AttributeError`.  The current implementation is
-        intentionally lightweight because most tasks are already started
-        inside `__init__` when the filter is instantiated by OpenWebUI.
-        The function therefore acts as a safety-net and can be extended in
-        future if additional runtime-initialised tasks are required.
-        """
-        # Nothing to do for now because __init__ has already created the
-        # background tasks.  Guard against multiple invocations.
-        if getattr(self, "_background_tasks_started", False):
-            return
-
-        # Placeholder for potential future dynamic tasks
-        logger.debug("_initialize_background_tasks called – no dynamic tasks to start.")
-        self._background_tasks_started = True
 
     # ------------------------------------------------------------------
     # Helper: Increment named error counter safely
@@ -4661,28 +4660,20 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
             
             if not os.path.exists(cache_file):
-                logger.info(f"DEBUG: Cache file does not exist: {cache_file}")
                 return None
             
             # Load cache
             with open(cache_file, 'r') as f:
                 cache = json.load(f)
             
-            # Log first 3 keys to see what's actually stored
-            cache_keys = list(cache.keys())[:3]
-            logger.info(f"DEBUG: Cache has {len(cache)} entries. First 3 keys: {cache_keys}, looking for: {memory_id}")
-            
             if memory_id in cache:
                 embedding_list = cache[memory_id]["embedding"]
                 embedding = np.array(embedding_list, dtype=np.float32)
-                logger.info(f"SUCCESS: Loaded embedding for memory {memory_id} from file cache (dim: {embedding.shape[0]})")
                 return embedding
             
-            logger.info(f"DEBUG: Memory {memory_id} not found in cache")
             return None
         except Exception as e:
             logger.warning(f"ERROR loading embedding from file cache for memory {memory_id}: {e}\n{traceback.format_exc()}")
             return None
 
     # --- END NEW Embedding Functions ---
-
