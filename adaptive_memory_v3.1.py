@@ -63,6 +63,7 @@ from open_webui.routers.memories import (
 )
 from open_webui.models.users import Users
 from open_webui.main import app as webui_app
+from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT  # For persistent embedding storage
 
 # Set up logging
 logger = logging.getLogger("openwebui.plugins.adaptive_memory")
@@ -3213,17 +3214,29 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 # Calculate vector similarities only if user embedding was successful
                 for mem in existing_memories:
                     mem_id = mem.get("id")
-                    # Ensure embedding exists in our cache for this memory
+                    # Check RAM cache first
                     mem_emb = self.memory_embeddings.get(mem_id)
-                    # Lazily compute and cache the memory embedding if not present
+                    
+                    # If not in RAM, try loading from database (NEW: eliminates re-embedding on restart)
+                    if mem_emb is None:
+                        mem_emb = await self._load_embedding_from_db(user_id, mem_id)
+                        if mem_emb is not None:
+                            # Cache in RAM for this session
+                            self.memory_embeddings[mem_id] = mem_emb
+                            logger.debug(f"Loaded embedding for memory {mem_id} from database")
+                    
+                    # Only re-embed if still not found (legacy memories without stored embeddings)
                     if mem_emb is None:
                         try:
                             mem_text = mem.get("memory") or ""
                             if mem_text:
                                 mem_emb = await self._get_embedding(mem_text)
-                                # Cache for future similarity checks
                                 if mem_emb is not None:
+                                    # Cache for future similarity checks
                                     self.memory_embeddings[mem_id] = mem_emb
+                                    # Store for future persistence
+                                    await self._store_embedding_in_db(user_id, mem_id, mem_text, mem_emb)
+                                    logger.info(f"Generated and stored embedding for legacy memory {mem_id}")
                         except Exception as e:
                             logger.warning(
                                 f"Error computing embedding for memory {mem_id}: {e}"
@@ -3761,8 +3774,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         memory_clean = re.sub(r"\[Tags:.*?\]\s*", "", formatted_content).lower().strip()
                         memory_embedding = await self._get_embedding(memory_clean)
                         if memory_embedding is not None:
+                            # Cache in RAM for immediate use
                             self.memory_embeddings[mem_id] = memory_embedding
-                            logger.debug(f"Generated and cached embedding for new memory ID: {mem_id}")
+                            
+                            # Store persistently in vector database
+                            await self._store_embedding_in_db(user.id, mem_id, memory_clean, memory_embedding)
+                            logger.debug(f"Generated, cached, and stored embedding for new memory ID: {mem_id}")
                     except Exception as e:
                         logger.warning(f"Failed to generate embedding for new memory: {e}")
                         # Non-critical error, don't raise
@@ -3799,11 +3816,14 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         try:
                             memory_clean = re.sub(r"\[Tags:.*?\]\s*", "", formatted_content).lower().strip()
                             memory_embedding = await self._get_embedding(memory_clean)
-                            # Store with the new ID from the result
                             if memory_embedding is not None:
+                                # Cache in RAM
                                 self.memory_embeddings[new_mem_id] = memory_embedding
+                                
+                                # Store persistently in vector database
+                                await self._store_embedding_in_db(user.id, new_mem_id, memory_clean, memory_embedding)
                                 logger.debug(
-                                    f"Updated embedding for memory ID: {new_mem_id} (was: {operation.id})"
+                                    f"Updated and stored embedding for memory ID: {new_mem_id} (was: {operation.id})"
                                 )
 
                                 # Remove old embedding if ID changed
@@ -4566,4 +4586,87 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             logger.error(f"Error re-embedding memory {memory_id}: {e}\n{traceback.format_exc()}")
             return None
 
+    async def _store_embedding_in_db(self, user_id: str, memory_id: str, memory_text: str, embedding: np.array) -> None:
+        """Store memory embedding in a persistent JSON file for reload across restarts.
+        
+        Args:
+            user_id: User ID for file naming
+            memory_id: Memory ID to use as the key
+            memory_text: The memory text content (not stored, just for logging)
+            embedding: The embedding vector to store
+        """
+        try:
+            # Use data directory for persistence
+            cache_dir = "/app/backend/data/cache/embeddings"
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+            
+            # Load existing cache
+            cache = {}
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'r') as f:
+                        cache = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Error loading embedding cache, starting fresh: {e}")
+            
+            # Convert numpy array to list for JSON storage
+            embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
+            
+            # Store embedding
+            cache[memory_id] = {
+                "embedding": embedding_list,
+                "model": self.valves.embedding_model_name,
+                "provider": self.valves.embedding_provider_type,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Save cache
+            with open(cache_file, 'w') as f:
+                json.dump(cache, f)
+            
+            logger.debug(f"Stored embedding for memory {memory_id} in file cache")
+        except Exception as e:
+            logger.warning(f"Failed to store embedding in file cache for memory {memory_id}: {e}")
+            # Non-critical - embedding will be regenerated if needed
+
+    async def _load_embedding_from_db(self, user_id: str, memory_id: str) -> Optional[np.array]:
+        """Load a stored embedding from the persistent JSON file.
+        
+        Args:
+            user_id: User ID for file naming
+            memory_id: Memory ID to retrieve
+            
+        Returns:
+            The embedding vector if found, None otherwise
+        """
+        try:
+            cache_dir = "/app/backend/data/cache/embeddings"
+            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+            
+            if not os.path.exists(cache_file):
+                logger.info(f"DEBUG: Cache file does not exist: {cache_file}")
+                return None
+            
+            # Load cache
+            with open(cache_file, 'r') as f:
+                cache = json.load(f)
+            
+            # Log first 3 keys to see what's actually stored
+            cache_keys = list(cache.keys())[:3]
+            logger.info(f"DEBUG: Cache has {len(cache)} entries. First 3 keys: {cache_keys}, looking for: {memory_id}")
+            
+            if memory_id in cache:
+                embedding_list = cache[memory_id]["embedding"]
+                embedding = np.array(embedding_list, dtype=np.float32)
+                logger.info(f"SUCCESS: Loaded embedding for memory {memory_id} from file cache (dim: {embedding.shape[0]})")
+                return embedding
+            
+            logger.info(f"DEBUG: Memory {memory_id} not found in cache")
+            return None
+        except Exception as e:
+            logger.warning(f"ERROR loading embedding from file cache for memory {memory_id}: {e}\n{traceback.format_exc()}")
+            return None
+
     # --- END NEW Embedding Functions ---
+
