@@ -953,22 +953,37 @@ Your output must be valid JSON only. No additional text.""",
         embedding_clusters = []
         if strategy in ["embeddings", "hybrid"]:
             logger.debug(f"Clustering eligible memories using embeddings (threshold: {threshold})...")
-            # Ensure all eligible memories have embeddings
+            # Ensure all eligible memories have embeddings (Batch Processing)
+            memories_to_embed = []
+            texts_to_embed = []
+            
             for mem in eligible_memories:
                 mem_id = mem.get("id")
                 if mem_id not in self.memory_embeddings:
-                    try:
-                        mem_text = mem.get("memory", "")
-                        if mem_text:
-                            mem_emb = await self._get_embedding(mem_text)
-                            if mem_emb is not None:
-                                self.memory_embeddings[mem_id] = mem_emb
-                        else:
-                             # Mark as None if no text to prevent repeated attempts
+                    mem_text = mem.get("memory", "")
+                    if mem_text:
+                        memories_to_embed.append(mem)
+                        texts_to_embed.append(mem_text)
+                    else:
+                         self.memory_embeddings[mem_id] = None # Mark empty text as None
+            
+            if memories_to_embed:
+                 logger.info(f"Generating embeddings for {len(memories_to_embed)} missing memories in batch...")
+                 try:
+                     embeddings_batch = await self._get_embeddings_batch(texts_to_embed)
+                     
+                     for i, mem in enumerate(memories_to_embed):
+                         mem_id = mem.get("id")
+                         emb = embeddings_batch[i]
+                         if emb is not None:
+                             self.memory_embeddings[mem_id] = emb
+                         else:
                              self.memory_embeddings[mem_id] = None
-                    except Exception as e:
-                        logger.warning(f"Failed to generate embedding for memory {mem_id} during clustering: {e}")
-                        self.memory_embeddings[mem_id] = None # Mark as failed
+                 except Exception as e:
+                     logger.error(f"Batch embedding generation failed: {e}") 
+                     # Mark all as missed so we don't block clustering but they won't be used
+                     for mem in memories_to_embed:
+                         self.memory_embeddings[mem.get("id")] = None
             
             # Simple greedy clustering based on similarity
             temp_eligible = eligible_memories[:] # Work with a copy
@@ -1116,7 +1131,15 @@ Your output must be valid JSON only. No additional text.""",
                     # Fetch all users to process memories for each
                     users = []
                     try:
-                        users = Users.get_users()
+                        users_response = Users.get_users()
+                        # Handle pagination/dict response (e.g., {'users': [...], 'total': N})
+                        if isinstance(users_response, dict) and "users" in users_response:
+                            users = users_response["users"]
+                        elif hasattr(users_response, "users"): # Handle Object/Pydantic
+                            users = users_response.users
+                        else:
+                            users = users_response # Assume it's the list itself
+                            
                     except Exception as e:
                         logger.warning(f"Failed to retrieve users list: {e}")
 
@@ -1125,7 +1148,20 @@ Your output must be valid JSON only. No additional text.""",
                         continue
 
                     for user_obj in users:
-                        user_id = user_obj.id
+                    # Handle both User objects (with .id attributes) and string IDs
+                    # Depending on Open WebUI version/context, Users.get_users() might return different types
+                        user_id = None
+                        if isinstance(user_obj, str):
+                            user_id = user_obj
+                        elif hasattr(user_obj, 'id'):
+                            user_id = user_obj.id
+                        elif isinstance(user_obj, dict) and 'id' in user_obj:
+                            user_id = user_obj['id']
+                        
+                        if not user_id:
+                            logger.warning(f"Skipping user in summarization loop: Could not extract ID from {type(user_obj)}")
+                            continue
+                            
                         try:
                             # Get all memories for the user
                             all_user_memories = await self._get_formatted_memories(user_id)
@@ -4566,6 +4602,105 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             EMBEDDING_ERRORS.labels(provider_type).inc()
             EMBEDDING_LATENCY.labels(provider_type).observe(time.perf_counter() - start_time)
             return None
+
+    # --- Batch Embedding Support ---
+    async def _get_embeddings_batch(self, texts: List[str]) -> List[Optional[np.array]]:
+        """Get embeddings for a list of texts using batching."""
+        if not texts:
+            return []
+
+        provider_type = self.valves.embedding_provider_type
+        logger.info(f"Generating batch embeddings for {len(texts)} items via {provider_type}...")
+        
+        results = [None] * len(texts)
+        
+        try:
+            if provider_type == "local":
+                local_model = self._local_embedding_model
+                if local_model:
+                     # SentenceTransformer supports batch encoding
+                     try:
+                         # Use show_progress_bar=False to keep logs clean
+                         embeddings = local_model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+                         return list(embeddings)
+                     except Exception as e:
+                         logger.error(f"Local batch embedding failed: {e}")
+                         return [None] * len(texts)
+                else:
+                    return [None] * len(texts)
+
+            elif provider_type == "openai_compatible":
+                # Chunk requests to avoid hitting size limits (e.g. 50 at a time)
+                chunk_size = 50 
+                all_embeddings = []
+                
+                for i in range(0, len(texts), chunk_size):
+                    chunk = texts[i : i + chunk_size]
+                    chunk_embeddings = await self._get_embeddings_batch_from_api(chunk)
+                    all_embeddings.extend(chunk_embeddings)
+                
+                return all_embeddings
+            
+            else:
+                return [None] * len(texts)
+
+        except Exception as e:
+            logger.error(f"Error during batch embedding generation: {e}\n{traceback.format_exc()}")
+            return [None] * len(texts)
+
+    async def _get_embeddings_batch_from_api(self, texts: List[str]) -> List[Optional[np.array]]:
+        """Helper to get batch embeddings from API."""
+        api_url = self.valves.embedding_api_url
+        api_key = self.valves.embedding_api_key
+        model_name = self.valves.embedding_model_name
+        
+        if not api_url or not api_key:
+            return [None] * len(texts)
+
+        session = await self._get_aiohttp_session()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        
+        data = {
+            "input": texts,
+            "model": model_name
+        }
+        
+        try:
+            async with session.post(api_url, json=data, headers=headers, timeout=60) as response:
+                if response.status == 200:
+                    response_data = await response.json()
+                    # Expect standard format: data list with 'embedding' and 'index'
+                    if "data" in response_data and isinstance(response_data["data"], list):
+                        # Sort by index to maintain order
+                        sorted_data = sorted(response_data["data"], key=lambda x: x.get("index", 0))
+                        embeddings = []
+                        for item in sorted_data:
+                            emb = item.get("embedding")
+                            if emb:
+                                embeddings.append(np.array(emb, dtype=np.float32))
+                            else:
+                                embeddings.append(None)
+                        
+                        # Ensure we return valid list length matched to input
+                        if len(embeddings) != len(texts):
+                            logger.warning(f"Batch API returned {len(embeddings)} embeddings for {len(texts)} inputs.")
+                            # Pad with None if mismatched
+                            while len(embeddings) < len(texts):
+                                embeddings.append(None)
+                        
+                        return embeddings
+                else:
+                    logger.error(f"Batch embedding API failed: {response.status}")
+                    return [None] * len(texts)
+                    
+        except Exception as e:
+            logger.error(f"Batch embedding API unexpected error: {e}")
+            return [None] * len(texts)
+        
+        return [None] * len(texts)
 
     async def _re_embed_memory_if_needed(self, memory_id: str, memory_text: str, current_dim: int, expected_dim: int) -> Optional[np.array]:
         """
