@@ -823,20 +823,7 @@ Your output must be valid JSON only. No additional text.""",
         logger.debug(f"  - use_embeddings_for_deduplication: {self.valves.use_embeddings_for_deduplication}")
         logger.debug(f"  - similarity_threshold: {self.valves.similarity_threshold}")
 
-        # Schedule background tasks based on configuration valves
-        if self.valves.enable_error_logging_task:
-            self._error_log_task = asyncio.create_task(self._log_error_counters_loop())
-            self._background_tasks.add(self._error_log_task)
-            self._error_log_task.add_done_callback(self._background_tasks.discard)
-            logger.debug("Started error logging background task")
 
-        if self.valves.enable_summarization_task:
-            self._summarization_task = asyncio.create_task(
-                self._summarize_old_memories_loop()
-            )
-            self._background_tasks.add(self._summarization_task)
-            self._summarization_task.add_done_callback(self._background_tasks.discard)
-            logger.debug("Started memory summarization background task")
 
         # Model discovery results
         self.available_ollama_models = []
@@ -848,19 +835,7 @@ Your output must be valid JSON only. No additional text.""",
         self.current_date = datetime.now()
         self.date_info = self._update_date_info()
 
-        # Schedule date update task if enabled
-        if self.valves.enable_date_update_task:
-            self._date_update_task = self._schedule_date_update()
-            logger.debug("Scheduled date update background task")
-        else:
-            self._date_update_task = None
 
-        # Schedule model discovery task if enabled
-        if self.valves.enable_model_discovery_task:
-            self._model_discovery_task = self._schedule_model_discovery()
-            logger.debug("Scheduled model discovery background task")
-        else:
-            self._model_discovery_task = None
 
         # Initialize MiniLM embedding model (singleton)
         # self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2") # Removed: Property handles lazy init
@@ -892,6 +867,38 @@ Your output must be valid JSON only. No additional text.""",
 
         # Track that background tasks are not yet re-initialised via inlet()
         self._background_tasks_started: bool = False
+
+    def _initialize_background_tasks(self):
+        """Initialize background tasks if they are not already running."""
+        # Error logging task
+        if self.valves.enable_error_logging_task:
+            if not hasattr(self, "_error_log_task") or self._error_log_task is None or self._error_log_task.done():
+                self._error_log_task = asyncio.create_task(self._log_error_counters_loop())
+                self._background_tasks.add(self._error_log_task)
+                self._error_log_task.add_done_callback(self._background_tasks.discard)
+                logger.debug("Started error logging background task")
+
+        # Summarization task
+        if self.valves.enable_summarization_task:
+             if not hasattr(self, "_summarization_task") or self._summarization_task is None or self._summarization_task.done():
+                self._summarization_task = asyncio.create_task(
+                    self._summarize_old_memories_loop()
+                )
+                self._background_tasks.add(self._summarization_task)
+                self._summarization_task.add_done_callback(self._background_tasks.discard)
+                logger.debug("Started memory summarization background task")
+
+        # Date update task
+        if self.valves.enable_date_update_task:
+             if not hasattr(self, "_date_update_task") or self._date_update_task is None or (hasattr(self._date_update_task, 'done') and self._date_update_task.done()):
+                self._date_update_task = self._schedule_date_update()
+                logger.debug("Scheduled date update background task")
+        
+        # Model discovery task
+        if self.valves.enable_model_discovery_task:
+             if not hasattr(self, "_model_discovery_task") or self._model_discovery_task is None or (hasattr(self._model_discovery_task, 'done') and self._model_discovery_task.done()):
+                self._model_discovery_task = self._schedule_model_discovery()
+                logger.debug("Scheduled model discovery background task")
 
     async def _calculate_memory_age_days(self, memory: Dict[str, Any]) -> float:
         """Calculate age of a memory in days."""
@@ -1087,99 +1094,108 @@ Your output must be valid JSON only. No additional text.""",
                 logger.info("Starting periodic memory summarization run...")
                 
                 try:
-                    # Fetch all users (or handle single user case)
-                    # For now, assuming single user for simplicity, adapt if multi-user support needed
-                    user_id = "default" # Replace with actual user ID logic if needed
-                    user_obj = Users.get_user_by_id(user_id)
-                    if not user_obj:
-                        logger.warning(f"Summarization skipped: User '{user_id}' not found.")
+                    # Fetch all users to process memories for each
+                    users = []
+                    try:
+                        users = Users.get_users()
+                    except Exception as e:
+                        logger.warning(f"Failed to retrieve users list: {e}")
+
+                    if not users:
+                        logger.info("No users found for memory summarization.")
                         continue
-                    
-                    # Get all memories for the user
-                    all_user_memories = await self._get_formatted_memories(user_id)
-                    if len(all_user_memories) < self.valves.summarization_min_cluster_size:
-                         logger.info(f"Summarization skipped: Not enough memories for user '{user_id}' to form a cluster.")
-                         continue
-                         
-                    logger.debug(f"Retrieved {len(all_user_memories)} total memories for user '{user_id}' for summarization.")
-                    
-                    # Find clusters of related, old memories
-                    memory_clusters = await self._find_memory_clusters(all_user_memories)
-                    
-                    if not memory_clusters:
-                        logger.info(f"No eligible memory clusters found for user '{user_id}' for summarization.")
-                        continue
-                    
-                    logger.info(f"Found {len(memory_clusters)} memory clusters to potentially summarize for user '{user_id}'.")
-                    
-                    # Process each cluster
-                    summarized_count = 0
-                    deleted_count = 0
-                    for cluster in memory_clusters:
-                        # Ensure cluster still meets minimum size after potential filtering in _find_memory_clusters
-                        if len(cluster) < self.valves.summarization_min_cluster_size:
-                            continue
-                        
-                        # Limit cluster size for the LLM call
-                        cluster_to_summarize = cluster[:self.valves.summarization_max_cluster_size]
-                        logger.debug(f"Attempting to summarize cluster of size {len(cluster_to_summarize)} (max: {self.valves.summarization_max_cluster_size}).")
 
-                        # Extract memory texts for the LLM prompt
-                        mem_texts = [m.get("memory", "") for m in cluster_to_summarize]
-                        # Sort by date to help LLM resolve contradictions potentially
-                        cluster_to_summarize.sort(key=lambda m: m.get("created_at", datetime.min.replace(tzinfo=timezone.utc)))
-                        combined_text = "\n- ".join([m.get("memory", "") for m in cluster_to_summarize])
-
-                        # Use the new configurable summarization prompt
-                        system_prompt = self.valves.summarization_memory_prompt
-                        user_prompt = f"Related memories to summarize:\n- {combined_text}"
-
-                        logger.debug(f"Calling LLM to summarize cluster. System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}")
-                        summary = await self.query_llm_with_retry(system_prompt, user_prompt)
-
-                        if summary and not summary.startswith("Error:"):                            
-                            # Format summary with tags (e.g., from the first memory in cluster? Or generate new ones?)
-                            # For simplicity, let's try inheriting tags from the *first* memory in the sorted cluster
-                            first_mem_content = cluster_to_summarize[0].get("memory", "")
-                            tags = []
-                            tags_match = re.match(r"\[Tags: (.*?)\]", first_mem_content)
-                            if tags_match:
-                                tags = [tag.strip() for tag in tags_match.group(1).split(",")]
-                            
-                            # Add a specific "summarized" tag
-                            if "summarized" not in tags:
-                                tags.append("summarized")
+                    for user_obj in users:
+                        user_id = user_obj.id
+                        try:
+                            # Get all memories for the user
+                            all_user_memories = await self._get_formatted_memories(user_id)
+                            if len(all_user_memories) < self.valves.summarization_min_cluster_size:
+                                # logger.debug(f"Summarization skipped: Not enough memories for user '{user_id}'.") # Reduce noise
+                                continue
                                 
-                            formatted_summary = f"[Tags: {', '.join(tags)}] {summary.strip()}"
+                            logger.debug(f"Retrieved {len(all_user_memories)} total memories for user '{user_id}' for summarization.")
                             
-                            logger.info(f"Generated summary for cluster: {formatted_summary[:100]}...")
+                            # Find clusters of related, old memories
+                            memory_clusters = await self._find_memory_clusters(all_user_memories)
                             
-                            # Save summary as new memory
-                            try:
-                                new_mem_op = MemoryOperation(operation="NEW", content=formatted_summary, tags=tags)
-                                await self._execute_memory_operation(new_mem_op, user_obj)
-                                summarized_count += 1
-                            except Exception as add_err:
-                                logger.error(f"Failed to save summary memory: {add_err}")
-                                continue # Skip deleting originals if saving summary fails
+                            if not memory_clusters:
+                                logger.debug(f"No eligible memory clusters found for user '{user_id}' for summarization.")
+                                continue
                             
-                            # Delete original memories in the summarized cluster
-                            for mem_to_delete in cluster_to_summarize:
-                                try:
-                                    delete_op = MemoryOperation(operation="DELETE", id=mem_to_delete["id"])
-                                    await self._execute_memory_operation(delete_op, user_obj)
-                                    deleted_count += 1
-                                except Exception as del_err:
-                                    logger.warning(f"Failed to delete old memory {mem_to_delete.get('id')} during summarization: {del_err}")
-                                    # Continue deleting others even if one fails
-                            logger.debug(f"Deleted {deleted_count} original memories after summarization.")
-                        else:
-                            logger.warning(f"LLM failed to generate summary for cluster starting with ID {cluster_to_summarize[0].get('id')}. Response: {summary}")
+                            logger.info(f"Found {len(memory_clusters)} memory clusters to potentially summarize for user '{user_id}'.")
+                            
+                            # Process each cluster
+                            summarized_count = 0
+                            deleted_count = 0
+                            for cluster in memory_clusters:
+                                # Ensure cluster still meets minimum size after potential filtering in _find_memory_clusters
+                                if len(cluster) < self.valves.summarization_min_cluster_size:
+                                    continue
+                                
+                                # Limit cluster size for the LLM call
+                                cluster_to_summarize = cluster[:self.valves.summarization_max_cluster_size]
+                                logger.debug(f"Attempting to summarize cluster of size {len(cluster_to_summarize)} (max: {self.valves.summarization_max_cluster_size}).")
 
-                    if summarized_count > 0:
-                        logger.info(f"Successfully generated {summarized_count} summaries and deleted {deleted_count} original memories for user '{user_id}'.")
-                    else:
-                        logger.info(f"No summaries were generated in this run for user '{user_id}'.")
+                                # Extract memory texts for the LLM prompt
+                                mem_texts = [m.get("memory", "") for m in cluster_to_summarize]
+                                # Sort by date to help LLM resolve contradictions potentially
+                                cluster_to_summarize.sort(key=lambda m: m.get("created_at", datetime.min.replace(tzinfo=timezone.utc)))
+                                combined_text = "\n- ".join([m.get("memory", "") for m in cluster_to_summarize])
+
+                                # Use the new configurable summarization prompt
+                                system_prompt = self.valves.summarization_memory_prompt
+                                user_prompt = f"Related memories to summarize:\n- {combined_text}"
+
+                                logger.debug(f"Calling LLM to summarize cluster. System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}")
+                                summary = await self.query_llm_with_retry(system_prompt, user_prompt)
+
+                                if summary and not summary.startswith("Error:"):                            
+                                    # Format summary with tags (e.g., from the first memory in cluster? Or generate new ones?)
+                                    # For simplicity, let's try inheriting tags from the *first* memory in the sorted cluster
+                                    first_mem_content = cluster_to_summarize[0].get("memory", "")
+                                    tags = []
+                                    tags_match = re.match(r"\[Tags: (.*?)\]", first_mem_content)
+                                    if tags_match:
+                                        tags = [tag.strip() for tag in tags_match.group(1).split(",")]
+                                    
+                                    # Add a specific "summarized" tag
+                                    if "summarized" not in tags:
+                                        tags.append("summarized")
+                                        
+                                    formatted_summary = f"[Tags: {', '.join(tags)}] {summary.strip()}"
+                                    
+                                    logger.info(f"Generated summary for cluster: {formatted_summary[:100]}...")
+                                    
+                                    # Save summary as new memory
+                                    try:
+                                        new_mem_op = MemoryOperation(operation="NEW", content=formatted_summary, tags=tags)
+                                        await self._execute_memory_operation(new_mem_op, user_obj)
+                                        summarized_count += 1
+                                    except Exception as add_err:
+                                        logger.error(f"Failed to save summary memory: {add_err}")
+                                        continue # Skip deleting originals if saving summary fails
+                                    
+                                    # Delete original memories in the summarized cluster
+                                    for mem_to_delete in cluster_to_summarize:
+                                        try:
+                                            delete_op = MemoryOperation(operation="DELETE", id=mem_to_delete["id"])
+                                            await self._execute_memory_operation(delete_op, user_obj)
+                                            deleted_count += 1
+                                        except Exception as del_err:
+                                            logger.warning(f"Failed to delete old memory {mem_to_delete.get('id')} during summarization: {del_err}")
+                                            # Continue deleting others even if one fails
+                                    logger.debug(f"Deleted {deleted_count} original memories after summarization.")
+                                else:
+                                    logger.warning(f"LLM failed to generate summary for cluster starting with ID {cluster_to_summarize[0].get('id')}. Response: {summary}")
+
+                            if summarized_count > 0:
+                                logger.info(f"Successfully generated {summarized_count} summaries and deleted {deleted_count} original memories for user '{user_id}'.")
+                            else:
+                                logger.info(f"No summaries were generated in this run for user '{user_id}'.")
+                        except Exception as e:
+                            logger.error(f"Error processing memories for user {user_id}: {e}")
+                            continue
                         
                 except Exception as e:
                     logger.error(f"Error in summarization loop for a user: {e}\n{traceback.format_exc()}")
