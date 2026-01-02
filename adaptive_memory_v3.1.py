@@ -1537,6 +1537,10 @@ Your output must be valid JSON only. No additional text.""",
         if final_message is None and body.get("messages"):
             final_message = body["messages"][-1].get("content")
 
+        # Handle multimodal content (list of dicts) for images
+        if isinstance(final_message, list):
+            final_message = " ".join([m.get("text", "") for m in final_message if isinstance(m, dict) and m.get("type") == "text"]).strip()
+
         # --- MESSAGE DE-DUPLICATION - ACQUIRE LOCK IMMEDIATELY ---
         # Prevent multiple worker processes from processing the same message
         # This MUST happen before any heavy processing (valve loading, background tasks, etc.)
@@ -1791,7 +1795,11 @@ Your output must be valid JSON only. No additional text.""",
             # Find the actual last user message in the history included in the body
             for msg in reversed(messages_copy):
                 if msg.get("role") == "user" and msg.get("content"):
-                    last_user_message_content = msg.get("content")
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        last_user_message_content = " ".join([m.get("text", "") for m in content if isinstance(m, dict) and m.get("type") == "text"]).strip()
+                    else:
+                        last_user_message_content = content
                     break
 
         # --- MESSAGE DE-DUPLICATION - ACQUIRE LOCK IMMEDIATELY ---
