@@ -544,7 +544,6 @@ class MemoryPipeline:
                         "tags": ["summary"],
                         "memory_bank": "General",
                         "confidence": 1.0 
-                        "confidence": 1.0 
                     }
                     await self.process_memory_operations([op], user_id)
                     logger.info(f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)")
@@ -556,12 +555,7 @@ class MemoryPipeline:
                 logger.error(f"Memory operation failed: {e}")
         
         return None
-                        
-            except Exception as e:
-                self.error_manager.increment("memory_crud_errors")
-                logger.error(f"Memory operation failed: {e}")
-        
-        # return success_ops # Not needed for void return type
+
 
     async def _is_duplicate(self, text: str, user_id: str) -> bool:
         # Implementation of deduplication logic
