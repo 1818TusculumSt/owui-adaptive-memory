@@ -4,40 +4,48 @@ Adaptive Memory is a sophisticated plugin that provides persistent, personalized
 
 **KEY FEATURES**
 
-* Automatically identifies facts, preferences, relationships, and goals from user messages
-* Categorizes memories with appropriate tags (identity, preference, behavior, relationship, goal, possession)
-* Focuses on user-specific information while filtering out general knowledge or trivia
-* Multi-layered Filtering Pipeline
-* Robust JSON parsing with fallback mechanisms for reliable memory extraction
-* Preference statement shortcuts for improved handling of common user likes/dislikes
-* Blacklist/whitelist system to control topic filtering
-* Smart deduplication using both semantic (embedding-based) and text-based similarity
-* Optimized Memory Retrieval
-* Vector-based similarity for efficient memory retrieval
-* Optional LLM-based relevance scoring for highest accuracy when needed
-* Performance optimizations to reduce unnecessary LLM calls
-* Smart clustering and summarization of related older memories to prevent clutter
-* Intelligent pruning strategies when memory limits are reached
-* Configurable background tasks for maintenance operations
-* Injects contextually relevant memories into LLM prompts
-* Customizable memory display formats (bullet, numbered, paragraph)
-* Filters meta-explanations from LLM responses for cleaner output
-* Generalized LLM provider configuration supporting both Ollama and OpenAI-compatible APIs
-* Configurable model selection and endpoint URLs
-* Optimized prompts for reliable JSON response parsing
-* Fine-grained control through "valve" settings
-* Input validation to prevent misconfiguration
-* Per-user configuration options
-* Memory Banks – categorize memories into Personal, Work, General (etc.) so retrieval / injection can be focused on a chosen context
+* **Intelligent Memory Extraction**: Automatically identifies facts, preferences, relationships, and goals from user messages using LLM-powered analysis
+* **Smart Categorization**: Categorizes memories with appropriate tags (identity, preference, behavior, relationship, goal, possession) and memory banks (Personal, Work, General)
+* **Advanced Filtering**: Multi-layered pipeline that focuses on user-specific information while filtering out general knowledge or trivia
+* **Robust Processing**: JSON parsing with multiple fallback mechanisms for reliable memory extraction
+* **Semantic Deduplication**: Smart deduplication using embedding-based similarity to prevent duplicate memories
+* **Vector-Based Retrieval**: Efficient memory retrieval using cosine similarity with configurable thresholds
+* **Background Summarization**: Automatic clustering and summarization of related older memories to prevent clutter and maintain relevance
+* **Flexible Embedding Support**: Choice between local SentenceTransformer models or OpenAI-compatible API endpoints
+* **Configurable LLM Integration**: Support for both Ollama and OpenAI-compatible APIs with customizable endpoints
+* **Real-time Status Updates**: Live status notifications during memory processing and background operations
+* **Comprehensive Monitoring**: Prometheus metrics instrumentation for performance tracking
+* **Memory Bank Organization**: Categorize memories into Personal, Work, General contexts for focused retrieval
+* **Background Task Management**: Automated maintenance tasks with configurable intervals
 
-**RECENT IMPROVEMENTS (v3.1)**
+**ARCHITECTURE (v4.0)**
 
-* Memory Confidence Scoring & Filtering
-* Flexible Embedding Provider Support (Local/API Valves)
-* Local Embedding Model Auto-Discovery
-* Embedding Dimension Validation
-* Prometheus Metrics Instrumentation
-* Health & Metrics Endpoints (/adaptive-memory/health, /adaptive-memory/metrics)
-* UI Status Emitters for Retrieval
-* Debugging & Robustness Fixes (Issue #15 - Thresholds, Visibility)
-* Minor Fixes (prometheus_client import)
+The system is built with a modular, pipeline-based architecture:
+
+* **EmbeddingManager**: Handles embedding generation with support for local and API-based providers
+* **MemoryPipeline**: Core logic for memory identification, retrieval, and processing
+* **TaskManager**: Manages background tasks for summarization and maintenance
+* **ErrorManager**: Centralized error tracking and reporting
+* **JSONParser**: Robust JSON extraction with multiple fallback strategies
+
+**BACKGROUND TASKS**
+
+* **Memory Summarization**: Automatically clusters and summarizes related memories (default: every 2 hours)
+* **Error Logging**: Periodic logging of error counters for monitoring (default: every 30 minutes)
+* **Date Updates**: Keeps temporal context current (default: every hour)
+
+**MAJOR CHANGES (v4.0)**
+
+* **Complete Architecture Refactor**: Modular pipeline-based design for better maintainability and extensibility
+* **Enhanced Background Processing**: Automatic memory summarization with clustering algorithms
+* **Task Management System**: Robust background task system with proper lifecycle management
+* **Improved Embedding Support**: Flexible provider system with local and API options
+* **Comprehensive Logging**: Detailed logging throughout the pipeline for debugging and monitoring
+* **Memory Confidence Scoring**: Confidence-based filtering for higher quality memories
+* **Prometheus Metrics**: Full instrumentation for performance monitoring
+* **Status Notifications**: Real-time updates during memory operations
+* **Error Resilience**: Improved error handling and recovery mechanisms
+
+**KNOWN ISSUES**
+
+* **Valve UI Persistence**: OpenWebUI valve changes may not persist properly in some installations. If valve settings don't take effect, try restarting OpenWebUI completely or temporarily modify default values in the code.

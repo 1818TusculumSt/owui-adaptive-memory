@@ -1,9 +1,19 @@
-
 import json
 import copy
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union, Set, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    Set,
+    Tuple,
+)
 import logging
 import re
 import asyncio
@@ -26,23 +36,48 @@ except ImportError:
     class _NoOpMetric:
         def __init__(self, *args, **kwargs):
             pass
+
         def labels(self, *args, **kwargs):
             return self
+
         def inc(self, *args, **kwargs):
             pass
+
         def observe(self, *args, **kwargs):
             pass
 
     Counter = Histogram = _NoOpMetric
 
 # Define Prometheus metrics
-EMBEDDING_REQUESTS = Counter('adaptive_memory_embedding_requests_total', 'Total number of embedding requests', ['provider'])
-EMBEDDING_ERRORS = Counter('adaptive_memory_embedding_errors_total', 'Total number of embedding errors', ['provider'])
-EMBEDDING_LATENCY = Histogram('adaptive_memory_embedding_latency_seconds', 'Latency of embedding generation', ['provider'])
+EMBEDDING_REQUESTS = Counter(
+    "adaptive_memory_embedding_requests_total",
+    "Total number of embedding requests",
+    ["provider"],
+)
+EMBEDDING_ERRORS = Counter(
+    "adaptive_memory_embedding_errors_total",
+    "Total number of embedding errors",
+    ["provider"],
+)
+EMBEDDING_LATENCY = Histogram(
+    "adaptive_memory_embedding_latency_seconds",
+    "Latency of embedding generation",
+    ["provider"],
+)
 
-RETRIEVAL_REQUESTS = Counter('adaptive_memory_retrieval_requests_total', 'Total number of get_relevant_memories calls', [])
-RETRIEVAL_ERRORS = Counter('adaptive_memory_retrieval_errors_total', 'Total number of retrieval errors', [])
-RETRIEVAL_LATENCY = Histogram('adaptive_memory_retrieval_latency_seconds', 'Latency of get_relevant_memories execution', [])
+RETRIEVAL_REQUESTS = Counter(
+    "adaptive_memory_retrieval_requests_total",
+    "Total number of get_relevant_memories calls",
+    [],
+)
+RETRIEVAL_ERRORS = Counter(
+    "adaptive_memory_retrieval_errors_total", "Total number of retrieval errors", []
+)
+RETRIEVAL_LATENCY = Histogram(
+    "adaptive_memory_retrieval_latency_seconds",
+    "Latency of get_relevant_memories execution",
+    [],
+)
 
 # Embedding model imports
 try:
@@ -65,7 +100,9 @@ from open_webui.main import app as webui_app
 logger = logging.getLogger("openwebui.plugins.adaptive_memory")
 if not logger.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
@@ -74,8 +111,10 @@ if not logger.handlers:
 # Data Models and Helper Classes
 # ------------------------------------------------------------------------------
 
+
 class MemoryOperation(BaseModel):
     """Model for memory operations"""
+
     operation: Literal["NEW", "UPDATE", "DELETE"]
     id: Optional[str] = None
     content: Optional[str] = None
@@ -83,13 +122,14 @@ class MemoryOperation(BaseModel):
     memory_bank: Optional[str] = None
     confidence: Optional[float] = None
 
+
 class AddMemoryForm(BaseModel):
     content: str
 
 
-
 class ErrorManager:
     """Centralized error tracking and reporting."""
+
     def __init__(self):
         self.counters: Dict[str, int] = {
             "embedding_errors": 0,
@@ -97,7 +137,7 @@ class ErrorManager:
             "json_parse_errors": 0,
             "memory_crud_errors": 0,
         }
-    
+
     def increment(self, counter_name: str):
         self.counters[counter_name] = self.counters.get(counter_name, 0) + 1
 
@@ -107,12 +147,12 @@ class ErrorManager:
 
 class JSONParser:
     """Robust JSON parsing utilities."""
-    
+
     @staticmethod
     def extract_and_parse(text: str) -> Union[List, Dict, None]:
         if not text:
             return None
-        
+
         # 1. Try direct parsing
         try:
             return json.loads(text)
@@ -134,12 +174,14 @@ class JSONParser:
                 return json.loads(bracket_match.group(1))
             except json.JSONDecodeError:
                 pass
-        
+
         return None
+
 
 # ------------------------------------------------------------------------------
 # Embedding Management
 # ------------------------------------------------------------------------------
+
 
 class EmbeddingProvider(ABC):
     @abstractmethod
@@ -147,7 +189,9 @@ class EmbeddingProvider(ABC):
         pass
 
     @abstractmethod
-    async def get_embeddings_batch(self, texts: List[str]) -> List[Optional[np.ndarray]]:
+    async def get_embeddings_batch(
+        self, texts: List[str]
+    ) -> List[Optional[np.ndarray]]:
         pass
 
 
@@ -169,22 +213,25 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             # Run blocking call in executor
             loop = asyncio.get_event_loop()
             embedding = await loop.run_in_executor(
-                None, 
-                lambda: self.model.encode(text, normalize_embeddings=True)
+                None, lambda: self.model.encode(text, normalize_embeddings=True)
             )
             return np.array(embedding, dtype=np.float32)
         except Exception as e:
             logger.error(f"Local embedding error: {e}")
             return None
 
-    async def get_embeddings_batch(self, texts: List[str]) -> List[Optional[np.ndarray]]:
+    async def get_embeddings_batch(
+        self, texts: List[str]
+    ) -> List[Optional[np.ndarray]]:
         if not self.model or not texts:
             return [None] * len(texts)
         try:
             loop = asyncio.get_event_loop()
             embeddings = await loop.run_in_executor(
                 None,
-                lambda: self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+                lambda: self.model.encode(
+                    texts, normalize_embeddings=True, show_progress_bar=False
+                ),
             )
             return [np.array(e, dtype=np.float32) for e in embeddings]
         except Exception as e:
@@ -203,10 +250,12 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             async with aiohttp.ClientSession() as session:
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
+                    "Authorization": f"Bearer {self.api_key}",
                 }
                 data = {"input": text, "model": self.model_name}
-                async with session.post(self.api_url, json=data, headers=headers, timeout=30) as response:
+                async with session.post(
+                    self.api_url, json=data, headers=headers, timeout=30
+                ) as response:
                     if response.status == 200:
                         res_json = await response.json()
                         if "data" in res_json and len(res_json["data"]) > 0:
@@ -217,25 +266,33 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             logger.error(f"API embedding error: {e}")
             return None
 
-    async def get_embeddings_batch(self, texts: List[str]) -> List[Optional[np.ndarray]]:
+    async def get_embeddings_batch(
+        self, texts: List[str]
+    ) -> List[Optional[np.ndarray]]:
         # Naive implementation: sequential calls to avoid complexity for now, or use batch endpoint if supported
         # For robustness, we will map them to the batch endpoint if possible.
         try:
             async with aiohttp.ClientSession() as session:
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
+                    "Authorization": f"Bearer {self.api_key}",
                 }
                 data = {"input": texts, "model": self.model_name}
-                async with session.post(self.api_url, json=data, headers=headers, timeout=60) as response:
+                async with session.post(
+                    self.api_url, json=data, headers=headers, timeout=60
+                ) as response:
                     if response.status == 200:
                         res_json = await response.json()
                         if "data" in res_json:
                             # Sort by index
-                            sorted_data = sorted(res_json["data"], key=lambda x: x.get("index", 0))
+                            sorted_data = sorted(
+                                res_json["data"], key=lambda x: x.get("index", 0)
+                            )
                             results = []
                             for item in sorted_data:
-                                results.append(np.array(item["embedding"], dtype=np.float32))
+                                results.append(
+                                    np.array(item["embedding"], dtype=np.float32)
+                                )
                             return results
                     return [None] * len(texts)
         except Exception as e:
@@ -245,7 +302,7 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
 
 class EmbeddingManager:
     """Manages embedding generation, caching, and persistence."""
-    
+
     def __init__(self, get_valves: Callable[[], Any], error_manager: ErrorManager):
         self.get_valves = get_valves
         self.error_manager = error_manager
@@ -256,48 +313,55 @@ class EmbeddingManager:
     def _ensure_provider(self):
         valves = self.get_valves()
         # Initialize if not set or if provider type changed
-        if not self.provider or self._current_provider_type != valves.embedding_provider_type:
-             self._current_provider_type = valves.embedding_provider_type
-             if valves.embedding_provider_type == "local":
-                 self.provider = LocalEmbeddingProvider(valves.embedding_model_name)
-             elif valves.embedding_provider_type == "openai_compatible":
-                 self.provider = OpenAICompatibleEmbeddingProvider(
-                     valves.embedding_api_url,
-                     valves.embedding_api_key,
-                     valves.embedding_model_name
-                 )
+        if (
+            not self.provider
+            or self._current_provider_type != valves.embedding_provider_type
+        ):
+            self._current_provider_type = valves.embedding_provider_type
+            if valves.embedding_provider_type == "local":
+                self.provider = LocalEmbeddingProvider(valves.embedding_model_name)
+            elif valves.embedding_provider_type == "openai_compatible":
+                self.provider = OpenAICompatibleEmbeddingProvider(
+                    valves.embedding_api_url,
+                    valves.embedding_api_key,
+                    valves.embedding_model_name,
+                )
 
     async def get_embedding(self, text: str) -> Optional[np.ndarray]:
-        if not text: 
+        if not text:
             return None
-        
+
         # Check memory cache (not implemented fully here for simplicity, but could be added)
         start = time.perf_counter()
-        
+
         if not self.provider:
-             self._ensure_provider()
-        
+            self._ensure_provider()
+
         if not self.provider:
             return None
 
         emb = await self.provider.get_embedding(text)
-        
+
         if emb is not None:
-             EMBEDDING_LATENCY.labels(self.get_valves().embedding_provider_type).observe(time.perf_counter() - start)
+            EMBEDDING_LATENCY.labels(self.get_valves().embedding_provider_type).observe(
+                time.perf_counter() - start
+            )
         else:
-             self.error_manager.increment("embedding_errors")
-             EMBEDDING_ERRORS.labels(self.get_valves().embedding_provider_type).inc()
+            self.error_manager.increment("embedding_errors")
+            EMBEDDING_ERRORS.labels(self.get_valves().embedding_provider_type).inc()
 
         return emb
 
-    async def get_embeddings_batch(self, texts: List[str]) -> List[Optional[np.ndarray]]:
+    async def get_embeddings_batch(
+        self, texts: List[str]
+    ) -> List[Optional[np.ndarray]]:
         if not self.provider:
             self._ensure_provider()
 
-        if not self.provider: 
+        if not self.provider:
             return [None] * len(texts)
         return await self.provider.get_embeddings_batch(texts)
-    
+
     # Store/Load persistence logic can be migrated here.
 
 
@@ -305,16 +369,28 @@ class EmbeddingManager:
 # Memory Pipeline
 # ------------------------------------------------------------------------------
 
+
 class MemoryPipeline:
     """Core logic for extracting, retrieving, and processing memories."""
-    
-    def __init__(self, valves: Any, embedding_manager: EmbeddingManager, error_manager: ErrorManager):
+
+    def __init__(
+        self,
+        valves: Any,
+        embedding_manager: EmbeddingManager,
+        error_manager: ErrorManager,
+    ):
         self.valves = valves
         self.embedding_manager = embedding_manager
         self.error_manager = error_manager
 
     # --- Memory Identification ---
-    async def identify_memories(self, user_message: str, user_id: str, context_memories: List[Dict[str, Any]] = None, query_llm_func: Callable = None) -> List[Dict[str, Any]]:
+    async def identify_memories(
+        self,
+        user_message: str,
+        user_id: str,
+        context_memories: List[Dict[str, Any]] = None,
+        query_llm_func: Callable = None,
+    ) -> List[Dict[str, Any]]:
         """Identify potential memories from user message using LLM."""
         if not user_message:
             return []
@@ -323,37 +399,40 @@ class MemoryPipeline:
         system_prompt = self.valves.memory_identification_prompt
         now = datetime.now()
         system_prompt += f"\n\nCurrent Date: {now.strftime('%Y-%m-%d %H:%M:%S')}"
-        
+
         user_prompt = f"User Message: {user_message}"
         if context_memories:
-            user_prompt += f"\n\nContext Memories:\n" + "\n".join([f"- {m.get('content', '')}" for m in context_memories])
+            user_prompt += f"\n\nContext Memories:\n" + "\n".join(
+                [f"- {m.get('content', '')}" for m in context_memories]
+            )
 
         # Call LLM
         if not query_llm_func:
             return []
-            
+
         try:
             response = await query_llm_func(system_prompt, user_prompt)
             if not response:
                 return []
-            
+
             # Parse JSON
             data = JSONParser.extract_and_parse(response)
             if not isinstance(data, list):
                 return []
-                
+
             # Validate and filter
             valid_ops = []
             for item in data:
-                if not isinstance(item, dict): continue
+                if not isinstance(item, dict):
+                    continue
                 op = item.get("operation")
                 content = item.get("content")
                 confidence = item.get("confidence", 0.0)
-                
+
                 if op in ["NEW", "UPDATE", "DELETE"] and content:
                     if confidence >= self.valves.min_confidence_threshold:
                         valid_ops.append(item)
-            
+
             return valid_ops
 
         except Exception as e:
@@ -362,7 +441,9 @@ class MemoryPipeline:
             return []
 
     # --- Relevance Retrieval ---
-    async def get_relevant_memories(self, query: str, user_id: str, all_memories: List[Any]) -> List[Any]:
+    async def get_relevant_memories(
+        self, query: str, user_id: str, all_memories: List[Any]
+    ) -> List[Any]:
         """Retrieve relevant memories using vector similarity + optional LLM ranking."""
         if not query or not all_memories:
             return []
@@ -370,22 +451,22 @@ class MemoryPipeline:
         # 1. Vector Search
         query_embedding = await self.embedding_manager.get_embedding(query)
         if query_embedding is None:
-            return [] 
+            return []
 
         scored_memories = []
-        
+
         # Batch embedding for memories without cached embeddings
-        # This assumes all_memories are custom objects or dicts. 
+        # This assumes all_memories are custom objects or dicts.
         # OpenWebUI Memories are SQLModel objects usually.
         mem_objects = []
         texts_to_embed = []
         ids_to_embed = []
-        
+
         for mem in all_memories:
             # Handle object vs dict
-            mem_content = mem.content if hasattr(mem, 'content') else mem.get('content')
-            mem_id = mem.id if hasattr(mem, 'id') else mem.get('id')
-            
+            mem_content = mem.content if hasattr(mem, "content") else mem.get("content")
+            mem_id = mem.id if hasattr(mem, "id") else mem.get("id")
+
             cached_emb = self.embedding_manager.cache.get(mem_id)
             if cached_emb is not None:
                 sim = self._cosine_similarity(query_embedding, cached_emb)
@@ -395,10 +476,12 @@ class MemoryPipeline:
                 mem_objects.append(mem)
                 texts_to_embed.append(mem_content)
                 ids_to_embed.append(mem_id)
-        
+
         if texts_to_embed:
             # Batch generate
-            new_embeddings = await self.embedding_manager.get_embeddings_batch(texts_to_embed)
+            new_embeddings = await self.embedding_manager.get_embeddings_batch(
+                texts_to_embed
+            )
             for i, emb in enumerate(new_embeddings):
                 if emb is not None:
                     # Update cache
@@ -407,11 +490,11 @@ class MemoryPipeline:
                     sim = self._cosine_similarity(query_embedding, emb)
                     if sim >= self.valves.vector_similarity_threshold:
                         scored_memories.append((sim, mem_objects[i]))
-        
+
         # Sort by similarity
         scored_memories.sort(key=lambda x: x[0], reverse=True)
-        top_memories = [m[1] for m in scored_memories[:self.valves.related_memories_n]]
-        
+        top_memories = [m[1] for m in scored_memories[: self.valves.related_memories_n]]
+
         # Optional: LLM Reranking (Skipped for brevity/Streamline, relying on vector)
         return top_memories
 
@@ -420,22 +503,24 @@ class MemoryPipeline:
         norm2 = np.linalg.norm(v2)
         if norm1 == 0 or norm2 == 0:
             return 0.0
-        return float(np.dot(v1, v2) / (norm1 * norm2)) 
+        return float(np.dot(v1, v2) / (norm1 * norm2))
 
     # --- Memory Operations ---
-    async def process_memory_operations(self, operations: List[Dict[str, Any]], user_id: str) -> List[Dict[str, Any]]:
+    async def process_memory_operations(
+        self, operations: List[Dict[str, Any]], user_id: str
+    ) -> List[Dict[str, Any]]:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
         success_ops = []
         for op in operations:
             try:
                 kind = op.get("operation")
                 content = op.get("content")
-                
+
                 if kind == "NEW" and content:
                     # Incorporate metadata into content string for storage
                     tags = op.get("tags", [])
                     bank = op.get("memory_bank", "General")
-                    
+
                     # Deduplication check (on raw content or full content? Raw is better for semantic check)
                     if self.valves.deduplicate_memories:
                         is_dupe = await self._is_duplicate(content, user_id)
@@ -445,7 +530,7 @@ class MemoryPipeline:
                     # Format: [Tags: tag1, tag2] Content [Memory Bank: Bank] [Confidence: X.XX]
                     tags_str = ", ".join(tags) if tags else "none"
                     confidence = op.get("confidence", 1.0)
-                    
+
                     final_content = f"[Tags: {tags_str}] {content} [Memory Bank: {bank}] [Confidence: {confidence:.2f}]"
 
                     # Add memory - using Model directly
@@ -454,18 +539,18 @@ class MemoryPipeline:
                         success_ops.append(op)
                     except Exception as ins_err:
                         logger.error(f"Failed to insert memory: {ins_err}")
-                    
+
                 elif kind == "DELETE" and op.get("id"):
                     try:
                         Memories.delete_memory_by_id(op["id"])
                         success_ops.append(op)
                     except Exception as del_err:
                         logger.error(f"Failed to delete memory: {del_err}")
-                    
+
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
                 logger.error(f"Memory operation failed: {e}")
-        
+
         return success_ops
 
     async def _is_duplicate(self, text: str, user_id: str) -> bool:
@@ -474,68 +559,92 @@ class MemoryPipeline:
         return False
 
     # --- Summarization ---
-    async def cluster_and_summarize(self, user_id: str, query_llm_func: Callable) -> None:
+    async def cluster_and_summarize(
+        self, user_id: str, query_llm_func: Callable
+    ) -> None:
         """Find clusters of memories and summarize them."""
+        logger.info(f"Starting summarization for user {user_id}")
+        
         # 1. Fetch memories
         try:
             memories = Memories.get_memories_by_user_id(user_id)
-            if not memories or len(memories) < self.valves.summarization_min_cluster_size:
+            logger.info(f"Found {len(memories) if memories else 0} memories for user {user_id}")
+            
+            if not memories:
+                logger.info(f"No memories found for user {user_id}, skipping summarization")
+                return
+                
+            if len(memories) < self.valves.summarization_min_cluster_size:
+                logger.info(f"Only {len(memories)} memories found for user {user_id}, need at least {self.valves.summarization_min_cluster_size} for clustering")
                 return
         except Exception as e:
             logger.error(f"Summarization fetch failed: {e}")
             return
 
         # 2. Get embeddings
-        # For simplicity, we'll re-embed everything to ensure we have vectors. 
+        # For simplicity, we'll re-embed everything to ensure we have vectors.
         # (Optimally, use a cache)
+        logger.info(f"Generating embeddings for {len(memories)} memories")
         contents = [m.content for m in memories]
         ids = [m.id for m in memories]
         embeddings = await self.embedding_manager.get_embeddings_batch(contents)
-        
+
         valid_indices = [i for i, e in enumerate(embeddings) if e is not None]
+        logger.info(f"Successfully generated {len(valid_indices)} embeddings out of {len(embeddings)}")
+        
         if len(valid_indices) < self.valves.summarization_min_cluster_size:
+            logger.info(f"Only {len(valid_indices)} valid embeddings, need at least {self.valves.summarization_min_cluster_size} for clustering")
             return
 
         # 3. Simple Greedy Clustering
+        logger.info(f"Starting clustering with similarity threshold {self.valves.summarization_similarity_threshold}")
         clusters = []
         visited = set()
-        
+
         for i in valid_indices:
-            if i in visited: continue
-            
+            if i in visited:
+                continue
+
             cluster = [i]
             visited.add(i)
             vec_i = embeddings[i]
-            
+
             for j in valid_indices:
-                if j in visited: continue
-                
+                if j in visited:
+                    continue
+
                 vec_j = embeddings[j]
                 sim = self._cosine_similarity(vec_i, vec_j)
-                
+
                 if sim >= self.valves.summarization_similarity_threshold:
                     cluster.append(j)
                     visited.add(j)
-            
+
             if len(cluster) >= self.valves.summarization_min_cluster_size:
                 clusters.append(cluster)
+                logger.info(f"Found cluster with {len(cluster)} memories (similarity >= {self.valves.summarization_similarity_threshold})")
+
+        logger.info(f"Found {len(clusters)} clusters ready for summarization")
 
         # 4. Summarize Clusters
         for cluster_indices in clusters:
             try:
                 cluster_memories = [memories[i] for i in cluster_indices]
                 cluster_text = "\n".join([f"- {m.content}" for m in cluster_memories])
-                
+
                 prompt = self.valves.summarization_memory_prompt + f"\n\n{cluster_text}"
-                
-                summary = await query_llm_func(self.valves.summarization_memory_prompt, f"Memories to summarize:\n{cluster_text}")
-                
+
+                summary = await query_llm_func(
+                    self.valves.summarization_memory_prompt,
+                    f"Memories to summarize:\n{cluster_text}",
+                )
+
                 if summary:
                     # 5. Execute Changes
                     # Delete old
                     for m in cluster_memories:
                         Memories.delete_memory_by_id(m.id)
-                    
+
                     # Add new summary
                     # NOTE: Explicitly setting confidence to 1.0 for summaries as they are consolidated facts.
                     op = {
@@ -543,19 +652,22 @@ class MemoryPipeline:
                         "content": summary,
                         "tags": ["summary"],
                         "memory_bank": "General",
-                        "confidence": 1.0 
+                        "confidence": 1.0,
                     }
                     await self.process_memory_operations([op], user_id)
-                    logger.info(f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)")
-                        
-                    return f"Consolidated {len(cluster_memories)} memories into a summary."
-                        
+                    logger.info(
+                        f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)"
+                    )
+
+                    return (
+                        f"Consolidated {len(cluster_memories)} memories into a summary."
+                    )
+
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
                 logger.error(f"Memory operation failed: {e}")
-        
-        return None
 
+        return None
 
     async def _is_duplicate(self, text: str, user_id: str) -> bool:
         # Implementation of deduplication logic
@@ -564,26 +676,34 @@ class MemoryPipeline:
 
 class TaskManager:
     """Manages background tasks."""
+
     def __init__(self, filter_instance: Any):
         self.filter = filter_instance
         self.tasks: Set[asyncio.Task] = set()
 
     def start_tasks(self):
         valves = self.filter.valves
-        
+        logger.info(f"TaskManager starting tasks. Summarization enabled: {valves.enable_summarization_task}")
+
         if valves.enable_summarization_task:
+            logger.info(f"Creating summarization task with interval: {valves.summarization_interval}")
             task = asyncio.create_task(self.filter._summarize_old_memories_loop())
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
-            
+            logger.info(f"Summarization task created. Total tasks: {len(self.tasks)}")
+
         if valves.enable_error_logging_task:
+            logger.info(f"Creating error logging task with interval: {valves.error_logging_interval}")
             task = asyncio.create_task(self.filter._log_error_counters_loop())
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
 
         if valves.enable_date_update_task:
-             # Just sets a variable, simplistic
-             pass
+            # Just sets a variable, simplistic
+            logger.info("Date update task enabled (no actual task created)")
+            pass
+
+        logger.info(f"TaskManager initialization complete. Total active tasks: {len(self.tasks)}")
 
     async def stop_tasks(self):
         for task in self.tasks:
@@ -597,13 +717,14 @@ class TaskManager:
 # Main Filter Class
 # ------------------------------------------------------------------------------
 
+
 class Filter:
     # --------------------------------------------------------------------------
     # Configuration / Valves (PRESERVED EXACTLY)
     # --------------------------------------------------------------------------
     class Valves(BaseModel):
         """Configuration valves for the filter"""
-        
+
         # Embedding Model Configuration
         embedding_provider_type: Literal["local", "openai_compatible"] = Field(
             default="local",
@@ -625,57 +746,56 @@ class Filter:
         # Background Task Management Configuration
         enable_summarization_task: bool = Field(
             default=True,
-            description="Enable or disable the background memory summarization task"
+            description="Enable or disable the background memory summarization task",
         )
         summarization_interval: int = Field(
             default=7200,
-            description="Interval in seconds between memory summarization runs"
+            description="Interval in seconds between memory summarization runs",
         )
         enable_error_logging_task: bool = Field(
             default=True,
-            description="Enable or disable the background error counter logging task"
+            description="Enable or disable the background error counter logging task",
         )
         error_logging_interval: int = Field(
             default=1800,
-            description="Interval in seconds between error counter log entries"
+            description="Interval in seconds between error counter log entries",
         )
         enable_date_update_task: bool = Field(
             default=True,
-            description="Enable or disable the background date update task"
+            description="Enable or disable the background date update task",
         )
         date_update_interval: int = Field(
             default=3600,
-            description="Interval in seconds between date information updates"
+            description="Interval in seconds between date information updates",
         )
         enable_model_discovery_task: bool = Field(
             default=True,
-            description="Enable or disable the background model discovery task"
+            description="Enable or disable the background model discovery task",
         )
         model_discovery_interval: int = Field(
-            default=7200,
-            description="Interval in seconds between model discovery runs"
+            default=7200, description="Interval in seconds between model discovery runs"
         )
-        
+
         # Summarization Configuration
         summarization_min_cluster_size: int = Field(
             default=3,
-            description="Minimum number of memories in a cluster for summarization"
+            description="Minimum number of memories in a cluster for summarization",
         )
         summarization_similarity_threshold: float = Field(
             default=0.7,
-            description="Threshold for considering memories related when using embedding similarity"
+            description="Threshold for considering memories related when using embedding similarity",
         )
         summarization_max_cluster_size: int = Field(
             default=8,
-            description="Maximum memories to include in one summarization batch"
+            description="Maximum memories to include in one summarization batch",
         )
         summarization_min_memory_age_days: int = Field(
             default=7,
-            description="Minimum age in days for memories to be considered for summarization"
+            description="Minimum age in days for memories to be considered for summarization",
         )
         summarization_strategy: Literal["embeddings", "tags", "hybrid"] = Field(
             default="hybrid",
-            description="Strategy for clustering memories: 'embeddings' (semantic similarity), 'tags' (shared tags), or 'hybrid' (combination)"
+            description="Strategy for clustering memories: 'embeddings' (semantic similarity), 'tags' (shared tags), or 'hybrid' (combination)",
         )
         summarization_memory_prompt: str = Field(
             default="""You are a memory summarization assistant. Your task is to combine related memories about a user into a concise, comprehensive summary.
@@ -708,29 +828,29 @@ Good summary:
 "User is a coffee enthusiast who drinks 2-3 cups daily, particularly enjoying dark roast varieties in the morning."
 
 Analyze the following related memories and provide a concise summary.""",
-            description="System prompt for summarizing clusters of related memories"
+            description="System prompt for summarizing clusters of related memories",
         )
-        
+
         # Filtering & Saving Configuration
         enable_json_stripping: bool = Field(
             default=True,
-            description="Attempt to strip non-JSON text before/after the main JSON object/array from LLM responses."
+            description="Attempt to strip non-JSON text before/after the main JSON object/array from LLM responses.",
         )
         enable_fallback_regex: bool = Field(
             default=True,
-            description="If primary JSON parsing fails, attempt a simple regex fallback to extract at least one memory."
+            description="If primary JSON parsing fails, attempt a simple regex fallback to extract at least one memory.",
         )
         enable_short_preference_shortcut: bool = Field(
             default=True,
-            description="If JSON parsing fails for a short message containing preference keywords, directly save the message content."
+            description="If JSON parsing fails for a short message containing preference keywords, directly save the message content.",
         )
         short_preference_no_dedupe_length: int = Field(
             default=100,
-            description="If a NEW memory's content length is below this threshold and contains preference keywords, skip deduplication checks to avoid false positives."
+            description="If a NEW memory's content length is below this threshold and contains preference keywords, skip deduplication checks to avoid false positives.",
         )
         preference_keywords_no_dedupe: str = Field(
             default="favorite,love,like,prefer,enjoy",
-            description="Comma-separated keywords indicating user preferences that, when present in a short statement, trigger deduplication bypass."
+            description="Comma-separated keywords indicating user preferences that, when present in a short statement, trigger deduplication bypass.",
         )
         blacklist_topics: Optional[str] = Field(
             default=None,
@@ -758,7 +878,7 @@ Analyze the following related memories and provide a concise summary.""",
         )
         min_confidence_threshold: float = Field(
             default=0.5,
-            description="Minimum confidence score (0-1) required for an extracted memory to be saved. Scores below this are discarded."
+            description="Minimum confidence score (0-1) required for an extracted memory to be saved. Scores below this are discarded.",
         )
         recent_messages_n: int = Field(
             default=5,
@@ -798,7 +918,7 @@ Analyze the following related memories and provide a concise summary.""",
         )
         relevance_threshold: float = Field(
             default=0.60,
-            description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring"
+            description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring",
         )
         memory_threshold: float = Field(
             default=0.6,
@@ -806,11 +926,11 @@ Analyze the following related memories and provide a concise summary.""",
         )
         vector_similarity_threshold: float = Field(
             default=0.60,
-            description="Minimum cosine similarity for initial vector filtering (0-1)"
+            description="Minimum cosine similarity for initial vector filtering (0-1)",
         )
         llm_skip_relevance_threshold: float = Field(
             default=0.93,
-            description="If *all* vector-filtered memories have similarity >= this threshold, treat the vector score as final relevance and skip the additional LLM call."
+            description="If *all* vector-filtered memories have similarity >= this threshold, treat the vector score as final relevance and skip the additional LLM call.",
         )
         top_n_memories: int = Field(
             default=3,
@@ -834,11 +954,11 @@ Analyze the following related memories and provide a concise summary.""",
         )
         embedding_similarity_threshold: float = Field(
             default=0.97,
-            description="Threshold (0-1) for considering two memories duplicates when using embedding similarity."
+            description="Threshold (0-1) for considering two memories duplicates when using embedding similarity.",
         )
         similarity_threshold: float = Field(
             default=0.95,
-            description="Threshold for detecting similar memories (0-1) using text or embeddings"
+            description="Threshold for detecting similar memories (0-1) using text or embeddings",
         )
         timezone: str = Field(
             default="Asia/Dubai",
@@ -883,10 +1003,10 @@ Analyze the following related memories and provide a concise summary.""",
         retry_delay: float = Field(
             default=1.0, description="Delay between retries (seconds)"
         )
-        
+
         # Prompts
         memory_identification_prompt: str = Field(
-            default='''You are an automated JSON data extraction system. Your ONLY function is to identify user-specific, persistent facts, preferences, goals, relationships, or interests from the user's messages and output them STRICTLY as a JSON array of operations.
+            default="""You are an automated JSON data extraction system. Your ONLY function is to identify user-specific, persistent facts, preferences, goals, relationships, or interests from the user's messages and output them STRICTLY as a JSON array of operations.
 
 **ABSOLUTE OUTPUT REQUIREMENT: FAILURE TO COMPLY WILL BREAK THE SYSTEM.**
 1.  Your **ENTIRE** response **MUST** be **ONLY** a valid JSON array starting with `[` and ending with `]`. 
@@ -958,7 +1078,7 @@ Analyze the following related memories and provide a concise summary.""",
 ]
 ```
 
-Analyze the following user message(s) and provide **ONLY** the JSON array output. Double-check your response starts with `[` and ends with `]` and contains **NO** other text whatsoever.''',
+Analyze the following user message(s) and provide **ONLY** the JSON array output. Double-check your response starts with `[` and ends with `]` and contains **NO** other text whatsoever.""",
             description="System prompt for memory identification",
         )
         memory_relevance_prompt: str = Field(
@@ -1003,29 +1123,29 @@ Return your result as a JSON array of strings, with each string being a merged m
 Your output must be valid JSON only. No additional text.""",
             description="System prompt for merging memories",
         )
-        
+
         # Memory Bank Config
         allowed_memory_banks: List[str] = Field(
             default=["General", "Personal", "Work"],
-            description="List of allowed memory bank names for categorization."
+            description="List of allowed memory bank names for categorization.",
         )
         default_memory_bank: str = Field(
             default="General",
-            description="Default memory bank assigned when LLM omits or supplies an invalid bank."
+            description="Default memory bank assigned when LLM omits or supplies an invalid bank.",
         )
 
         # Error Guard Config
         enable_error_counter_guard: bool = Field(
             default=True,
-            description="Enable guard to temporarily disable LLM/embedding features if specific error rates spike."
+            description="Enable guard to temporarily disable LLM/embedding features if specific error rates spike.",
         )
         error_guard_threshold: int = Field(
             default=5,
-            description="Number of errors within the window required to activate the guard."
+            description="Number of errors within the window required to activate the guard.",
         )
         error_guard_window_seconds: int = Field(
             default=600,
-            description="Rolling time-window (in seconds) over which errors are counted for guarding logic."
+            description="Rolling time-window (in seconds) over which errors are counted for guarding logic.",
         )
         debug_error_counter_logs: bool = Field(
             default=False,
@@ -1034,12 +1154,21 @@ Your output must be valid JSON only. No additional text.""",
 
         # Validators
         @field_validator(
-            'summarization_interval', 'error_logging_interval', 'date_update_interval',
-            'model_discovery_interval', 'max_total_memories', 'min_memory_length',
-            'recent_messages_n', 'related_memories_n', 'top_n_memories',
-            'cache_ttl_seconds', 'max_retries', 'max_injected_memory_length',
-            'summarization_min_cluster_size', 'summarization_max_cluster_size',
-            'summarization_min_memory_age_days',
+            "summarization_interval",
+            "error_logging_interval",
+            "date_update_interval",
+            "model_discovery_interval",
+            "max_total_memories",
+            "min_memory_length",
+            "recent_messages_n",
+            "related_memories_n",
+            "top_n_memories",
+            "cache_ttl_seconds",
+            "max_retries",
+            "max_injected_memory_length",
+            "summarization_min_cluster_size",
+            "summarization_max_cluster_size",
+            "summarization_min_memory_age_days",
         )
         def check_non_negative_int(cls, v, info):
             if not isinstance(v, int) or v < 0:
@@ -1047,26 +1176,31 @@ Your output must be valid JSON only. No additional text.""",
             return v
 
         @field_validator(
-            'save_relevance_threshold', 'relevance_threshold', 'memory_threshold',
-            'vector_similarity_threshold', 'similarity_threshold',
-            'summarization_similarity_threshold',
-            'llm_skip_relevance_threshold',
-            'embedding_similarity_threshold',
-            'min_confidence_threshold',
-            check_fields=False
+            "save_relevance_threshold",
+            "relevance_threshold",
+            "memory_threshold",
+            "vector_similarity_threshold",
+            "similarity_threshold",
+            "summarization_similarity_threshold",
+            "llm_skip_relevance_threshold",
+            "embedding_similarity_threshold",
+            "min_confidence_threshold",
+            check_fields=False,
         )
         def check_threshold_float(cls, v, info):
             if not (0.0 <= v <= 1.0):
-                raise ValueError(f"{info.field_name} must be between 0.0 and 1.0. Received: {v}")
+                raise ValueError(
+                    f"{info.field_name} must be between 0.0 and 1.0. Received: {v}"
+                )
             return v
-        
-        @field_validator('retry_delay')
+
+        @field_validator("retry_delay")
         def check_non_negative_float(cls, v, info):
             if not isinstance(v, float) or v < 0.0:
                 raise ValueError(f"{info.field_name} must be a non-negative float")
             return v
 
-        @field_validator('timezone')
+        @field_validator("timezone")
         def check_valid_timezone(cls, v):
             try:
                 pytz.timezone(v)
@@ -1077,50 +1211,69 @@ Your output must be valid JSON only. No additional text.""",
         @model_validator(mode="after")
         def check_llm_config(self):
             if self.llm_provider_type == "openai_compatible" and not self.llm_api_key:
-                raise ValueError("API Key is required when llm_provider_type is 'openai_compatible'")
+                raise ValueError(
+                    "API Key is required when llm_provider_type is 'openai_compatible'"
+                )
             return self
 
-        @field_validator('allowed_memory_banks', check_fields=False)
+        @field_validator("allowed_memory_banks", check_fields=False)
         def check_allowed_memory_banks(cls, v):
-            if not isinstance(v, list) or not v or v == ['']:
-                return cls.model_fields['allowed_memory_banks'].default
+            if not isinstance(v, list) or not v or v == [""]:
+                return cls.model_fields["allowed_memory_banks"].default
             cleaned_list = [str(item).strip() for item in v if str(item).strip()]
             if not cleaned_list:
-                return cls.model_fields['allowed_memory_banks'].default
+                return cls.model_fields["allowed_memory_banks"].default
             return cleaned_list
-        
+
         @model_validator(mode="after")
         def check_embedding_config(self):
             if self.embedding_provider_type == "openai_compatible":
                 if not self.embedding_api_key:
-                    raise ValueError("API Key required for openai_compatible embedding provider")
+                    raise ValueError(
+                        "API Key required for openai_compatible embedding provider"
+                    )
             return self
 
     class UserValves(BaseModel):
-        enabled: bool = Field(default=True, description="Enable or disable the memory function")
-        show_status: bool = Field(default=True, description="Show memory processing status updates")
-        timezone: str = Field(default="", description="User's timezone (overrides global setting if provided)")
+        enabled: bool = Field(
+            default=True, description="Enable or disable the memory function"
+        )
+        show_status: bool = Field(
+            default=True, description="Show memory processing status updates"
+        )
+        timezone: str = Field(
+            default="",
+            description="User's timezone (overrides global setting if provided)",
+        )
 
     # --------------------------------------------------------------------------
     # Main Filter Initialization
     # --------------------------------------------------------------------------
 
     def __init__(self):
+        logger.info("Initializing Adaptive Memory Filter...")
         self.valves = self.Valves()
+        logger.info(f"Valves initialized. Summarization enabled: {self.valves.enable_summarization_task}, interval: {self.valves.summarization_interval}")
+        logger.info(f"All valve values: summarization_interval={self.valves.summarization_interval}, error_logging_interval={self.valves.error_logging_interval}, date_update_interval={self.valves.date_update_interval}")
+        
         self.error_manager = ErrorManager()
         # Pass a lambda to always get the current valves state
-        self.embedding_manager = EmbeddingManager(lambda: self.valves, self.error_manager)
+        self.embedding_manager = EmbeddingManager(
+            lambda: self.valves, self.error_manager
+        )
         self.task_manager = TaskManager(self)
-        
+
         # Initialize internal state
         self._processed_messages = set()
         self._last_body = {}
-        self.memory_embeddings = {} # Local in-memory cache
-        self.seen_users = set() # Track active users for background tasks
-        self.notification_queue = [] # Queue for background task notifications
-        
+        self.memory_embeddings = {}  # Local in-memory cache
+        self.seen_users = set()  # Track active users for background tasks
+        self.notification_queue = []  # Queue for background task notifications
+
         logger.info("Adaptive Memory Filter Initialized (Streamlined + Summarization)")
+        logger.info("Starting background tasks...")
         self.task_manager.start_tasks()
+        logger.info("Filter initialization complete.")
 
     async def cleanup(self):
         await self.task_manager.stop_tasks()
@@ -1135,21 +1288,21 @@ Your output must be valid JSON only. No additional text.""",
         # ... logic to call Ollama or OpenAI ...
         # For brevity in this refactor step, simplified:
         try:
-             async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession() as session:
                 url = valves.llm_api_endpoint_url
                 headers = {"Content-Type": "application/json"}
                 if valves.llm_api_key:
                     headers["Authorization"] = f"Bearer {valves.llm_api_key}"
-                
+
                 payload = {
                     "model": valves.llm_model_name,
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
+                        {"role": "user", "content": user_prompt},
                     ],
-                    "stream": False
+                    "stream": False,
                 }
-                
+
                 if valves.llm_provider_type == "openai_compatible":
                     payload["response_format"] = {"type": "json_object"}
 
@@ -1157,7 +1310,7 @@ Your output must be valid JSON only. No additional text.""",
                     if resp.status == 200:
                         data = await resp.json()
                         # Extract content logic...
-                        if "choices" in data: 
+                        if "choices" in data:
                             return data["choices"][0]["message"]["content"]
                         elif "message" in data:
                             return data["message"]["content"]
@@ -1169,7 +1322,9 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
     # Core Pipeline: Inlet (Incoming Message)
     # --------------------------------------------------------------------------
-    async def inlet(self, body: Dict[str, Any], __event_emitter__=None, __user__=None) -> Dict[str, Any]:
+    async def inlet(
+        self, body: Dict[str, Any], __event_emitter__=None, __user__=None
+    ) -> Dict[str, Any]:
         """Process incoming message: Identify user, inject context memories."""
         if not __user__ or not body.get("messages"):
             logger.debug("Inlet: No user or messages, skipping.")
@@ -1179,44 +1334,53 @@ Your output must be valid JSON only. No additional text.""",
 
         # Safe UserValves instantiation
         raw_valves = __user__.get("valves", {})
-        if hasattr(raw_valves, 'model_dump'):
+        if hasattr(raw_valves, "model_dump"):
             user_valves = self.UserValves(**raw_valves.model_dump())
-        elif hasattr(raw_valves, 'dict'):
-             user_valves = self.UserValves(**raw_valves.dict())
+        elif hasattr(raw_valves, "dict"):
+            user_valves = self.UserValves(**raw_valves.dict())
         elif isinstance(raw_valves, dict):
             user_valves = self.UserValves(**raw_valves)
         elif isinstance(raw_valves, self.UserValves):
-             user_valves = raw_valves
+            user_valves = raw_valves
         else:
-             user_valves = self.UserValves()
+            user_valves = self.UserValves()
         if not user_valves.enabled:
             return body
-        
+
         user_id = __user__["id"]
-        self.seen_users.add(user_id) # Track active user
+        self.seen_users.add(user_id)  # Track active user
+        logger.debug(
+            f"User {user_id} added to active set. Total active users: {len(self.seen_users)}"
+        )
         messages = body["messages"]
         last_message = messages[-1]["content"]
 
         # Pipeline
-        pipeline = MemoryPipeline(self.valves, self.embedding_manager, self.error_manager)
+        pipeline = MemoryPipeline(
+            self.valves, self.embedding_manager, self.error_manager
+        )
 
         # 1. Retrieve all memories
         try:
-             # This gets generic memory objects (SYNC call)
-             all_memories = Memories.get_memories_by_user_id(user_id)
+            # This gets generic memory objects (SYNC call)
+            all_memories = Memories.get_memories_by_user_id(user_id)
         except Exception as e:
-             logger.error(f"Failed to fetch memories: {e}")
-             all_memories = []
+            logger.error(f"Failed to fetch memories: {e}")
+            all_memories = []
 
         # 2. Filter relevant memories
         relevant_memories = []
         if all_memories:
-            relevant_memories = await pipeline.get_relevant_memories(last_message, user_id, all_memories)
+            relevant_memories = await pipeline.get_relevant_memories(
+                last_message, user_id, all_memories
+            )
 
         # 3. Inject into system prompt
         if relevant_memories:
-            context_text = "User Memories:\n" + "\n".join([f"- {m.content}" for m in relevant_memories])
-            
+            context_text = "User Memories:\n" + "\n".join(
+                [f"- {m.content}" for m in relevant_memories]
+            )
+
             # Find system message or insert one
             if messages[0]["role"] == "system":
                 messages[0]["content"] += f"\n\n{context_text}"
@@ -1233,8 +1397,8 @@ Your output must be valid JSON only. No additional text.""",
                         "type": "status",
                         "data": {
                             "description": f"🧠 Recalled {count} {suffix}.",
-                            "done": True
-                        }
+                            "done": True,
+                        },
                     }
                     if __event_emitter__:
                         await __event_emitter__(status_dict)
@@ -1243,73 +1407,74 @@ Your output must be valid JSON only. No additional text.""",
                 while self.notification_queue:
                     msg = self.notification_queue.pop(0)
                     bg_status_dict = {
-                        "type": "status", # Or "status" with a different message
-                        "data": {
-                            "description": f"🧹 {msg}",
-                            "done": True
-                        }
+                        "type": "status",  # Or "status" with a different message
+                        "data": {"description": f"🧹 {msg}", "done": True},
                     }
                     if __event_emitter__:
                         logger.debug(f"Inlet: Emitting background notification: {msg}")
                         await __event_emitter__(bg_status_dict)
-        
+
         return body
 
     # --------------------------------------------------------------------------
     # Core Pipeline: Outlet (Response Processing)
     # --------------------------------------------------------------------------
-    async def outlet(self, body: Dict[str, Any], __event_emitter__=None, __user__=None) -> Dict[str, Any]:
+    async def outlet(
+        self, body: Dict[str, Any], __event_emitter__=None, __user__=None
+    ) -> Dict[str, Any]:
         """Process outgoing response: Extract memories, update status."""
         if not __user__ or not body.get("messages"):
             logger.debug("Outlet: No user or messages, skipping.")
             return body
-            
+
         logger.debug(f"Outlet called for user {__user__.get('id')}")
 
         # Safe UserValves instantiation
         raw_valves = __user__.get("valves", {})
-        if hasattr(raw_valves, 'model_dump'):
+        if hasattr(raw_valves, "model_dump"):
             user_valves = self.UserValves(**raw_valves.model_dump())
-        elif hasattr(raw_valves, 'dict'):
-             user_valves = self.UserValves(**raw_valves.dict())
+        elif hasattr(raw_valves, "dict"):
+            user_valves = self.UserValves(**raw_valves.dict())
         elif isinstance(raw_valves, dict):
             user_valves = self.UserValves(**raw_valves)
         elif isinstance(raw_valves, self.UserValves):
-             user_valves = raw_valves
+            user_valves = raw_valves
         else:
-             user_valves = self.UserValves()
+            user_valves = self.UserValves()
         if not user_valves.enabled:
             return body
 
         user_id = __user__["id"]
         messages = body["messages"]
-        
+
         # Get last user message
         user_message = ""
         for m in reversed(messages):
             if m["role"] == "user":
                 user_message = m["content"]
                 break
-        
+
         # Pipeline
-        pipeline = MemoryPipeline(self.valves, self.embedding_manager, self.error_manager)
-        
+        pipeline = MemoryPipeline(
+            self.valves, self.embedding_manager, self.error_manager
+        )
+
         # Identify Memories
         if user_message:
             # Pass our _query_llm as callback
             ops = await pipeline.identify_memories(
-                user_message, 
-                user_id, 
-                context_memories=[], 
-                query_llm_func=self._query_llm
+                user_message,
+                user_id,
+                context_memories=[],
+                query_llm_func=self._query_llm,
             )
             logger.debug(f"Outlet: Identified {len(ops)} memory operations.")
-            
+
             success_ops = []
             if ops:
                 # Process Operations (Save/Delete)
                 success_ops = await pipeline.process_memory_operations(ops, user_id)
-            
+
             # Show status if enabled
             if user_valves.show_status:
                 count = len(success_ops)
@@ -1321,51 +1486,66 @@ Your output must be valid JSON only. No additional text.""",
 
                 status_dict = {
                     "type": "status",
-                    "data": {
-                        "description": description,
-                        "done": True
-                    }
+                    "data": {"description": description, "done": True},
                 }
                 if __event_emitter__:
-                        logger.debug(f"Outlet: Emitting status event: {status_dict}")
-                        await __event_emitter__(status_dict)
+                    logger.debug(f"Outlet: Emitting status event: {status_dict}")
+                    await __event_emitter__(status_dict)
                 else:
-                        logger.warning("Outlet: No event emitter available for status.")
-        
+                    logger.warning("Outlet: No event emitter available for status.")
+
         return body
 
     # ... Placeholder for other required methods (referenced by TaskManager) ...
     async def _summarize_old_memories_loop(self):
         """Background task for summarization."""
+        logger.info(f"Summarization background task launched with interval: {self.valves.summarization_interval} seconds")
         while True:
             try:
-                await asyncio.sleep(self.valves.summarization_interval)
+                # Always get the current valve value in case it changed
+                interval = self.valves.summarization_interval
+                logger.info(f"Summarization task sleeping for {interval} seconds...")
+                await asyncio.sleep(interval)
+                logger.info(
+                    f"Summarization task waking up. Active users: {len(self.seen_users)}, enabled: {self.valves.enable_summarization_task}"
+                )
+
                 if self.valves.enable_summarization_task and self.seen_users:
-                    logger.info("Summarization task starting...")
-                    pipeline = MemoryPipeline(self.valves, self.embedding_manager, self.error_manager)
-                    
+                    logger.info("Summarization task starting scan...")
+                    pipeline = MemoryPipeline(
+                        self.valves, self.embedding_manager, self.error_manager
+                    )
+
                     # Copy set to avoid size change during iteration
                     active_users = list(self.seen_users)
                     for user_id in active_users:
                         try:
+                            logger.info(f"Processing summarization for user: {user_id}")
                             # Use _query_llm as callback
-                            result_msg = await pipeline.cluster_and_summarize(user_id, self._query_llm)
+                            result_msg = await pipeline.cluster_and_summarize(
+                                user_id, self._query_llm
+                            )
                             if result_msg and isinstance(result_msg, str):
                                 self.notification_queue.append(result_msg)
+                                logger.info(f"Summarization result queued: {result_msg}")
                         except Exception as u_err:
-                            logger.error(f"Summarization error for user {user_id}: {u_err}")
-                    
+                            logger.error(
+                                f"Summarization error for user {user_id}: {u_err}"
+                            )
+
                     logger.info("Summarization task cycle complete.")
+                else:
+                    logger.info(f"Summarization task skipped - enabled: {self.valves.enable_summarization_task}, users: {len(self.seen_users)}")
 
             except asyncio.CancelledError:
+                logger.info("Summarization task cancelled")
                 break
             except Exception as e:
                 logger.error(f"Summarization task error: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 await asyncio.sleep(60)
 
-            
     async def _log_error_counters_loop(self):
         while True:
             await asyncio.sleep(self.valves.error_logging_interval)
             logger.debug(f"Error Counters: {self.error_manager.get_counters()}")
-
