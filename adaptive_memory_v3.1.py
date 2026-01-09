@@ -544,9 +544,18 @@ class MemoryPipeline:
                         "tags": ["summary"],
                         "memory_bank": "General",
                         "confidence": 1.0 
+                        "confidence": 1.0 
                     }
                     await self.process_memory_operations([op], user_id)
                     logger.info(f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)")
+                        
+                    return f"Consolidated {len(cluster_memories)} memories into a summary."
+                        
+            except Exception as e:
+                self.error_manager.increment("memory_crud_errors")
+                logger.error(f"Memory operation failed: {e}")
+        
+        return None
                         
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
@@ -1114,6 +1123,7 @@ Your output must be valid JSON only. No additional text.""",
         self._last_body = {}
         self.memory_embeddings = {} # Local in-memory cache
         self.seen_users = set() # Track active users for background tasks
+        self.notification_queue = [] # Queue for background task notifications
         
         logger.info("Adaptive Memory Filter Initialized (Streamlined + Summarization)")
         self.task_manager.start_tasks()
@@ -1221,20 +1231,33 @@ Your output must be valid JSON only. No additional text.""",
 
             # Show status if enabled
             if user_valves.show_status:
+                # 1. Recall Notifications
                 count = len(relevant_memories)
-                suffix = "memory" if count == 1 else "memories"
-                status_dict = {
-                    "type": "status",
-                    "data": {
-                        "description": f"🧠 Recalled {count} {suffix}.",
-                        "done": True
+                if count > 0:
+                    suffix = "memory" if count == 1 else "memories"
+                    status_dict = {
+                        "type": "status",
+                        "data": {
+                            "description": f"🧠 Recalled {count} {suffix}.",
+                            "done": True
+                        }
                     }
-                }
-                if __event_emitter__:
-                    logger.debug(f"Inlet: Emitting status event: {status_dict}")
-                    await __event_emitter__(status_dict)
-                else:
-                    logger.warning("Inlet: No event emitter available for status.")
+                    if __event_emitter__:
+                        await __event_emitter__(status_dict)
+
+                # 2. Background Notifications (queued)
+                while self.notification_queue:
+                    msg = self.notification_queue.pop(0)
+                    bg_status_dict = {
+                        "type": "status", # Or "status" with a different message
+                        "data": {
+                            "description": f"🧹 {msg}",
+                            "done": True
+                        }
+                    }
+                    if __event_emitter__:
+                        logger.debug(f"Inlet: Emitting background notification: {msg}")
+                        await __event_emitter__(bg_status_dict)
         
         return body
 
@@ -1332,7 +1355,9 @@ Your output must be valid JSON only. No additional text.""",
                     for user_id in active_users:
                         try:
                             # Use _query_llm as callback
-                            await pipeline.cluster_and_summarize(user_id, self._query_llm)
+                            result_msg = await pipeline.cluster_and_summarize(user_id, self._query_llm)
+                            if result_msg and isinstance(result_msg, str):
+                                self.notification_queue.append(result_msg)
                         except Exception as u_err:
                             logger.error(f"Summarization error for user {user_id}: {u_err}")
                     
