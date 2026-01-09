@@ -1171,7 +1171,7 @@ Your output must be valid JSON only. No additional text.""",
             logger.debug("Inlet: No user or messages, skipping.")
             return body
 
-        logger.info(f"Inlet called for user {__user__.get('id')}")
+        logger.debug(f"Inlet called for user {__user__.get('id')}")
 
         # Safe UserValves instantiation
         raw_valves = __user__.get("valves", {})
@@ -1218,6 +1218,23 @@ Your output must be valid JSON only. No additional text.""",
                 messages[0]["content"] += f"\n\n{context_text}"
             else:
                 messages.insert(0, {"role": "system", "content": context_text})
+
+            # Show status if enabled
+            if user_valves.show_status:
+                count = len(relevant_memories)
+                suffix = "memory" if count == 1 else "memories"
+                status_dict = {
+                    "type": "status",
+                    "data": {
+                        "description": f"🧠 Recalled {count} {suffix}.",
+                        "done": True
+                    }
+                }
+                if __event_emitter__:
+                    logger.debug(f"Inlet: Emitting status event: {status_dict}")
+                    await __event_emitter__(status_dict)
+                else:
+                    logger.warning("Inlet: No event emitter available for status.")
         
         return body
 
@@ -1230,7 +1247,7 @@ Your output must be valid JSON only. No additional text.""",
             logger.debug("Outlet: No user or messages, skipping.")
             return body
             
-        logger.info(f"Outlet called for user {__user__.get('id')}")
+        logger.debug(f"Outlet called for user {__user__.get('id')}")
 
         # Safe UserValves instantiation
         raw_valves = __user__.get("valves", {})
@@ -1269,7 +1286,7 @@ Your output must be valid JSON only. No additional text.""",
                 context_memories=[], 
                 query_llm_func=self._query_llm
             )
-            logger.info(f"Outlet: Identified {len(ops)} memory operations.")
+            logger.debug(f"Outlet: Identified {len(ops)} memory operations.")
             
             success_ops = []
             if ops:
@@ -1293,7 +1310,7 @@ Your output must be valid JSON only. No additional text.""",
                     }
                 }
                 if __event_emitter__:
-                        logger.info(f"Outlet: Emitting status event: {status_dict}")
+                        logger.debug(f"Outlet: Emitting status event: {status_dict}")
                         await __event_emitter__(status_dict)
                 else:
                         logger.warning("Outlet: No event emitter available for status.")
@@ -1331,5 +1348,5 @@ Your output must be valid JSON only. No additional text.""",
     async def _log_error_counters_loop(self):
         while True:
             await asyncio.sleep(self.valves.error_logging_interval)
-            logger.info(f"Error Counters: {self.error_manager.get_counters()}")
+            logger.debug(f"Error Counters: {self.error_manager.get_counters()}")
 
