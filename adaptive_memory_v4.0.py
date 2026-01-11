@@ -521,10 +521,11 @@ class MemoryPipeline:
                     tags = op.get("tags", [])
                     bank = op.get("memory_bank", "General")
 
-                    # Deduplication check (on raw content or full content? Raw is better for semantic check)
+                    # Deduplication check
                     if self.valves.deduplicate_memories:
                         is_dupe = await self._is_duplicate(content, user_id)
                         if is_dupe:
+                            logger.info(f"Skipping duplicate memory: '{content[:50]}...'")
                             continue
 
                     # Format: [Tags: tag1, tag2] Content [Memory Bank: Bank] [Confidence: X.XX]
@@ -537,6 +538,7 @@ class MemoryPipeline:
                     try:
                         mem_obj = Memories.insert_new_memory(user_id, final_content)
                         success_ops.append(op)
+                        logger.info(f"Memory saved: '{content[:50]}...' [Bank: {bank}] [Confidence: {confidence:.2f}]")
                     except Exception as ins_err:
                         logger.error(f"Failed to insert memory: {ins_err}")
 
@@ -554,8 +556,136 @@ class MemoryPipeline:
         return success_ops
 
     async def _is_duplicate(self, text: str, user_id: str) -> bool:
-        # Placeholder for deduplication
-        # In a real impl, check vector similarity against all memories
+        """Check if the given text is a duplicate of existing memories using embedding or text similarity."""
+        if not text or not self.valves.deduplicate_memories:
+            return False
+            
+        try:
+            # Get all existing memories for the user
+            all_memories = Memories.get_memories_by_user_id(user_id)
+            if not all_memories:
+                return False
+
+            if self.valves.use_embeddings_for_deduplication:
+                # Use embedding-based similarity
+                new_embedding = await self.embedding_manager.get_embedding(text)
+                if new_embedding is None:
+                    logger.warning("Could not generate embedding for duplicate check, falling back to text similarity")
+                    return await self._check_text_similarity(text, all_memories)
+                    
+                # Check similarity against existing memories
+                for i, memory in enumerate(all_memories):
+                    memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
+                    memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
+                    
+                    # Extract raw content from formatted memory for comparison
+                    # Format: [Tags: ...] CONTENT [Memory Bank: ...] [Confidence: ...]
+                    raw_memory_content = memory_content
+                    
+                    # Extract content between tags and memory bank
+                    if '[Tags:' in memory_content and '[Memory Bank:' in memory_content:
+                        # Find the end of tags section
+                        tags_end = memory_content.find(']', memory_content.find('[Tags:'))
+                        if tags_end != -1:
+                            # Find the start of memory bank section
+                            bank_start = memory_content.find('[Memory Bank:', tags_end)
+                            if bank_start != -1:
+                                # Extract content between tags and memory bank
+                                raw_memory_content = memory_content[tags_end + 1:bank_start].strip()
+                    
+
+                    # Check for exact match first (ignoring punctuation and case)
+                    def normalize_text(t):
+                        import re
+                        # Remove punctuation, extra spaces, convert to lowercase
+                        normalized = re.sub(r'[^\w\s]', '', t.strip().lower())
+                        
+                        # Handle common plural variations
+                        normalized = re.sub(r'\bs\b', '', normalized)  # Remove standalone 's'
+                        normalized = re.sub(r'(\w)s\b', r'\1', normalized)  # Remove trailing 's' from words
+                        
+                        # Handle common verb tense variations
+                        normalized = re.sub(r'\bwould like\b', 'like', normalized)  # "would like" -> "like"
+                        normalized = re.sub(r'\bwould want\b', 'want', normalized)  # "would want" -> "want"
+                        normalized = re.sub(r'\bwould enjoy\b', 'enjoy', normalized)  # "would enjoy" -> "enjoy"
+                        normalized = re.sub(r'\bwould love\b', 'love', normalized)  # "would love" -> "love"
+                        normalized = re.sub(r'\bwould prefer\b', 'prefer', normalized)  # "would prefer" -> "prefer"
+                        
+                        # Handle "likes" vs "like"
+                        normalized = re.sub(r'\blikes\b', 'like', normalized)
+                        normalized = re.sub(r'\bwants\b', 'want', normalized)
+                        normalized = re.sub(r'\benjoys\b', 'enjoy', normalized)
+                        normalized = re.sub(r'\bloves\b', 'love', normalized)
+                        normalized = re.sub(r'\bprefers\b', 'prefer', normalized)
+                        
+                        # Normalize synonymous verbs to a common form
+                        normalized = re.sub(r'\b(love|enjoy|like)\b', 'like', normalized)  # All positive preferences -> "like"
+                        normalized = re.sub(r'\b(want|desire|crave)\b', 'want', normalized)  # All desires -> "want"
+                        
+                        # Remove articles (a, an, the)
+                        normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
+                        
+                        # Remove common adjectives/modifiers that don't change meaning
+                        normalized = re.sub(r'\b(good|great|nice|cold|refreshing|perfect|awesome|amazing|wonderful)\b', '', normalized)
+                        
+                        # Remove intensifiers
+                        normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
+                        
+                        # Clean up extra spaces
+                        normalized = re.sub(r'\s+', ' ', normalized).strip()
+                        return normalized
+                    
+                    if normalize_text(text) == normalize_text(raw_memory_content):
+                        logger.info(f"Exact match found (normalized): '{text[:50]}...' matches existing memory")
+                        return True
+                    
+                    # Use raw content for embedding comparison
+                    content_for_embedding = raw_memory_content
+                    # Check cache first
+                    existing_embedding = self.embedding_manager.cache.get(memory_id)
+                    if existing_embedding is None:
+                        # Generate embedding for existing memory using raw content
+                        existing_embedding = await self.embedding_manager.get_embedding(content_for_embedding)
+                        if existing_embedding is not None:
+                            # Cache it for future use
+                            self.embedding_manager.cache[memory_id] = existing_embedding
+                    
+                    if existing_embedding is not None:
+                        # Calculate similarity
+                        similarity = self._cosine_similarity(new_embedding, existing_embedding)
+                        
+                        # Use embedding similarity threshold from valves
+                        if similarity >= self.valves.embedding_similarity_threshold:
+                            logger.info(f"Duplicate detected via embeddings (similarity: {similarity:.3f}): '{text[:50]}...'")
+                            return True
+                    else:
+                        logger.warning(f"Could not generate embedding for existing memory: '{memory_content[:50]}...'")
+            else:
+                # Use text-based similarity
+                return await self._check_text_similarity(text, all_memories)
+                        
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error during duplicate check: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            # If deduplication fails, err on the side of caution and don't save
+            return True
+
+    async def _check_text_similarity(self, text: str, all_memories: List[Any]) -> bool:
+        """Check for text-based similarity using difflib."""
+        import difflib
+        
+        for i, memory in enumerate(all_memories):
+            memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
+            
+            # Calculate text similarity using difflib
+            similarity = difflib.SequenceMatcher(None, text.lower().strip(), memory_content.lower().strip()).ratio()
+            
+            if similarity >= self.valves.similarity_threshold:
+                logger.info(f"Duplicate detected via text similarity (similarity: {similarity:.3f}): '{text[:50]}...'")
+                return True
+                
         return False
 
     # --- Summarization ---
@@ -669,10 +799,6 @@ class MemoryPipeline:
 
         return None
 
-    async def _is_duplicate(self, text: str, user_id: str) -> bool:
-        # Implementation of deduplication logic
-        return False
-
 
 class TaskManager:
     """Manages background tasks."""
@@ -683,27 +809,28 @@ class TaskManager:
 
     def start_tasks(self):
         valves = self.filter.valves
-        logger.info(f"TaskManager starting tasks. Summarization enabled: {valves.enable_summarization_task}")
+        logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}, deduplication={valves.enable_deduplication_task}, error_logging={valves.enable_error_logging_task}")
 
         if valves.enable_summarization_task:
-            logger.info(f"Creating summarization task with interval: {valves.summarization_interval}")
             task = asyncio.create_task(self.filter._summarize_old_memories_loop())
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
-            logger.info(f"Summarization task created. Total tasks: {len(self.tasks)}")
 
         if valves.enable_error_logging_task:
-            logger.info(f"Creating error logging task with interval: {valves.error_logging_interval}")
             task = asyncio.create_task(self.filter._log_error_counters_loop())
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
+        if valves.enable_deduplication_task:
+            task = asyncio.create_task(self.filter._deduplicate_memories_loop())
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
 
         if valves.enable_date_update_task:
             # Just sets a variable, simplistic
-            logger.info("Date update task enabled (no actual task created)")
             pass
 
-        logger.info(f"TaskManager initialization complete. Total active tasks: {len(self.tasks)}")
+        logger.info(f"Background tasks started: {len(self.tasks)} active tasks")
 
     async def stop_tasks(self):
         for task in self.tasks:
@@ -759,6 +886,14 @@ class Filter:
         error_logging_interval: int = Field(
             default=1800,
             description="Interval in seconds between error counter log entries",
+        )
+        enable_deduplication_task: bool = Field(
+            default=True,
+            description="Enable or disable the background memory deduplication task",
+        )
+        deduplication_interval: int = Field(
+            default=14400,
+            description="Interval in seconds between memory deduplication runs (default: 4 hours)",
         )
         enable_date_update_task: bool = Field(
             default=True,
@@ -953,7 +1088,7 @@ Analyze the following related memories and provide a concise summary.""",
             description="Use embedding-based similarity for more accurate semantic duplicate detection (if False, uses text-based similarity)",
         )
         embedding_similarity_threshold: float = Field(
-            default=0.97,
+            default=0.75,
             description="Threshold (0-1) for considering two memories duplicates when using embedding similarity.",
         )
         similarity_threshold: float = Field(
@@ -1251,11 +1386,8 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter...")
+        logger.info("Initializing Adaptive Memory Filter v4.0")
         self.valves = self.Valves()
-        logger.info(f"Valves initialized. Summarization enabled: {self.valves.enable_summarization_task}, interval: {self.valves.summarization_interval}")
-        logger.info(f"All valve values: summarization_interval={self.valves.summarization_interval}, error_logging_interval={self.valves.error_logging_interval}, date_update_interval={self.valves.date_update_interval}")
-        
         self.error_manager = ErrorManager()
         # Pass a lambda to always get the current valves state
         self.embedding_manager = EmbeddingManager(
@@ -1270,10 +1402,9 @@ Your output must be valid JSON only. No additional text.""",
         self.seen_users = set()  # Track active users for background tasks
         self.notification_queue = []  # Queue for background task notifications
 
-        logger.info("Adaptive Memory Filter Initialized (Streamlined + Summarization)")
         logger.info("Starting background tasks...")
         self.task_manager.start_tasks()
-        logger.info("Filter initialization complete.")
+        logger.info("Adaptive Memory Filter v4.0 initialized successfully")
 
     async def cleanup(self):
         await self.task_manager.stop_tasks()
@@ -1327,10 +1458,7 @@ Your output must be valid JSON only. No additional text.""",
     ) -> Dict[str, Any]:
         """Process incoming message: Identify user, inject context memories."""
         if not __user__ or not body.get("messages"):
-            logger.debug("Inlet: No user or messages, skipping.")
             return body
-
-        logger.debug(f"Inlet called for user {__user__.get('id')}")
 
         # Safe UserValves instantiation
         raw_valves = __user__.get("valves", {})
@@ -1349,9 +1477,6 @@ Your output must be valid JSON only. No additional text.""",
 
         user_id = __user__["id"]
         self.seen_users.add(user_id)  # Track active user
-        logger.debug(
-            f"User {user_id} added to active set. Total active users: {len(self.seen_users)}"
-        )
         messages = body["messages"]
         last_message = messages[-1]["content"]
 
@@ -1374,6 +1499,9 @@ Your output must be valid JSON only. No additional text.""",
             relevant_memories = await pipeline.get_relevant_memories(
                 last_message, user_id, all_memories
             )
+            logger.info(f"Memory retrieval: found {len(relevant_memories)} relevant memories from {len(all_memories)} total memories")
+        else:
+            logger.debug(f"Memory retrieval: no existing memories found for user {user_id}")
 
         # 3. Inject into system prompt
         if relevant_memories:
@@ -1411,7 +1539,6 @@ Your output must be valid JSON only. No additional text.""",
                         "data": {"description": f"🧹 {msg}", "done": True},
                     }
                     if __event_emitter__:
-                        logger.debug(f"Inlet: Emitting background notification: {msg}")
                         await __event_emitter__(bg_status_dict)
 
         return body
@@ -1424,10 +1551,7 @@ Your output must be valid JSON only. No additional text.""",
     ) -> Dict[str, Any]:
         """Process outgoing response: Extract memories, update status."""
         if not __user__ or not body.get("messages"):
-            logger.debug("Outlet: No user or messages, skipping.")
             return body
-
-        logger.debug(f"Outlet called for user {__user__.get('id')}")
 
         # Safe UserValves instantiation
         raw_valves = __user__.get("valves", {})
@@ -1468,12 +1592,19 @@ Your output must be valid JSON only. No additional text.""",
                 context_memories=[],
                 query_llm_func=self._query_llm,
             )
-            logger.debug(f"Outlet: Identified {len(ops)} memory operations.")
+            logger.info(f"Memory extraction: identified {len(ops)} potential memories from user message")
 
             success_ops = []
             if ops:
                 # Process Operations (Save/Delete)
                 success_ops = await pipeline.process_memory_operations(ops, user_id)
+                
+            if len(success_ops) > 0:
+                logger.info(f"Memory operations: saved {len(success_ops)} new memories (skipped {len(ops) - len(success_ops)} duplicates)")
+            elif len(ops) > 0:
+                logger.info(f"Memory operations: all {len(ops)} identified memories were duplicates, none saved")
+            else:
+                logger.debug("Memory operations: no memories identified from user message")
 
             # Show status if enabled
             if user_valves.show_status:
@@ -1489,7 +1620,6 @@ Your output must be valid JSON only. No additional text.""",
                     "data": {"description": description, "done": True},
                 }
                 if __event_emitter__:
-                    logger.debug(f"Outlet: Emitting status event: {status_dict}")
                     await __event_emitter__(status_dict)
                 else:
                     logger.warning("Outlet: No event emitter available for status.")
@@ -1504,14 +1634,13 @@ Your output must be valid JSON only. No additional text.""",
             try:
                 # Always get the current valve value in case it changed
                 interval = self.valves.summarization_interval
-                logger.info(f"Summarization task sleeping for {interval} seconds...")
                 await asyncio.sleep(interval)
                 logger.info(
-                    f"Summarization task waking up. Active users: {len(self.seen_users)}, enabled: {self.valves.enable_summarization_task}"
+                    f"Summarization task running. Active users: {len(self.seen_users)}, enabled: {self.valves.enable_summarization_task}"
                 )
 
                 if self.valves.enable_summarization_task and self.seen_users:
-                    logger.info("Summarization task starting scan...")
+                    logger.info("Background summarization: starting scan...")
                     pipeline = MemoryPipeline(
                         self.valves, self.embedding_manager, self.error_manager
                     )
@@ -1520,22 +1649,24 @@ Your output must be valid JSON only. No additional text.""",
                     active_users = list(self.seen_users)
                     for user_id in active_users:
                         try:
-                            logger.info(f"Processing summarization for user: {user_id}")
+                            logger.info(f"Background summarization: processing user {user_id}")
                             # Use _query_llm as callback
                             result_msg = await pipeline.cluster_and_summarize(
                                 user_id, self._query_llm
                             )
                             if result_msg and isinstance(result_msg, str):
                                 self.notification_queue.append(result_msg)
-                                logger.info(f"Summarization result queued: {result_msg}")
+                                logger.info(f"Background summarization: {result_msg}")
+                            else:
+                                logger.debug(f"Background summarization: no clusters found for user {user_id}")
                         except Exception as u_err:
                             logger.error(
-                                f"Summarization error for user {user_id}: {u_err}"
+                                f"Background summarization error for user {user_id}: {u_err}"
                             )
 
-                    logger.info("Summarization task cycle complete.")
+                    logger.info("Background summarization: cycle complete")
                 else:
-                    logger.info(f"Summarization task skipped - enabled: {self.valves.enable_summarization_task}, users: {len(self.seen_users)}")
+                    logger.debug(f"Background summarization: skipped (enabled: {self.valves.enable_summarization_task}, users: {len(self.seen_users)})")
 
             except asyncio.CancelledError:
                 logger.info("Summarization task cancelled")
@@ -1549,3 +1680,90 @@ Your output must be valid JSON only. No additional text.""",
         while True:
             await asyncio.sleep(self.valves.error_logging_interval)
             logger.debug(f"Error Counters: {self.error_manager.get_counters()}")
+
+    async def _deduplicate_memories_loop(self):
+        """Background task for removing duplicate memories."""
+        logger.info("Deduplication background task launched.")
+        
+        while True:
+            try:
+                # Always get the current valve value in case it changed
+                interval = self.valves.deduplication_interval
+                await asyncio.sleep(interval)
+                
+                logger.info(f"Deduplication task running. Active users: {len(self.seen_users)}")
+
+                if self.valves.enable_deduplication_task and self.seen_users:
+                    logger.info("Background deduplication: starting scan...")
+                    
+                    # Copy set to avoid size change during iteration
+                    active_users = list(self.seen_users)
+                    for user_id in active_users:
+                        try:
+                            logger.info(f"Background deduplication: processing user {user_id}")
+                            duplicates_removed = await self._remove_duplicate_memories(user_id)
+                            if duplicates_removed > 0:
+                                result_msg = f"Removed {duplicates_removed} duplicate memories."
+                                self.notification_queue.append(result_msg)
+                                logger.info(f"Background deduplication: {result_msg}")
+                            else:
+                                logger.debug(f"Background deduplication: no duplicates found for user {user_id}")
+                        except Exception as u_err:
+                            logger.error(f"Background deduplication error for user {user_id}: {u_err}")
+
+                    logger.info("Background deduplication: cycle complete")
+                else:
+                    logger.debug(f"Background deduplication: skipped (enabled: {self.valves.enable_deduplication_task}, users: {len(self.seen_users)})")
+
+            except asyncio.CancelledError:
+                logger.info("Deduplication task cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Deduplication task error: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                await asyncio.sleep(60)
+
+    async def _remove_duplicate_memories(self, user_id: str) -> int:
+        """Remove duplicate memories for a user and return count of removed duplicates."""
+        try:
+            all_memories = Memories.get_memories_by_user_id(user_id)
+            if not all_memories or len(all_memories) < 2:
+                return 0
+                
+            duplicates_removed = 0
+            pipeline = MemoryPipeline(self.valves, self.embedding_manager, self.error_manager)
+            
+            # Check each memory against all others
+            for i, memory in enumerate(all_memories):
+                if hasattr(memory, 'content'):
+                    memory_content = memory.content
+                    memory_id = memory.id
+                else:
+                    memory_content = memory.get('content')
+                    memory_id = memory.get('id')
+                
+                # Extract raw content
+                raw_content = memory_content
+                if '[Tags:' in memory_content and '[Memory Bank:' in memory_content:
+                    tags_end = memory_content.find(']', memory_content.find('[Tags:'))
+                    if tags_end != -1:
+                        bank_start = memory_content.find('[Memory Bank:', tags_end)
+                        if bank_start != -1:
+                            raw_content = memory_content[tags_end + 1:bank_start].strip()
+                
+                # Check if this memory is a duplicate of any previous memory
+                is_duplicate = await pipeline._is_duplicate(raw_content, user_id)
+                if is_duplicate:
+                    # Remove this duplicate
+                    try:
+                        Memories.delete_memory_by_id(memory_id)
+                        duplicates_removed += 1
+                        logger.info(f"Removed duplicate memory: '{raw_content[:50]}...'")
+                    except Exception as del_err:
+                        logger.error(f"Failed to delete duplicate memory {memory_id}: {del_err}")
+                        
+            return duplicates_removed
+            
+        except Exception as e:
+            logger.error(f"Error during background deduplication: {e}")
+            return 0
