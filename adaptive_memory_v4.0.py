@@ -306,7 +306,7 @@ class EmbeddingManager:
     def __init__(self, get_valves: Callable[[], Any], error_manager: ErrorManager):
         self.get_valves = get_valves
         self.error_manager = error_manager
-        self.cache: Dict[str, np.ndarray] = {}
+        self.cache: Dict[str, np.ndarray] = {}  # In-memory cache
         self.provider: Optional[EmbeddingProvider] = None
         self._current_provider_type = None
 
@@ -362,7 +362,103 @@ class EmbeddingManager:
             return [None] * len(texts)
         return await self.provider.get_embeddings_batch(texts)
 
-    # Store/Load persistence logic can be migrated here.
+    async def store_embedding_persistent(self, user_id: str, memory_id: str, memory_text: str, embedding: np.ndarray) -> None:
+        """Store memory embedding in a persistent JSON file for reload across restarts."""
+        try:
+            # Use data directory for persistence
+            cache_dir = "/app/backend/data/cache/embeddings"
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+            
+            # Load existing cache
+            cache = {}
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'r') as f:
+                        cache = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Error loading embedding cache, starting fresh: {e}")
+            
+            # Convert numpy array to list for JSON storage
+            embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
+            
+            # Store embedding with metadata
+            cache[memory_id] = {
+                "embedding": embedding_list,
+                "model": self.get_valves().embedding_model_name,
+                "provider": self.get_valves().embedding_provider_type,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Save cache
+            with open(cache_file, 'w') as f:
+                json.dump(cache, f)
+            
+            logger.debug(f"Stored embedding for memory {memory_id} in persistent cache")
+        except Exception as e:
+            logger.warning(f"Failed to store embedding in persistent cache for memory {memory_id}: {e}")
+            # Non-critical - embedding will be regenerated if needed
+
+    async def load_embedding_persistent(self, user_id: str, memory_id: str) -> Optional[np.ndarray]:
+        """Load a stored embedding from the persistent JSON file."""
+        try:
+            cache_dir = "/app/backend/data/cache/embeddings"
+            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+            
+            if not os.path.exists(cache_file):
+                return None
+            
+            # Load cache
+            with open(cache_file, 'r') as f:
+                cache = json.load(f)
+            
+            if memory_id in cache:
+                embedding_data = cache[memory_id]
+                embedding_list = embedding_data["embedding"]
+                embedding = np.array(embedding_list, dtype=np.float32)
+                
+                # Validate model compatibility (optional - could regenerate if different)
+                valves = self.get_valves()
+                if (embedding_data.get("model") != valves.embedding_model_name or 
+                    embedding_data.get("provider") != valves.embedding_provider_type):
+                    logger.debug(f"Embedding model/provider changed for memory {memory_id}, will regenerate")
+                    return None
+                
+                return embedding
+            
+            return None
+        except Exception as e:
+            logger.warning(f"Error loading embedding from persistent cache for memory {memory_id}: {e}")
+            return None
+
+    async def get_embedding_with_persistence(self, text: str, user_id: str, memory_id: str) -> Optional[np.ndarray]:
+        """Get embedding with full caching hierarchy: memory -> persistent -> generate."""
+        if not text:
+            return None
+
+        # 1. Check in-memory cache first
+        cached_emb = self.cache.get(memory_id)
+        if cached_emb is not None:
+            return cached_emb
+
+        # 2. Check persistent cache
+        persistent_emb = await self.load_embedding_persistent(user_id, memory_id)
+        if persistent_emb is not None:
+            # Cache in memory for this session
+            self.cache[memory_id] = persistent_emb
+            logger.debug(f"Loaded embedding for memory {memory_id} from persistent cache")
+            return persistent_emb
+
+        # 3. Generate new embedding
+        new_emb = await self.get_embedding(text)
+        if new_emb is not None:
+            # Cache in memory
+            self.cache[memory_id] = new_emb
+            # Store persistently
+            await self.store_embedding_persistent(user_id, memory_id, text, new_emb)
+            logger.debug(f"Generated and cached new embedding for memory {memory_id}")
+        
+        return new_emb
 
 
 # ------------------------------------------------------------------------------
@@ -467,29 +563,47 @@ class MemoryPipeline:
             mem_content = mem.content if hasattr(mem, "content") else mem.get("content")
             mem_id = mem.id if hasattr(mem, "id") else mem.get("id")
 
+            # Check in-memory cache first
             cached_emb = self.embedding_manager.cache.get(mem_id)
             if cached_emb is not None:
                 sim = self._cosine_similarity(query_embedding, cached_emb)
                 if sim >= self.valves.vector_similarity_threshold:
                     scored_memories.append((sim, mem))
             else:
-                mem_objects.append(mem)
-                texts_to_embed.append(mem_content)
-                ids_to_embed.append(mem_id)
+                # Check persistent cache
+                persistent_emb = await self.embedding_manager.load_embedding_persistent(user_id, mem_id)
+                if persistent_emb is not None:
+                    # Cache in memory for this session
+                    self.embedding_manager.cache[mem_id] = persistent_emb
+                    sim = self._cosine_similarity(query_embedding, persistent_emb)
+                    if sim >= self.valves.vector_similarity_threshold:
+                        scored_memories.append((sim, mem))
+                else:
+                    # Need to generate embedding
+                    mem_objects.append(mem)
+                    texts_to_embed.append(mem_content)
+                    ids_to_embed.append(mem_id)
 
         if texts_to_embed:
+            logger.info(f"Generating embeddings for {len(texts_to_embed)} memories (using cache for {len(all_memories) - len(texts_to_embed)})")
             # Batch generate
             new_embeddings = await self.embedding_manager.get_embeddings_batch(
                 texts_to_embed
             )
             for i, emb in enumerate(new_embeddings):
                 if emb is not None:
-                    # Update cache
+                    # Update in-memory cache
                     self.embedding_manager.cache[ids_to_embed[i]] = emb
+                    # Store persistently
+                    await self.embedding_manager.store_embedding_persistent(
+                        user_id, ids_to_embed[i], texts_to_embed[i], emb
+                    )
                     # Score
                     sim = self._cosine_similarity(query_embedding, emb)
                     if sim >= self.valves.vector_similarity_threshold:
                         scored_memories.append((sim, mem_objects[i]))
+        else:
+            logger.info(f"Using cached embeddings for all {len(all_memories)} memories")
 
         # Sort by similarity
         scored_memories.sort(key=lambda x: x[0], reverse=True)
@@ -641,14 +755,23 @@ class MemoryPipeline:
                     
                     # Use raw content for embedding comparison
                     content_for_embedding = raw_memory_content
-                    # Check cache first
+                    # Check in-memory cache first
                     existing_embedding = self.embedding_manager.cache.get(memory_id)
                     if existing_embedding is None:
-                        # Generate embedding for existing memory using raw content
-                        existing_embedding = await self.embedding_manager.get_embedding(content_for_embedding)
+                        # Check persistent cache
+                        existing_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
                         if existing_embedding is not None:
-                            # Cache it for future use
+                            # Cache in memory for this session
                             self.embedding_manager.cache[memory_id] = existing_embedding
+                        else:
+                            # Generate embedding for existing memory using raw content
+                            existing_embedding = await self.embedding_manager.get_embedding(content_for_embedding)
+                            if existing_embedding is not None:
+                                # Cache in memory and store persistently
+                                self.embedding_manager.cache[memory_id] = existing_embedding
+                                await self.embedding_manager.store_embedding_persistent(
+                                    user_id, memory_id, content_for_embedding, existing_embedding
+                                )
                     
                     if existing_embedding is not None:
                         # Calculate similarity
@@ -711,16 +834,54 @@ class MemoryPipeline:
             logger.error(f"Summarization fetch failed: {e}")
             return
 
-        # 2. Get embeddings
-        # For simplicity, we'll re-embed everything to ensure we have vectors.
-        # (Optimally, use a cache)
-        logger.info(f"Generating embeddings for {len(memories)} memories")
+        # 2. Get embeddings (use cache when possible)
+        logger.info(f"Processing embeddings for {len(memories)} memories")
         contents = [m.content for m in memories]
         ids = [m.id for m in memories]
-        embeddings = await self.embedding_manager.get_embeddings_batch(contents)
+        
+        # Check cache hierarchy: memory -> persistent -> generate
+        embeddings = []
+        uncached_indices = []
+        uncached_contents = []
+        
+        for i, (memory_id, content) in enumerate(zip(ids, contents)):
+            # Check in-memory cache first
+            cached_embedding = self.embedding_manager.cache.get(memory_id)
+            if cached_embedding is not None:
+                embeddings.append(cached_embedding)
+            else:
+                # Check persistent cache
+                persistent_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
+                if persistent_embedding is not None:
+                    # Cache in memory for this session
+                    self.embedding_manager.cache[memory_id] = persistent_embedding
+                    embeddings.append(persistent_embedding)
+                else:
+                    # Need to generate
+                    embeddings.append(None)  # Placeholder
+                    uncached_indices.append(i)
+                    uncached_contents.append(content)
+        
+        # Generate embeddings for uncached memories
+        if uncached_contents:
+            logger.info(f"Generating embeddings for {len(uncached_contents)} uncached memories (using cache for {len(memories) - len(uncached_contents)})")
+            new_embeddings = await self.embedding_manager.get_embeddings_batch(uncached_contents)
+            
+            # Update cache and embeddings list
+            for idx, new_emb in zip(uncached_indices, new_embeddings):
+                if new_emb is not None:
+                    embeddings[idx] = new_emb
+                    # Cache in memory
+                    self.embedding_manager.cache[ids[idx]] = new_emb
+                    # Store persistently
+                    await self.embedding_manager.store_embedding_persistent(
+                        user_id, ids[idx], uncached_contents[uncached_indices.index(idx)], new_emb
+                    )
+        else:
+            logger.info(f"Using cached embeddings for all {len(memories)} memories")
 
         valid_indices = [i for i, e in enumerate(embeddings) if e is not None]
-        logger.info(f"Successfully generated {len(valid_indices)} embeddings out of {len(embeddings)}")
+        logger.info(f"Ready for clustering: {len(valid_indices)} valid embeddings ({len(memories) - len(uncached_contents)} from cache, {len([e for e in new_embeddings if e is not None]) if uncached_contents else 0} newly generated)")
         
         if len(valid_indices) < self.valves.summarization_min_cluster_size:
             logger.info(f"Only {len(valid_indices)} valid embeddings, need at least {self.valves.summarization_min_cluster_size} for clustering")
