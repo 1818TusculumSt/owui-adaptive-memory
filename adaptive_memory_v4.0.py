@@ -190,12 +190,12 @@ class JSONParser:
 
 class EmbeddingProvider(ABC):
     @abstractmethod
-    async def get_embedding(self, text: str) -> Optional[np.ndarray]:
+    async def get_embedding(self, text: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[np.ndarray]:
         pass
 
     @abstractmethod
     async def get_embeddings_batch(
-        self, texts: List[str]
+        self, texts: List[str], session: Optional[aiohttp.ClientSession] = None
     ) -> List[Optional[np.ndarray]]:
         pass
 
@@ -211,7 +211,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             except Exception as e:
                 logger.exception(f"Failed to load local SentenceTransformer model: {e}")
 
-    async def get_embedding(self, text: str) -> Optional[np.ndarray]:
+    async def get_embedding(self, text: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[np.ndarray]:
         if not self.model:
             return None
         try:
@@ -226,7 +226,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             return None
 
     async def get_embeddings_batch(
-        self, texts: List[str]
+        self, texts: List[str], session: Optional[aiohttp.ClientSession] = None
     ) -> List[Optional[np.ndarray]]:
         if not self.model or not texts:
             return [None] * len(texts)
@@ -250,15 +250,19 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
         self.api_key = api_key
         self.model_name = model_name
 
-    async def get_embedding(self, text: str) -> Optional[np.ndarray]:
+    async def get_embedding(self, text: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[np.ndarray]:
         try:
-            async with aiohttp.ClientSession() as session:
+            # Use provided session or create one (fallback)
+            inner_session = session if session else aiohttp.ClientSession()
+            should_close = session is None
+            
+            try:
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}",
                 }
                 data = {"input": text, "model": self.model_name}
-                async with session.post(
+                async with inner_session.post(
                     self.api_url, json=data, headers=headers, timeout=30
                 ) as response:
                     if response.status == 200:
@@ -267,39 +271,43 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
                             emb = res_json["data"][0]["embedding"]
                             return np.array(emb, dtype=np.float32)
                     return None
+            finally:
+                if should_close:
+                    await inner_session.close()
         except Exception as e:
             logger.exception(f"API embedding error: {e}")
             return None
 
     async def get_embeddings_batch(
-        self, texts: List[str]
+        self, texts: List[str], session: Optional[aiohttp.ClientSession] = None
     ) -> List[Optional[np.ndarray]]:
-        # Naive implementation: sequential calls to avoid complexity for now, or use batch endpoint if supported
-        # For robustness, we will map them to the batch endpoint if possible.
         try:
-            async with aiohttp.ClientSession() as session:
+            inner_session = session if session else aiohttp.ClientSession()
+            should_close = session is None
+            
+            try:
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}",
                 }
                 data = {"input": texts, "model": self.model_name}
-                async with session.post(
+                async with inner_session.post(
                     self.api_url, json=data, headers=headers, timeout=60
                 ) as response:
                     if response.status == 200:
                         res_json = await response.json()
                         if "data" in res_json:
-                            # Sort by index
-                            sorted_data = sorted(
-                                res_json["data"], key=lambda x: x.get("index", 0)
-                            )
-                            results = []
-                            for item in sorted_data:
-                                results.append(
-                                    np.array(item["embedding"], dtype=np.float32)
-                                )
+                            # Correct indexing: map by the 'index' field to ensure positional alignment
+                            results = [None] * len(texts)
+                            for item in res_json["data"]:
+                                idx = item.get("index")
+                                if idx is not None and 0 <= idx < len(results):
+                                    results[idx] = np.array(item["embedding"], dtype=np.float32)
                             return results
                     return [None] * len(texts)
+            finally:
+                if should_close:
+                    await inner_session.close()
         except Exception as e:
             logger.exception(f"API batch embedding error: {e}")
             return [None] * len(texts)
@@ -314,6 +322,24 @@ class EmbeddingManager:
         self.cache: Dict[str, np.ndarray] = {}  # In-memory cache
         self.provider: Optional[EmbeddingProvider] = None
         self._current_provider_type = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, user_id: str) -> asyncio.Lock:
+        if user_id not in self._locks:
+            self._locks[user_id] = asyncio.Lock()
+        return self._locks[user_id]
+
+    async def cleanup(self):
+        """Clean up resources like the shared HTTP session."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    def _ensure_session(self):
+        """Ensure a shared aiohttp session exists."""
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
 
     def _ensure_provider(self):
         valves = self.get_valves()
@@ -345,7 +371,8 @@ class EmbeddingManager:
         if not self.provider:
             return None
 
-        emb = await self.provider.get_embedding(text)
+        self._ensure_session()
+        emb = await self.provider.get_embedding(text, session=self._session)
 
         if emb is not None:
             EMBEDDING_LATENCY.labels(self.get_valves().embedding_provider_type).observe(
@@ -365,148 +392,167 @@ class EmbeddingManager:
 
         if not self.provider:
             return [None] * len(texts)
-        return await self.provider.get_embeddings_batch(texts)
+        
+        self._ensure_session()
+        return await self.provider.get_embeddings_batch(texts, session=self._session)
 
     async def store_embedding_persistent(self, user_id: str, memory_id: str, memory_text: str, embedding: np.ndarray) -> None:
         """Store memory embedding in a persistent JSON file for reload across restarts."""
-        try:
-            # Use data directory for persistence
-            cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-            os.makedirs(cache_dir, exist_ok=True)
-            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
-            
-            # Load existing cache
-            cache = {}
-            if os.path.exists(cache_file):
-                try:
-                    with open(cache_file, 'r') as f:
-                        cache = json.load(f)
-                except Exception as e:
-                    logger.warning(f"Error loading embedding cache, starting fresh: {e}")
-            
-            # Convert numpy array to list for JSON storage
-            embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
-            
-            # Store embedding with metadata (Ensure ID is string for JSON key)
-            cache[str(memory_id)] = {
-                "embedding": embedding_list,
-                "model": self.get_valves().embedding_model_name,
-                "provider": self.get_valves().embedding_provider_type,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            
-            # Save cache
-            with open(cache_file, 'w') as f:
-                json.dump(cache, f)
-            
-            logger.debug(f"Stored embedding for memory {memory_id} in persistent cache")
-        except Exception as e:
-            logger.warning(f"Failed to store embedding in persistent cache for memory {memory_id}: {e}")
-            # Non-critical - embedding will be regenerated if needed
-
-    async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], texts: List[str], embeddings: List[np.ndarray]) -> None:
-        """Store multiple embeddings in a single persistent JSON file operation."""
-        if not ids:
-            return
-            
-        try:
-            cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-            os.makedirs(cache_dir, exist_ok=True)
-            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
-            
-            # Load existing cache
-            cache = {}
-            if os.path.exists(cache_file):
-                try:
-                    with open(cache_file, 'r') as f:
-                        cache = json.load(f)
-                except Exception as e:
-                    logger.warning(f"Error loading embedding cache for batch store: {e}")
-            
-            # Update cache with new embeddings
-            for memory_id, text, embedding in zip(ids, texts, embeddings):
-                if embedding is None:
-                    continue
-                    
+        async with self._get_lock(user_id):
+            try:
+                # Use data directory for persistence
+                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
+                await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
+                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                
+                # Load existing cache
+                cache = {}
+                if await asyncio.to_thread(os.path.exists, cache_file):
+                    try:
+                        def _load():
+                            with open(cache_file, 'r') as f:
+                                return json.load(f)
+                        cache = await asyncio.to_thread(_load)
+                    except Exception as e:
+                        logger.warning(f"Error loading embedding cache, starting fresh: {e}")
+                
+                # Convert numpy array to list for JSON storage
                 embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
+                
+                # Store embedding with metadata (Ensure ID is string for JSON key)
                 cache[str(memory_id)] = {
                     "embedding": embedding_list,
                     "model": self.get_valves().embedding_model_name,
                     "provider": self.get_valves().embedding_provider_type,
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }
+                
+                # Save cache atomically
+                def _save_atomic(data):
+                    tmp_file = cache_file + ".tmp"
+                    with open(tmp_file, 'w') as f:
+                        json.dump(data, f)
+                    os.replace(tmp_file, cache_file)
+                    
+                await asyncio.to_thread(_save_atomic, cache)
+                logger.debug(f"Stored embedding for memory {memory_id} in persistent cache")
+            except Exception as e:
+                logger.warning(f"Failed to store embedding in persistent cache for memory {memory_id}: {e}")
+
+    async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], texts: List[str], embeddings: List[np.ndarray]) -> None:
+        """Store multiple embeddings in a single persistent JSON file operation."""
+        if not ids:
+            return
             
-            # Save cache once for the whole batch
-            with open(cache_file, 'w') as f:
-                json.dump(cache, f)
-            
-            logger.info(f"Batched stored {len(ids)} embeddings in persistent cache for user {user_id}")
-        except Exception as e:
-            logger.warning(f"Failed to store batch embeddings in persistent cache: {e}")
+        async with self._get_lock(user_id):
+            try:
+                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
+                await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
+                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                
+                # Load existing cache
+                cache = {}
+                if await asyncio.to_thread(os.path.exists, cache_file):
+                    try:
+                        def _load():
+                            with open(cache_file, 'r') as f:
+                                return json.load(f)
+                        cache = await asyncio.to_thread(_load)
+                    except Exception as e:
+                        logger.warning(f"Error loading embedding cache for batch store: {e}")
+                
+                # Update cache with new embeddings
+                for memory_id, text, embedding in zip(ids, texts, embeddings):
+                    if embedding is None:
+                        continue
+                        
+                    embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
+                    cache[str(memory_id)] = {
+                        "embedding": embedding_list,
+                        "model": self.get_valves().embedding_model_name,
+                        "provider": self.get_valves().embedding_provider_type,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                
+                # Save cache atomically
+                def _save_atomic(data):
+                    tmp_file = cache_file + ".tmp"
+                    with open(tmp_file, 'w') as f:
+                        json.dump(data, f)
+                    os.replace(tmp_file, cache_file)
+                    
+                await asyncio.to_thread(_save_atomic, cache)
+                logger.info(f"Batched stored {len(ids)} embeddings in persistent cache for user {user_id}")
+            except Exception as e:
+                logger.warning(f"Failed to store batch embeddings in persistent cache: {e}")
 
     async def load_embedding_persistent(self, user_id: str, memory_id: str) -> Optional[np.ndarray]:
         """Load a stored embedding from the persistent JSON file."""
-        try:
-            cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
-            
-            if not os.path.exists(cache_file):
-                return None
-            
-            # Load cache
-            with open(cache_file, 'r') as f:
-                cache = json.load(f)
-            
-            # Ensure ID is handled as string for JSON key lookup
-            memory_id_str = str(memory_id)
-            if memory_id_str in cache:
-                embedding_data = cache[memory_id_str]
-                embedding_list = embedding_data["embedding"]
-                embedding = np.array(embedding_list, dtype=np.float32)
+        async with self._get_lock(user_id):
+            try:
+                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
+                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
                 
-                # Validate model compatibility
-                valves = self.get_valves()
-                stored_model = embedding_data.get("model")
-                stored_provider = embedding_data.get("provider")
-                
-                if (stored_model != valves.embedding_model_name or 
-                    stored_provider != valves.embedding_provider_type):
-                    logger.debug(f"Cache miss for {memory_id_str}: Model/provider changed (Stored: {stored_model}/{stored_provider}, Current: {valves.embedding_model_name}/{valves.embedding_provider_type})")
+                if not await asyncio.to_thread(os.path.exists, cache_file):
                     return None
                 
-                return embedding
-            
-            return None
-        except Exception as e:
-            logger.warning(f"Error loading embedding from persistent cache for memory {memory_id}: {e}")
-            return None
+                # Load cache
+                def _load():
+                    with open(cache_file, 'r') as f:
+                        return json.load(f)
+                cache = await asyncio.to_thread(_load)
+                
+                # Ensure ID is handled as string for JSON key lookup
+                memory_id_str = str(memory_id)
+                if memory_id_str in cache:
+                    embedding_data = cache[memory_id_str]
+                    embedding_list = embedding_data["embedding"]
+                    embedding = np.array(embedding_list, dtype=np.float32)
+                    
+                    # Validate model compatibility
+                    valves = self.get_valves()
+                    stored_model = embedding_data.get("model")
+                    stored_provider = embedding_data.get("provider")
+                    
+                    if (stored_model != valves.embedding_model_name or 
+                        stored_provider != valves.embedding_provider_type):
+                        logger.debug(f"Cache miss for {memory_id_str}: Model/provider changed")
+                        return None
+                    
+                    return embedding
+                
+                return None
+            except Exception as e:
+                logger.warning(f"Error loading embedding from persistent cache for memory {memory_id}: {e}")
+                return None
 
     async def get_embedding_with_persistence(self, text: str, user_id: str, memory_id: str) -> Optional[np.ndarray]:
         """Get embedding with full caching hierarchy: memory -> persistent -> generate."""
         if not text:
             return None
 
+        # Ensure memory_id is a string for consistent caching
+        memory_id_str = str(memory_id)
+
         # 1. Check in-memory cache first
-        cached_emb = self.cache.get(memory_id)
+        cached_emb = self.cache.get(memory_id_str)
         if cached_emb is not None:
             return cached_emb
 
         # 2. Check persistent cache
-        persistent_emb = await self.load_embedding_persistent(user_id, memory_id)
+        persistent_emb = await self.load_embedding_persistent(user_id, memory_id_str)
         if persistent_emb is not None:
             # Cache in memory for this session
-            self.cache[memory_id] = persistent_emb
-            logger.debug(f"Loaded embedding for memory {memory_id} from persistent cache")
+            self.cache[memory_id_str] = persistent_emb
             return persistent_emb
 
         # 3. Generate new embedding
         new_emb = await self.get_embedding(text)
         if new_emb is not None:
             # Cache in memory
-            self.cache[memory_id] = new_emb
+            self.cache[memory_id_str] = new_emb
             # Store persistently
-            await self.store_embedding_persistent(user_id, memory_id, text, new_emb)
-            logger.debug(f"Generated and cached new embedding for memory {memory_id}")
+            await self.store_embedding_persistent(user_id, memory_id_str, text, new_emb)
         
         return new_emb
 
@@ -710,7 +756,7 @@ class MemoryPipeline:
                     if self.valves.deduplicate_memories:
                         is_dupe = await self._is_duplicate(content, user_id)
                         if is_dupe:
-                            logger.info(f"Skipping duplicate memory: '{content[:50]}...'")
+                            logger.info(f"Skipping duplicate memory (length: {len(content)})")
                             continue
 
                     # Format: [Tags: tag1, tag2] Content [Memory Bank: Bank] [Confidence: X.XX]
@@ -723,7 +769,7 @@ class MemoryPipeline:
                     try:
                         mem_obj = Memories.insert_new_memory(user_id, final_content)
                         success_ops.append(op)
-                        logger.info(f"Memory saved: '{content[:50]}...' [Bank: {bank}] [Confidence: {confidence:.2f}]")
+                        logger.info(f"Memory saved (ID: {getattr(mem_obj, 'id', 'new')}) [Bank: {bank}] [Confidence: {confidence:.2f}]")
                     except Exception as ins_err:
                         logger.error(f"Failed to insert memory: {ins_err}")
 
@@ -740,14 +786,18 @@ class MemoryPipeline:
 
         return success_ops
 
-    async def _is_duplicate(self, text: str, user_id: str, exclude_id: str = None) -> bool:
+    async def _is_duplicate(self, text: str, user_id: str, exclude_id: str = None, all_memories_override: List[Any] = None) -> bool:
         """Check if the given text is a duplicate of existing memories using embedding or text similarity."""
         if not text or not self.valves.deduplicate_memories:
             return False
             
         try:
-            # Get all existing memories for the user
-            all_memories = Memories.get_memories_by_user_id(user_id)
+            # Get all existing memories for the user (or use override for optimization)
+            if all_memories_override is not None:
+                all_memories = all_memories_override
+            else:
+                all_memories = Memories.get_memories_by_user_id(user_id)
+                
             if not all_memories:
                 return False
 
@@ -756,7 +806,7 @@ class MemoryPipeline:
                 new_embedding = await self.embedding_manager.get_embedding(text)
                 if new_embedding is None:
                     logger.warning("Could not generate embedding for duplicate check, falling back to text similarity")
-                    return await self._check_text_similarity(text, all_memories)
+                    return await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
                     
                 # Check similarity against existing memories
                 for i, memory in enumerate(all_memories):
@@ -804,7 +854,7 @@ class MemoryPipeline:
                         return normalized
                     
                     if normalize_text(text) == normalize_text(raw_memory_content):
-                        logger.info(f"Exact match found (normalized): '{text[:50]}...' matches existing memory")
+                        logger.info(f"Exact match found for memory {memory_id}")
                         return True
                     
                     # Use raw content for embedding comparison
@@ -833,10 +883,10 @@ class MemoryPipeline:
                         
                         # Use embedding similarity threshold from valves
                         if similarity >= self.valves.embedding_similarity_threshold:
-                            logger.info(f"Duplicate detected via embeddings (similarity: {similarity:.3f}): '{text[:50]}...'")
+                            logger.info(f"Duplicate detected via embeddings (similarity: {similarity:.3f}) for memory {memory_id}")
                             return True
                     else:
-                        logger.warning(f"Could not generate embedding for existing memory: '{memory_content[:50]}...'")
+                        logger.warning(f"Could not generate embedding for existing memory {memory_id}")
             else:
                 # Use text-based similarity
                 return await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
@@ -853,6 +903,18 @@ class MemoryPipeline:
         """Check for text-based similarity using difflib."""
         import difflib
         
+        # Helper for normalization (could be moved to a shared utility)
+        def normalize_text(t):
+            import re
+            normalized = re.sub(r'[^\w\s]', '', t.strip().lower())
+            normalized = re.sub(r'\bs\b', '', normalized)
+            normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
+            normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            return normalized
+
+        normalized_text = normalize_text(text)
+        
         for i, memory in enumerate(all_memories):
             memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
             
@@ -862,11 +924,21 @@ class MemoryPipeline:
                 
             memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
             
-            # Calculate text similarity using difflib
-            similarity = difflib.SequenceMatcher(None, text.lower().strip(), memory_content.lower().strip()).ratio()
+            # Extract raw content from formatted memory for comparison
+            raw_memory_content = memory_content
+            if '[Tags:' in memory_content and '[Memory Bank:' in memory_content:
+                tags_end = memory_content.find(']', memory_content.find('[Tags:'))
+                if tags_end != -1:
+                    bank_start = memory_content.find('[Memory Bank:', tags_end)
+                    if bank_start != -1:
+                        raw_memory_content = memory_content[tags_end + 1:bank_start].strip()
+
+            # Calculate text similarity using normalized raw content
+            normalized_raw = normalize_text(raw_memory_content)
+            similarity = difflib.SequenceMatcher(None, normalized_text, normalized_raw).ratio()
             
             if similarity >= self.valves.similarity_threshold:
-                logger.info(f"Duplicate detected via text similarity (similarity: {similarity:.3f}): '{text[:50]}...'")
+                logger.info(f"Duplicate detected via text similarity (similarity: {similarity:.3f}) for memory {memory_id}")
                 return True
                 
         return False
@@ -1032,15 +1104,16 @@ class TaskManager:
         self.filter = filter_instance
         self.tasks: Set[asyncio.Task] = set()
 
-    def start_tasks(self):
+    def start_tasks(self) -> bool:
+        """Attempt to start background tasks. Returns True if successful."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            logger.warning("TaskManager: No running event loop found, cannot start tasks immediately. Tasks will start lazily.")
-            return
+            logger.warning("TaskManager: No running event loop found. Tasks will be retried on next request.")
+            return False
 
         valves = self.filter.valves
-        logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}, deduplication={valves.enable_deduplication_task}, error_logging={valves.enable_error_logging_task}")
+        logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}, deduplication={valves.enable_deduplication_task}")
 
         if valves.enable_summarization_task:
             task = asyncio.create_task(self.filter._summarize_old_memories_loop())
@@ -1057,11 +1130,8 @@ class TaskManager:
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
 
-        if valves.enable_date_update_task:
-            # Just sets a variable, simplistic
-            pass
-
         logger.info(f"Background tasks started: {len(self.tasks)} active tasks")
+        return True
 
     async def stop_tasks(self):
         for task in self.tasks:
@@ -1638,6 +1708,7 @@ Your output must be valid JSON only. No additional text.""",
 
     async def cleanup(self):
         await self.task_manager.stop_tasks()
+        await self.embedding_manager.cleanup()
 
     # --------------------------------------------------------------------------
     # Helper: LLM Query Wrapper
@@ -1665,7 +1736,11 @@ Your output must be valid JSON only. No additional text.""",
                 }
 
                 if valves.llm_provider_type == "openai_compatible":
-                    payload["response_format"] = {"type": "json_object"}
+                    # For identify_memories, we expect an array. 
+                    # openai_compatible's 'json_object' format requires a root object, not array.
+                    # Only use it if not identification or if the prompt can be adjusted.
+                    # For now, following CodeRabbit: remove to avoid array errors.
+                    pass
 
                 async with session.post(url, json=payload, headers=headers) as resp:
                     if resp.status == 200:
@@ -1728,7 +1803,7 @@ Your output must be valid JSON only. No additional text.""",
 
         # Skip command processing
         if last_message.startswith("/"):
-            logger.info(f"Skipping memory processing for command: {last_message[:50]}...")
+            logger.info("Skipping memory processing for command")
             return body
 
         if not last_message:
@@ -1991,14 +2066,13 @@ Your output must be valid JSON only. No additional text.""",
             duplicates_removed = 0
             pipeline = MemoryPipeline(self.valves, self.embedding_manager, self.error_manager)
             
-            # Check each memory against all others
-            for i, memory in enumerate(all_memories):
-                if hasattr(memory, 'content'):
-                    memory_content = memory.content
-                    memory_id = memory.id
-                else:
-                    memory_content = memory.get('content')
-                    memory_id = memory.get('id')
+            # Optimized logic: Instead of N separate _is_duplicate calls (which each fetch all N memories),
+            # we iterate through the list once and compare each memory against the ones we've already processed.
+            processed_memories = []
+            
+            for memory in all_memories:
+                memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
+                memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
                 
                 # Extract raw content
                 raw_content = memory_content
@@ -2009,16 +2083,20 @@ Your output must be valid JSON only. No additional text.""",
                         if bank_start != -1:
                             raw_content = memory_content[tags_end + 1:bank_start].strip()
                 
-                # Check if this memory is a duplicate of any previous memory
-                is_duplicate = await pipeline._is_duplicate(raw_content, user_id, exclude_id=memory_id)
+                # Check if this memory is a duplicate of any ALREADY processed memory
+                # We can reuse _is_duplicate but we'll pass the subset we've already seen
+                is_duplicate = await pipeline._is_duplicate(raw_content, user_id, all_memories_override=processed_memories)
                 if is_duplicate:
-                    # Remove this duplicate
+                    # Remove this duplicate from DB
                     try:
                         Memories.delete_memory_by_id(memory_id)
                         duplicates_removed += 1
-                        logger.info(f"Removed duplicate memory: '{raw_content[:50]}...'")
+                        logger.info(f"Removed duplicate memory {memory_id}")
                     except Exception as del_err:
                         logger.error(f"Failed to delete duplicate memory {memory_id}: {del_err}")
+                else:
+                    # Keep this one as a reference for future comparisons
+                    processed_memories.append(memory)
                         
             return duplicates_removed
             
