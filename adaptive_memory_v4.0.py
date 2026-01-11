@@ -740,7 +740,7 @@ class MemoryPipeline:
 
         return success_ops
 
-    async def _is_duplicate(self, text: str, user_id: str) -> bool:
+    async def _is_duplicate(self, text: str, user_id: str, exclude_id: str = None) -> bool:
         """Check if the given text is a duplicate of existing memories using embedding or text similarity."""
         if not text or not self.valves.deduplicate_memories:
             return False
@@ -761,6 +761,11 @@ class MemoryPipeline:
                 # Check similarity against existing memories
                 for i, memory in enumerate(all_memories):
                     memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
+                    
+                    # SAFETY: Skip comparing memory against itself
+                    if exclude_id and str(memory_id) == str(exclude_id):
+                        continue
+                        
                     memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
                     
                     # Extract raw content from formatted memory for comparison
@@ -787,33 +792,11 @@ class MemoryPipeline:
                         
                         # Handle common plural variations
                         normalized = re.sub(r'\bs\b', '', normalized)  # Remove standalone 's'
-                        normalized = re.sub(r'(\w)s\b', r'\1', normalized)  # Remove trailing 's' from words
-                        
-                        # Handle common verb tense variations
-                        normalized = re.sub(r'\bwould like\b', 'like', normalized)  # "would like" -> "like"
-                        normalized = re.sub(r'\bwould want\b', 'want', normalized)  # "would want" -> "want"
-                        normalized = re.sub(r'\bwould enjoy\b', 'enjoy', normalized)  # "would enjoy" -> "enjoy"
-                        normalized = re.sub(r'\bwould love\b', 'love', normalized)  # "would love" -> "love"
-                        normalized = re.sub(r'\bwould prefer\b', 'prefer', normalized)  # "would prefer" -> "prefer"
-                        
-                        # Handle "likes" vs "like"
-                        normalized = re.sub(r'\blikes\b', 'like', normalized)
-                        normalized = re.sub(r'\bwants\b', 'want', normalized)
-                        normalized = re.sub(r'\benjoys\b', 'enjoy', normalized)
-                        normalized = re.sub(r'\bloves\b', 'love', normalized)
-                        normalized = re.sub(r'\bprefers\b', 'prefer', normalized)
-                        
-                        # Normalize synonymous verbs to a common form
-                        normalized = re.sub(r'\b(love|enjoy|like)\b', 'like', normalized)  # All positive preferences -> "like"
-                        normalized = re.sub(r'\b(want|desire|crave)\b', 'want', normalized)  # All desires -> "want"
                         
                         # Remove articles (a, an, the)
                         normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
                         
-                        # Remove common adjectives/modifiers that don't change meaning
-                        normalized = re.sub(r'\b(good|great|nice|cold|refreshing|perfect|awesome|amazing|wonderful)\b', '', normalized)
-                        
-                        # Remove intensifiers
+                        # Remove intensifiers (but keep adjectives like 'cold', 'hot')
                         normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
                         
                         # Clean up extra spaces
@@ -856,7 +839,7 @@ class MemoryPipeline:
                         logger.warning(f"Could not generate embedding for existing memory: '{memory_content[:50]}...'")
             else:
                 # Use text-based similarity
-                return await self._check_text_similarity(text, all_memories)
+                return await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
                         
             return False
             
@@ -866,11 +849,17 @@ class MemoryPipeline:
             # If deduplication fails, err on the side of caution and don't save
             return True
 
-    async def _check_text_similarity(self, text: str, all_memories: List[Any]) -> bool:
+    async def _check_text_similarity(self, text: str, all_memories: List[Any], exclude_id: str = None) -> bool:
         """Check for text-based similarity using difflib."""
         import difflib
         
         for i, memory in enumerate(all_memories):
+            memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
+            
+            # SAFETY: Skip comparing memory against itself
+            if exclude_id and str(memory_id) == str(exclude_id):
+                continue
+                
             memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
             
             # Calculate text similarity using difflib
@@ -2021,7 +2010,7 @@ Your output must be valid JSON only. No additional text.""",
                             raw_content = memory_content[tags_end + 1:bank_start].strip()
                 
                 # Check if this memory is a duplicate of any previous memory
-                is_duplicate = await pipeline._is_duplicate(raw_content, user_id)
+                is_duplicate = await pipeline._is_duplicate(raw_content, user_id, exclude_id=memory_id)
                 if is_duplicate:
                     # Remove this duplicate
                     try:
