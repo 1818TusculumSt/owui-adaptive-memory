@@ -91,7 +91,12 @@ from aiohttp import ClientError
 from pydantic import BaseModel, Field, model_validator, field_validator
 
 # OpenWebUI Imports
-# OpenWebUI Imports
+try:
+    from open_webui.config import DATA_DIR
+except ImportError:
+    from pathlib import Path
+    DATA_DIR = Path("/app/backend/data")
+
 from open_webui.models.memories import Memories
 from open_webui.models.users import Users
 from open_webui.main import app as webui_app
@@ -366,7 +371,7 @@ class EmbeddingManager:
         """Store memory embedding in a persistent JSON file for reload across restarts."""
         try:
             # Use data directory for persistence
-            cache_dir = "/app/backend/data/cache/embeddings"
+            cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
             os.makedirs(cache_dir, exist_ok=True)
             cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
             
@@ -382,8 +387,8 @@ class EmbeddingManager:
             # Convert numpy array to list for JSON storage
             embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
             
-            # Store embedding with metadata
-            cache[memory_id] = {
+            # Store embedding with metadata (Ensure ID is string for JSON key)
+            cache[str(memory_id)] = {
                 "embedding": embedding_list,
                 "model": self.get_valves().embedding_model_name,
                 "provider": self.get_valves().embedding_provider_type,
@@ -399,10 +404,50 @@ class EmbeddingManager:
             logger.warning(f"Failed to store embedding in persistent cache for memory {memory_id}: {e}")
             # Non-critical - embedding will be regenerated if needed
 
+    async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], texts: List[str], embeddings: List[np.ndarray]) -> None:
+        """Store multiple embeddings in a single persistent JSON file operation."""
+        if not ids:
+            return
+            
+        try:
+            cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+            
+            # Load existing cache
+            cache = {}
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'r') as f:
+                        cache = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Error loading embedding cache for batch store: {e}")
+            
+            # Update cache with new embeddings
+            for memory_id, text, embedding in zip(ids, texts, embeddings):
+                if embedding is None:
+                    continue
+                    
+                embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
+                cache[str(memory_id)] = {
+                    "embedding": embedding_list,
+                    "model": self.get_valves().embedding_model_name,
+                    "provider": self.get_valves().embedding_provider_type,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            
+            # Save cache once for the whole batch
+            with open(cache_file, 'w') as f:
+                json.dump(cache, f)
+            
+            logger.info(f"Batched stored {len(ids)} embeddings in persistent cache for user {user_id}")
+        except Exception as e:
+            logger.warning(f"Failed to store batch embeddings in persistent cache: {e}")
+
     async def load_embedding_persistent(self, user_id: str, memory_id: str) -> Optional[np.ndarray]:
         """Load a stored embedding from the persistent JSON file."""
         try:
-            cache_dir = "/app/backend/data/cache/embeddings"
+            cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
             cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
             
             if not os.path.exists(cache_file):
@@ -412,16 +457,21 @@ class EmbeddingManager:
             with open(cache_file, 'r') as f:
                 cache = json.load(f)
             
-            if memory_id in cache:
-                embedding_data = cache[memory_id]
+            # Ensure ID is handled as string for JSON key lookup
+            memory_id_str = str(memory_id)
+            if memory_id_str in cache:
+                embedding_data = cache[memory_id_str]
                 embedding_list = embedding_data["embedding"]
                 embedding = np.array(embedding_list, dtype=np.float32)
                 
-                # Validate model compatibility (optional - could regenerate if different)
+                # Validate model compatibility
                 valves = self.get_valves()
-                if (embedding_data.get("model") != valves.embedding_model_name or 
-                    embedding_data.get("provider") != valves.embedding_provider_type):
-                    logger.debug(f"Embedding model/provider changed for memory {memory_id}, will regenerate")
+                stored_model = embedding_data.get("model")
+                stored_provider = embedding_data.get("provider")
+                
+                if (stored_model != valves.embedding_model_name or 
+                    stored_provider != valves.embedding_provider_type):
+                    logger.debug(f"Cache miss for {memory_id_str}: Model/provider changed (Stored: {stored_model}/{stored_provider}, Current: {valves.embedding_model_name}/{valves.embedding_provider_type})")
                     return None
                 
                 return embedding
@@ -607,14 +657,16 @@ class MemoryPipeline:
                 if emb is not None:
                     # Update in-memory cache
                     self.embedding_manager.cache[ids_to_embed[i]] = emb
-                    # Store persistently
-                    await self.embedding_manager.store_embedding_persistent(
-                        user_id, ids_to_embed[i], texts_to_embed[i], emb
-                    )
                     # Score
                     sim = self._cosine_similarity(query_embedding, emb)
                     if sim >= self.valves.vector_similarity_threshold:
                         scored_memories.append((sim, mem_objects[i]))
+            
+            # Store all newly generated embeddings persistently in one go
+            if any(e is not None for e in new_embeddings):
+                await self.embedding_manager.store_embeddings_batch_persistent(
+                    user_id, ids_to_embed, texts_to_embed, new_embeddings
+                )
         else:
             logger.info(f"Using cached embeddings for all {len(all_memories)} memories")
 
@@ -892,10 +944,14 @@ class MemoryPipeline:
                     embeddings[idx] = new_emb
                     # Cache in memory
                     self.embedding_manager.cache[ids[idx]] = new_emb
-                    # Store persistently
-                    await self.embedding_manager.store_embedding_persistent(
-                        user_id, ids[idx], uncached_contents[uncached_indices.index(idx)], new_emb
-                    )
+            
+            # Store persistently in batch
+            await self.embedding_manager.store_embeddings_batch_persistent(
+                user_id, 
+                [str(ids[idx]) for idx in uncached_indices], 
+                uncached_contents, 
+                new_embeddings
+            )
         else:
             logger.info(f"Using cached embeddings for all {len(memories)} memories")
 
