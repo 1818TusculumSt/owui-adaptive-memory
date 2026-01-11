@@ -204,7 +204,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                 logger.info(f"Loading local embedding model: {model_name}")
                 self.model = SentenceTransformer(model_name)
             except Exception as e:
-                logger.error(f"Failed to load local SentenceTransformer model: {e}")
+                logger.exception(f"Failed to load local SentenceTransformer model: {e}")
 
     async def get_embedding(self, text: str) -> Optional[np.ndarray]:
         if not self.model:
@@ -217,7 +217,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             )
             return np.array(embedding, dtype=np.float32)
         except Exception as e:
-            logger.error(f"Local embedding error: {e}")
+            logger.exception(f"Local embedding error: {e}")
             return None
 
     async def get_embeddings_batch(
@@ -235,7 +235,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             )
             return [np.array(e, dtype=np.float32) for e in embeddings]
         except Exception as e:
-            logger.error(f"Local batch embedding error: {e}")
+            logger.exception(f"Local batch embedding error: {e}")
             return [None] * len(texts)
 
 
@@ -263,7 +263,7 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
                             return np.array(emb, dtype=np.float32)
                     return None
         except Exception as e:
-            logger.error(f"API embedding error: {e}")
+            logger.exception(f"API embedding error: {e}")
             return None
 
     async def get_embeddings_batch(
@@ -296,7 +296,7 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
                             return results
                     return [None] * len(texts)
         except Exception as e:
-            logger.error(f"API batch embedding error: {e}")
+            logger.exception(f"API batch embedding error: {e}")
             return [None] * len(texts)
 
 
@@ -331,7 +331,7 @@ class EmbeddingManager:
         if not text:
             return None
 
-        # Check memory cache (not implemented fully here for simplicity, but could be added)
+        EMBEDDING_REQUESTS.labels(self.get_valves().embedding_provider_type).inc()
         start = time.perf_counter()
 
         if not self.provider:
@@ -483,7 +483,6 @@ class MemoryPipeline:
     async def identify_memories(
         self,
         user_message: str,
-        user_id: str,
         context_memories: List[Dict[str, Any]] = None,
         query_llm_func: Callable = None,
     ) -> List[Dict[str, Any]]:
@@ -493,12 +492,12 @@ class MemoryPipeline:
 
         # Construct prompt
         system_prompt = self.valves.memory_identification_prompt
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         system_prompt += f"\n\nCurrent Date: {now.strftime('%Y-%m-%d %H:%M:%S')}"
 
         user_prompt = f"User Message: {user_message}"
         if context_memories:
-            user_prompt += f"\n\nContext Memories:\n" + "\n".join(
+            user_prompt += "\n\nContext Memories:\n" + "\n".join(
                 [f"- {m.get('content', '')}" for m in context_memories]
             )
 
@@ -525,15 +524,18 @@ class MemoryPipeline:
                 content = item.get("content")
                 confidence = item.get("confidence", 0.0)
 
-                if op in ["NEW", "UPDATE", "DELETE"] and content:
+                if op in ["NEW", "UPDATE"] and content:
                     if confidence >= self.valves.min_confidence_threshold:
                         valid_ops.append(item)
+                elif op == "DELETE" and item.get("id"):
+                    # DELETE doesn't require content
+                    valid_ops.append(item)
 
             return valid_ops
 
         except Exception as e:
             self.error_manager.increment("llm_call_errors")
-            logger.error(f"Identify memories failed: {e}")
+            logger.exception(f"Identify memories failed: {e}")
             return []
 
     # --- Relevance Retrieval ---
@@ -544,9 +546,17 @@ class MemoryPipeline:
         if not query or not all_memories:
             return []
 
+        RETRIEVAL_REQUESTS.inc()
+        start_time = time.perf_counter()
+
         # 1. Vector Search
-        query_embedding = await self.embedding_manager.get_embedding(query)
-        if query_embedding is None:
+        try:
+            query_embedding = await self.embedding_manager.get_embedding(query)
+            if query_embedding is None:
+                return []
+        except Exception as e:
+            RETRIEVAL_ERRORS.inc()
+            logger.exception(f"Error generating query embedding: {e}")
             return []
 
         scored_memories = []
@@ -562,6 +572,9 @@ class MemoryPipeline:
             # Handle object vs dict
             mem_content = mem.content if hasattr(mem, "content") else mem.get("content")
             mem_id = mem.id if hasattr(mem, "id") else mem.get("id")
+
+            if not mem_id or not mem_content:
+                continue
 
             # Check in-memory cache first
             cached_emb = self.embedding_manager.cache.get(mem_id)
@@ -607,12 +620,18 @@ class MemoryPipeline:
 
         # Sort by similarity
         scored_memories.sort(key=lambda x: x[0], reverse=True)
-        top_memories = [m[1] for m in scored_memories[: self.valves.related_memories_n]]
-
-        # Optional: LLM Reranking (Skipped for brevity/Streamline, relying on vector)
+        top_memories = [mem for sim, mem in scored_memories[: self.valves.related_memories_n]]
+        
+        RETRIEVAL_LATENCY.observe(time.perf_counter() - start_time)
         return top_memories
 
+        # Optional: LLM Reranking (Skipped for brevity/Streamline, relying on vector)
+        # return top_memories
+
     def _cosine_similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
+        if v1.shape != v2.shape:
+            logger.debug(f"Cosine similarity dimension mismatch: {v1.shape} vs {v2.shape}")
+            return 0.0
         norm1 = np.linalg.norm(v1)
         norm2 = np.linalg.norm(v2)
         if norm1 == 0 or norm2 == 0:
@@ -661,11 +680,11 @@ class MemoryPipeline:
                         Memories.delete_memory_by_id(op["id"])
                         success_ops.append(op)
                     except Exception as del_err:
-                        logger.error(f"Failed to delete memory: {del_err}")
+                        logger.exception(f"Failed to delete memory: {del_err}")
 
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
-                logger.error(f"Memory operation failed: {e}")
+                logger.exception(f"Memory operation failed: {e}")
 
         return success_ops
 
@@ -831,7 +850,7 @@ class MemoryPipeline:
                 logger.info(f"Only {len(memories)} memories found for user {user_id}, need at least {self.valves.summarization_min_cluster_size} for clustering")
                 return
         except Exception as e:
-            logger.error(f"Summarization fetch failed: {e}")
+            logger.exception(f"Summarization fetch failed: {e}")
             return
 
         # 2. Get embeddings (use cache when possible)
@@ -956,7 +975,7 @@ class MemoryPipeline:
 
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
-                logger.error(f"Memory operation failed: {e}")
+                logger.exception(f"Memory operation failed: {e}")
 
         return None
 
@@ -969,6 +988,12 @@ class TaskManager:
         self.tasks: Set[asyncio.Task] = set()
 
     def start_tasks(self):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("TaskManager: No running event loop found, cannot start tasks immediately. Tasks will start lazily.")
+            return
+
         valves = self.filter.valves
         logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}, deduplication={valves.enable_deduplication_task}, error_logging={valves.enable_error_logging_task}")
 
@@ -1562,10 +1587,9 @@ Your output must be valid JSON only. No additional text.""",
         self.memory_embeddings = {}  # Local in-memory cache
         self.seen_users = set()  # Track active users for background tasks
         self.notification_queue = []  # Queue for background task notifications
+        self._tasks_started = False
 
-        logger.info("Starting background tasks...")
-        self.task_manager.start_tasks()
-        logger.info("Adaptive Memory Filter v4.0 initialized successfully")
+        logger.info("Adaptive Memory Filter v4.0 initialized")
 
     async def cleanup(self):
         await self.task_manager.stop_tasks()
@@ -1607,7 +1631,7 @@ Your output must be valid JSON only. No additional text.""",
                         elif "message" in data:
                             return data["message"]["content"]
         except Exception as e:
-            logger.error(f"LLM Query failed: {e}")
+            logger.exception(f"LLM Query failed: {e}")
             self.error_manager.increment("llm_call_errors")
         return None
 
@@ -1636,10 +1660,35 @@ Your output must be valid JSON only. No additional text.""",
         if not user_valves.enabled:
             return body
 
+        if not self._tasks_started:
+            self.task_manager.start_tasks()
+            self._tasks_started = True
+
         user_id = __user__["id"]
         self.seen_users.add(user_id)  # Track active user
         messages = body["messages"]
-        last_message = messages[-1]["content"]
+        last_message_content = messages[-1]["content"]
+
+        # Handle multimodal content (list of dicts)
+        if isinstance(last_message_content, list):
+            last_message = " ".join(
+                [
+                    m.get("text", "")
+                    for m in last_message_content
+                    if isinstance(m, dict) and m.get("type") == "text"
+                ]
+            ).strip()
+        else:
+            last_message = last_message_content
+
+        # Skip command processing
+        if last_message.startswith("/"):
+            logger.info(f"Skipping memory processing for command: {last_message[:50]}...")
+            return body
+
+        if not last_message:
+            logger.debug("Skipping memory processing for empty message.")
+            return body
 
         # Pipeline
         pipeline = MemoryPipeline(
@@ -1711,6 +1760,10 @@ Your output must be valid JSON only. No additional text.""",
         self, body: Dict[str, Any], __event_emitter__=None, __user__=None
     ) -> Dict[str, Any]:
         """Process outgoing response: Extract memories, update status."""
+        if not self._tasks_started:
+            self.task_manager.start_tasks()
+            self._tasks_started = True
+
         if not __user__ or not body.get("messages"):
             return body
 
@@ -1749,7 +1802,6 @@ Your output must be valid JSON only. No additional text.""",
             # Pass our _query_llm as callback
             ops = await pipeline.identify_memories(
                 user_message,
-                user_id,
                 context_memories=[],
                 query_llm_func=self._query_llm,
             )
@@ -1821,7 +1873,7 @@ Your output must be valid JSON only. No additional text.""",
                             else:
                                 logger.debug(f"Background summarization: no clusters found for user {user_id}")
                         except Exception as u_err:
-                            logger.error(
+                            logger.exception(
                                 f"Background summarization error for user {user_id}: {u_err}"
                             )
 
@@ -1833,7 +1885,7 @@ Your output must be valid JSON only. No additional text.""",
                 logger.info("Summarization task cancelled")
                 break
             except Exception as e:
-                logger.error(f"Summarization task error: {e}")
+                logger.exception(f"Summarization task error: {e}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 await asyncio.sleep(60)
 
@@ -1870,7 +1922,7 @@ Your output must be valid JSON only. No additional text.""",
                             else:
                                 logger.debug(f"Background deduplication: no duplicates found for user {user_id}")
                         except Exception as u_err:
-                            logger.error(f"Background deduplication error for user {user_id}: {u_err}")
+                            logger.exception(f"Background deduplication error for user {user_id}: {u_err}")
 
                     logger.info("Background deduplication: cycle complete")
                 else:
@@ -1880,7 +1932,7 @@ Your output must be valid JSON only. No additional text.""",
                 logger.info("Deduplication task cancelled.")
                 break
             except Exception as e:
-                logger.error(f"Deduplication task error: {e}")
+                logger.exception(f"Deduplication task error: {e}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 await asyncio.sleep(60)
 
@@ -1926,5 +1978,5 @@ Your output must be valid JSON only. No additional text.""",
             return duplicates_removed
             
         except Exception as e:
-            logger.error(f"Error during background deduplication: {e}")
+            logger.exception(f"Error during background deduplication: {e}")
             return 0
