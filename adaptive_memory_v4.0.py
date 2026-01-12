@@ -336,7 +336,7 @@ class EmbeddingManager:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
     def _check_and_handle_valve_changes(self):
-        ""Detect if valves have changed and restart tasks if needed.""
+        """Detect if valves have changed and restart tasks if needed."""
         # Hash important valve settings that affect background tasks
         import hashlib
         valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
@@ -357,7 +357,7 @@ class EmbeddingManager:
         return False
     
     async def _restart_tasks(self):
-        ""Restart background tasks with new valve settings.""
+        """Restart background tasks with new valve settings."""
         await self.task_manager.stop_tasks()
         self._tasks_started = False
         self.task_manager.start_tasks()
@@ -1810,7 +1810,7 @@ Your output must be valid JSON only. No additional text.""",
 
         logger.info("Adaptive Memory Filter v4.0 initialized")
     def _check_and_handle_valve_changes(self):
-        ""Detect if valves have changed and restart tasks if needed.""
+        """Detect if valves have changed and restart tasks if needed."""
         # Hash important valve settings that affect background tasks
         import hashlib
         valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
@@ -1831,7 +1831,7 @@ Your output must be valid JSON only. No additional text.""",
         return False
     
     async def _restart_tasks(self):
-        ""Restart background tasks with new valve settings.""
+        """Restart background tasks with new valve settings."""
         await self.task_manager.stop_tasks()
         self._tasks_started = False
         self.task_manager.start_tasks()
