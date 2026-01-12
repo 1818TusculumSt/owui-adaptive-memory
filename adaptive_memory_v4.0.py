@@ -792,8 +792,21 @@ class MemoryPipeline:
                     final_content = f"[Tags: {tags_str}] {content} [Memory Bank: {bank}] [Confidence: {confidence:.2f}]"
 
                     # Add memory - using Model directly
+                    # NOTE: We try 'add_memory' first as it likely handles vector indexing.
+                    # 'insert_new_memory' is a low-level DB write that might skip indexing.
                     try:
-                        mem_obj = Memories.insert_new_memory(user_id, final_content)
+                        mem_obj = None
+                        try:
+                            # Try the high-level method first (triggers vector indexing?)
+                            if hasattr(Memories, 'add_memory'):
+                                logger.info(f"Attempting to add memory via Memories.add_memory (Vector-Aware)...")
+                                mem_obj = Memories.add_memory(user_id, final_content)
+                            else:
+                                raise AttributeError("Memories.add_memory not found")
+                        except Exception as add_err:
+                            logger.warning(f"Memories.add_memory failed or not found ({add_err}), falling back to insert_new_memory")
+                            mem_obj = Memories.insert_new_memory(user_id, final_content)
+
                         memory_id = getattr(mem_obj, 'id', None)
                         success_ops.append(op)
                         logger.info(f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]")
