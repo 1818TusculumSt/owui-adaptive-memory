@@ -797,14 +797,12 @@ class MemoryPipeline:
                     try:
                         mem_obj = None
                         try:
-                            # Try the high-level method first (triggers vector indexing?)
-                            if hasattr(Memories, 'add_memory'):
-                                logger.info(f"Attempting to add memory via Memories.add_memory (Vector-Aware)...")
-                                mem_obj = Memories.add_memory(user_id, final_content)
-                            else:
-                                raise AttributeError("Memories.add_memory not found")
+                            # Try the high-level router function which handles vector indexing
+                            logger.info(f"Attempting to add memory via router add_memory (Vector-Aware)...")
+                            form = AddMemoryForm(content=final_content)
+                            mem_obj = await add_memory(user_id=user_id, form_data=form)
                         except Exception as add_err:
-                            logger.warning(f"Memories.add_memory failed or not found ({add_err}), falling back to insert_new_memory")
+                            logger.warning(f"Router add_memory failed ({add_err}), falling back to insert_new_memory")
                             mem_obj = Memories.insert_new_memory(user_id, final_content)
 
                         memory_id = getattr(mem_obj, 'id', None)
