@@ -335,6 +335,34 @@ class EmbeddingManager:
         if user_id not in self._locks:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
+    def _check_and_handle_valve_changes(self):
+        ""Detect if valves have changed and restart tasks if needed.""
+        # Hash important valve settings that affect background tasks
+        import hashlib
+        valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
+        new_hash = hashlib.md5(valve_str.encode()).hexdigest()
+        
+        if self._valve_hash is None:
+            self._valve_hash = new_hash
+            return False
+        
+        if new_hash != self._valve_hash:
+            logger.info(f"Valve changes detected! Restarting background tasks...")
+            self._valve_hash = new_hash
+            # Restart tasks with new valve values
+            if self._tasks_started:
+                import asyncio
+                asyncio.create_task(self._restart_tasks())
+            return True
+        return False
+    
+    async def _restart_tasks(self):
+        ""Restart background tasks with new valve settings.""
+        await self.task_manager.stop_tasks()
+        self._tasks_started = False
+        self.task_manager.start_tasks()
+        self._tasks_started = True
+        logger.info("Background tasks restarted with new valve values")
 
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
@@ -762,7 +790,7 @@ class MemoryPipeline:
 
     # --- Memory Operations ---
     async def process_memory_operations(
-        self, operations: List[Dict[str, Any]], user_id: str
+        self, operations: List[Dict[str, Any]], user_id: str, skip_deduplication: bool = False
     ) -> List[Dict[str, Any]]:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
         success_ops = []
@@ -776,9 +804,9 @@ class MemoryPipeline:
                     tags = op.get("tags", [])
                     bank = op.get("memory_bank", "General")
 
-                    # Deduplication check
+                    # Deduplication check (skip for summaries)
                     dedup_embedding = None
-                    if self.valves.deduplicate_memories:
+                    if self.valves.deduplicate_memories and not skip_deduplication:
                         is_dupe, dedup_embedding = await self._is_duplicate(content, user_id)
                         if is_dupe:
                             logger.info(f"Skipping duplicate memory (length: {len(content)})")
@@ -1032,7 +1060,9 @@ class MemoryPipeline:
             # Store persistently in batch
             await self.embedding_manager.store_embeddings_batch_persistent(
                 user_id, 
-                [str(ids[idx]) for idx in uncached_indices], 
+                [str(ids[idx]) for idx in uncached_indices],
+                uncached_contents,
+                [new_embeddings[i] for i in range(len(new_embeddings))]
             )
         else:
             logger.info(f"Using cached embeddings for all {len(memories)} memories")
@@ -1099,8 +1129,8 @@ class MemoryPipeline:
                         "confidence": 1.0,
                     }
 
-                    # Process the new summary first
-                    success_ops = await self.process_memory_operations([op], user_id)
+                    # Process the new summary first (skip deduplication for summaries)
+                    success_ops = await self.process_memory_operations([op], user_id, skip_deduplication=True)
 
                     if success_ops:
                         logger.info(
@@ -1776,8 +1806,37 @@ Your output must be valid JSON only. No additional text.""",
         self.seen_users = set()  # Track active users for background tasks
         self.notification_queue = []  # Queue for background task notifications
         self._tasks_started = False
+        self._valve_hash = None  # Track valve changes
 
         logger.info("Adaptive Memory Filter v4.0 initialized")
+    def _check_and_handle_valve_changes(self):
+        ""Detect if valves have changed and restart tasks if needed.""
+        # Hash important valve settings that affect background tasks
+        import hashlib
+        valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
+        new_hash = hashlib.md5(valve_str.encode()).hexdigest()
+        
+        if self._valve_hash is None:
+            self._valve_hash = new_hash
+            return False
+        
+        if new_hash != self._valve_hash:
+            logger.info(f"Valve changes detected! Restarting background tasks...")
+            self._valve_hash = new_hash
+            # Restart tasks with new valve values
+            if self._tasks_started:
+                import asyncio
+                asyncio.create_task(self._restart_tasks())
+            return True
+        return False
+    
+    async def _restart_tasks(self):
+        ""Restart background tasks with new valve settings.""
+        await self.task_manager.stop_tasks()
+        self._tasks_started = False
+        self.task_manager.start_tasks()
+        self._tasks_started = True
+        logger.info("Background tasks restarted with new valve values")
 
     async def cleanup(self):
         await self.task_manager.stop_tasks()
@@ -1854,6 +1913,10 @@ Your output must be valid JSON only. No additional text.""",
             return body
 
         if not self._tasks_started:
+        
+        # Check if valves have changed and restart tasks if needed
+        self._check_and_handle_valve_changes()
+        
             self.task_manager.start_tasks()
             self._tasks_started = True
 
@@ -1954,6 +2017,10 @@ Your output must be valid JSON only. No additional text.""",
     ) -> Dict[str, Any]:
         """Process outgoing response: Extract memories, update status."""
         if not self._tasks_started:
+        
+        # Check if valves have changed and restart tasks if needed
+        self._check_and_handle_valve_changes()
+        
             self.task_manager.start_tasks()
             self._tasks_started = True
 
