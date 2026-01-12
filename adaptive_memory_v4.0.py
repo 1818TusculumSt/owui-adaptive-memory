@@ -222,7 +222,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             return None
         try:
             # Run blocking call in executor
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             embedding = await loop.run_in_executor(
                 None, lambda: self.model.encode(text, normalize_embeddings=True)
             )
@@ -237,7 +237,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         if not self.model or not texts:
             return [None] * len(texts)
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             embeddings = await loop.run_in_executor(
                 None,
                 lambda: self.model.encode(
@@ -742,6 +742,24 @@ class MemoryPipeline:
             return 0.0
         return float(np.dot(v1, v2) / (norm1 * norm2))
 
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text for comparison by removing punctuation, articles, intensifiers, and extra spaces."""
+        # Remove punctuation, extra spaces, convert to lowercase
+        normalized = re.sub(r'[^\w\s]', '', text.strip().lower())
+        
+        # Handle common plural variations
+        normalized = re.sub(r'\bs\b', '', normalized)  # Remove standalone 's'
+        
+        # Remove articles (a, an, the)
+        normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
+        
+        # Remove intensifiers (but keep adjectives like 'cold', 'hot')
+        normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
+        
+        # Clean up extra spaces
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        return normalized
+
     # --- Memory Operations ---
     async def process_memory_operations(
         self, operations: List[Dict[str, Any]], user_id: str
@@ -759,8 +777,9 @@ class MemoryPipeline:
                     bank = op.get("memory_bank", "General")
 
                     # Deduplication check
+                    dedup_embedding = None
                     if self.valves.deduplicate_memories:
-                        is_dupe = await self._is_duplicate(content, user_id)
+                        is_dupe, dedup_embedding = await self._is_duplicate(content, user_id)
                         if is_dupe:
                             logger.info(f"Skipping duplicate memory (length: {len(content)})")
                             continue
@@ -774,8 +793,18 @@ class MemoryPipeline:
                     # Add memory - using Model directly
                     try:
                         mem_obj = Memories.insert_new_memory(user_id, final_content)
+                        memory_id = getattr(mem_obj, 'id', None)
                         success_ops.append(op)
-                        logger.info(f"Memory saved (ID: {getattr(mem_obj, 'id', 'new')}) [Bank: {bank}] [Confidence: {confidence:.2f}]")
+                        logger.info(f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]")
+                        
+                        # Cache the embedding from deduplication check to avoid re-generating later
+                        if dedup_embedding is not None and memory_id:
+                            logger.debug(f"Caching embedding from deduplication check for memory {memory_id}")
+                            self.embedding_manager.cache[str(memory_id)] = dedup_embedding
+                            # Persist it immediately
+                            await self.embedding_manager.store_embedding_persistent(
+                                user_id, str(memory_id), content, dedup_embedding
+                            )
                     except Exception as ins_err:
                         logger.error(f"Failed to insert memory: {ins_err}")
 
@@ -792,10 +821,15 @@ class MemoryPipeline:
 
         return success_ops
 
-    async def _is_duplicate(self, text: str, user_id: str, exclude_id: str = None, all_memories_override: List[Any] = None) -> bool:
-        """Check if the given text is a duplicate of existing memories using embedding or text similarity."""
+    async def _is_duplicate(self, text: str, user_id: str, exclude_id: str = None, all_memories_override: List[Any] = None) -> Tuple[bool, Optional[np.ndarray]]:
+        """Check if the given text is a duplicate of existing memories.
+        
+        Returns:
+            Tuple of (is_duplicate: bool, embedding: Optional[np.ndarray])
+            The embedding is returned so it can be cached after successful save.
+        """
         if not text or not self.valves.deduplicate_memories:
-            return False
+            return False, None
             
         try:
             # Get all existing memories for the user (or use override for optimization)
@@ -805,14 +839,16 @@ class MemoryPipeline:
                 all_memories = Memories.get_memories_by_user_id(user_id)
                 
             if not all_memories:
-                return False
+                return False, None
 
             if self.valves.use_embeddings_for_deduplication:
                 # Use embedding-based similarity
                 new_embedding = await self.embedding_manager.get_embedding(text)
                 if new_embedding is None:
                     logger.warning("Could not generate embedding for duplicate check, falling back to text similarity")
-                    return await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
+                    # Fallback to text similarity - no embedding to cache
+                    is_dup = await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
+                    return is_dup, None
                     
                 # Check similarity against existing memories
                 for i, memory in enumerate(all_memories):
@@ -839,29 +875,10 @@ class MemoryPipeline:
                                 # Extract content between tags and memory bank
                                 raw_memory_content = memory_content[tags_end + 1:bank_start].strip()
                     
-
                     # Check for exact match first (ignoring punctuation and case)
-                    def normalize_text(t):
-                        import re
-                        # Remove punctuation, extra spaces, convert to lowercase
-                        normalized = re.sub(r'[^\w\s]', '', t.strip().lower())
-                        
-                        # Handle common plural variations
-                        normalized = re.sub(r'\bs\b', '', normalized)  # Remove standalone 's'
-                        
-                        # Remove articles (a, an, the)
-                        normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
-                        
-                        # Remove intensifiers (but keep adjectives like 'cold', 'hot')
-                        normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
-                        
-                        # Clean up extra spaces
-                        normalized = re.sub(r'\s+', ' ', normalized).strip()
-                        return normalized
-                    
-                    if normalize_text(text) == normalize_text(raw_memory_content):
+                    if self._normalize_text(text) == self._normalize_text(raw_memory_content):
                         logger.info(f"Exact match found for memory {memory_id}")
-                        return True
+                        return True, new_embedding  # Return the embedding we generated
                     
                     # Use raw content for embedding comparison
                     content_for_embedding = raw_memory_content
@@ -890,36 +907,36 @@ class MemoryPipeline:
                         # Use embedding similarity threshold from valves
                         if similarity >= self.valves.embedding_similarity_threshold:
                             logger.info(f"Duplicate detected via embeddings (similarity: {similarity:.3f}) for memory {memory_id}")
-                            return True
+                            return True, new_embedding  # Return the embedding we generated
                     else:
                         logger.warning(f"Could not generate embedding for existing memory {memory_id}")
             else:
-                # Use text-based similarity
-                return await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
+                # Use text-based similarity - no embedding to cache
+                is_dup = await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
+                return is_dup, None
                         
-            return False
+            return False, new_embedding if self.valves.use_embeddings_for_deduplication else None  # Not duplicate, return embedding for caching
             
         except Exception as e:
             logger.error(f"Error during duplicate check: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             # If deduplication fails, err on the side of caution and keep the memory
-            return False
-
+            return False, None
     async def _check_text_similarity(self, text: str, all_memories: List[Any], exclude_id: str = None) -> bool:
         """Check for text-based similarity using difflib."""
         import difflib
         
         # Helper for normalization (could be moved to a shared utility)
-        def normalize_text(t):
-            import re
-            normalized = re.sub(r'[^\w\s]', '', t.strip().lower())
-            normalized = re.sub(r'\bs\b', '', normalized)
-            normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
-            normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
-            normalized = re.sub(r'\s+', ' ', normalized).strip()
-            return normalized
+        # def normalize_text(t):
+        #     import re
+        #     normalized = re.sub(r'[^\w\s]', '', t.strip().lower())
+        #     normalized = re.sub(r'\bs\b', '', normalized)
+        #     normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
+        #     normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
+        #     normalized = re.sub(r'\s+', ' ', normalized).strip()
+        #     return normalized
 
-        normalized_text = normalize_text(text)
+        normalized_text = self._normalize_text(text)
         
         for i, memory in enumerate(all_memories):
             memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
@@ -940,7 +957,7 @@ class MemoryPipeline:
                         raw_memory_content = memory_content[tags_end + 1:bank_start].strip()
 
             # Calculate text similarity using normalized raw content
-            normalized_raw = normalize_text(raw_memory_content)
+            normalized_raw = self._normalize_text(raw_memory_content)
             similarity = difflib.SequenceMatcher(None, normalized_text, normalized_raw).ratio()
             
             if similarity >= self.valves.similarity_threshold:
@@ -952,7 +969,7 @@ class MemoryPipeline:
     # --- Summarization ---
     async def cluster_and_summarize(
         self, user_id: str, query_llm_func: Callable
-    ) -> None:
+    ) -> Optional[str]:
         """Find clusters of memories and summarize them."""
         logger.info(f"Starting summarization for user {user_id}")
         
@@ -1016,14 +1033,14 @@ class MemoryPipeline:
             await self.embedding_manager.store_embeddings_batch_persistent(
                 user_id, 
                 [str(ids[idx]) for idx in uncached_indices], 
-                uncached_contents, 
-                new_embeddings
             )
         else:
             logger.info(f"Using cached embeddings for all {len(memories)} memories")
+            new_embeddings = []  # No new embeddings when all are cached
 
         valid_indices = [i for i, e in enumerate(embeddings) if e is not None]
-        logger.info(f"Ready for clustering: {len(valid_indices)} valid embeddings ({len(memories) - len(uncached_contents)} from cache, {len([e for e in new_embeddings if e is not None]) if uncached_contents else 0} newly generated)")
+        newly_generated_count = len([e for e in new_embeddings if e is not None]) if new_embeddings else 0
+        logger.info(f"Ready for clustering: {len(valid_indices)} valid embeddings ({len(memories) - len(uncached_contents)} from cache, {newly_generated_count} newly generated)")
         
         if len(valid_indices) < self.valves.summarization_min_cluster_size:
             logger.info(f"Only {len(valid_indices)} valid embeddings, need at least {self.valves.summarization_min_cluster_size} for clustering")
@@ -1132,7 +1149,9 @@ class TaskManager:
             return False
 
         # Kill rogue ghost tasks from previous versions before starting new ones
-        asyncio.create_task(self._scavenge_rogue_tasks())
+        scavenger_task = asyncio.create_task(self._scavenge_rogue_tasks())
+        self.tasks.add(scavenger_task)
+        scavenger_task.add_done_callback(self.tasks.discard)
 
         valves = self.filter.valves
         logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}, deduplication={valves.enable_deduplication_task}")
@@ -2064,7 +2083,13 @@ Your output must be valid JSON only. No additional text.""",
                 await asyncio.sleep(60)
 
     async def _log_error_counters_loop(self):
-        while True:
-            await asyncio.sleep(self.valves.error_logging_interval)
-            logger.debug(f"Error Counters: {self.error_manager.get_counters()}")
+        """Periodically log error counters."""
+        try:
+            while True:
+                await asyncio.sleep(self.valves.error_logging_interval)
+                logger.debug(f"Error Counters: {self.error_manager.get_counters()}")
+        except asyncio.CancelledError:
+            logger.info("Error logging task cancelled")
+        except Exception as e:
+            logger.exception(f"Error in error logging loop: {e}")
 
