@@ -167,7 +167,7 @@ class MemoryOperation(BaseModel):
     confidence: Optional[float] = None
 
 
-class AddMemoryForm(BaseModel):
+class LocalAddMemoryForm(BaseModel):
     content: str
 
 
@@ -220,6 +220,51 @@ class JSONParser:
                 pass
 
         return None
+
+
+class LRUCache:
+    """A simple LRU (Least Recently Used) cache with bounded size.
+    
+    Entries are evicted when the cache reaches max_size. Most recently
+    accessed items are kept, oldest items are removed first.
+    """
+    
+    def __init__(self, max_size: int = 10000):
+        """Initialize LRU cache with maximum size.
+        
+        Args:
+            max_size: Maximum number of entries to keep in cache
+        """
+        self._cache = OrderedDict()
+        self._max_size = max_size
+    
+    def get(self, key: str) -> Optional[np.ndarray]:
+        """Get value from cache, moving it to end (most recently used).
+        
+        Args:
+            key: Cache key to retrieve
+            
+        Returns:
+            Cached value if found, None otherwise
+        """
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+    
+    def set(self, key: str, value: np.ndarray) -> None:
+        """Set value in cache, evicting oldest entry if at capacity.
+        
+        Args:
+            key: Cache key
+            value: Value to cache
+        """
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= self._max_size:
+                self._cache.popitem(last=False)
+        self._cache[key] = value
 
 
 # ------------------------------------------------------------------------------
@@ -340,8 +385,11 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
                             results = [None] * len(texts)
                             for item in res_json["data"]:
                                 idx = item.get("index")
-                                if idx is not None and 0 <= idx < len(results):
-                                    results[idx] = np.array(item["embedding"], dtype=np.float32)
+                                embedding_data = item.get("embedding")
+                                if idx is not None and 0 <= idx < len(results) and embedding_data is not None:
+                                    results[idx] = np.array(embedding_data, dtype=np.float32)
+                                elif idx is not None and 0 <= idx < len(results):
+                                    logger.warning(f"Missing embedding data for item at index {idx} in batch response")
                             return results
                     return [None] * len(texts)
             finally:
@@ -358,7 +406,7 @@ class EmbeddingManager:
     def __init__(self, get_valves: Callable[[], Any], error_manager: ErrorManager):
         self.get_valves = get_valves
         self.error_manager = error_manager
-        self.cache: Dict[str, np.ndarray] = {}  # In-memory cache
+        self.cache = LRUCache()  # Bounded LRU cache (default max_size=10000)
         self.provider: Optional[EmbeddingProvider] = None
         self._current_provider_type = None
         self._session: Optional[aiohttp.ClientSession] = None
@@ -502,7 +550,7 @@ class EmbeddingManager:
                         logger.warning(f"Error loading embedding cache for batch store: {e}")
                 
                 # Update cache with new embeddings
-                for memory_id, text, embedding in zip(ids, texts, embeddings):
+                for memory_id, embedding in zip(ids, embeddings, strict=True):
                     if embedding is None:
                         continue
                         
@@ -583,14 +631,14 @@ class EmbeddingManager:
         persistent_emb = await self.load_embedding_persistent(user_id, memory_id_str)
         if persistent_emb is not None:
             # Cache in memory for this session
-            self.cache[memory_id_str] = persistent_emb
+            self.cache.set(memory_id_str, persistent_emb)
             return persistent_emb
 
         # 3. Generate new embedding
         new_emb = await self.get_embedding(text)
         if new_emb is not None:
             # Cache in memory
-            self.cache[memory_id_str] = new_emb
+            self.cache.set(memory_id_str, new_emb)
             # Store persistently
             await self.store_embedding_persistent(user_id, memory_id_str, text, new_emb)
         
@@ -723,7 +771,7 @@ class MemoryPipeline:
                 persistent_emb = await self.embedding_manager.load_embedding_persistent(user_id, mem_id)
                 if persistent_emb is not None:
                     # Cache in memory for this session
-                    self.embedding_manager.cache[mem_id] = persistent_emb
+                    self.embedding_manager.cache.set(mem_id, persistent_emb)
                     sim = self._cosine_similarity(query_embedding, persistent_emb)
                     if sim >= self.valves.vector_similarity_threshold:
                         scored_memories.append((sim, mem))
@@ -742,7 +790,7 @@ class MemoryPipeline:
             for i, emb in enumerate(new_embeddings):
                 if emb is not None:
                     # Update in-memory cache
-                    self.embedding_manager.cache[ids_to_embed[i]] = emb
+                    self.embedding_manager.cache.set(ids_to_embed[i], emb)
                     # Score
                     sim = self._cosine_similarity(query_embedding, emb)
                     if sim >= self.valves.vector_similarity_threshold:
@@ -833,8 +881,10 @@ class MemoryPipeline:
                             # Try the high-level router function which handles vector indexing
                             logger.info(f"Attempting to add memory via router add_memory (Vector-Aware)...")
                             
-                            if add_memory and AddMemoryForm:
-                                form = AddMemoryForm(content=final_content)
+                            if add_memory and (AddMemoryForm or LocalAddMemoryForm):
+                                # Use imported AddMemoryForm if available, otherwise local
+                                FormClass = AddMemoryForm if AddMemoryForm else LocalAddMemoryForm
+                                form = FormClass(content=final_content)
                                 
                                 # Define wrapper for embedding function to match Router signature
                                 # The router calls: await request.app.state.EMBEDDING_FUNCTION(content, user=user)
@@ -844,19 +894,14 @@ class MemoryPipeline:
                                 # Prepare Mock Request for Dependency Injection
                                 req = MockRequest(user_obj, mock_embedding_function) if 'MockRequest' in globals() else None
                                 
-                                try:
-                                    # Attempt 1: Standard Router Signature (request + form + user + db)
-                                    # We must explicitly pass 'user' and 'db=None' because we are invoking the router 
-                                    # function directly, bypassing FastAPI's dependency injection.
-                                    # Passing db=None relies on Memories.insert_new_memory acting robustly.
-                                    if req:
-                                        mem_obj = await add_memory(request=req, form_data=form, user=user_obj, db=None)
-                                    else:
-                                        mem_obj = await add_memory(user_id=user_id, form_data=form)
-                                        
-                                except TypeError as te:
-                                    logger.warning(f"Router add_memory signature mismatch (try 1): {te}, retrying...")
-                                    raise te
+                                # Call add_memory with correct signature (request, form_data, user)
+                                # No db parameter - the function signature is:
+                                # async def add_memory(request: Request, form_data: AddMemoryForm, user: User = None)
+                                if req:
+                                    mem_obj = await add_memory(request=req, form_data=form, user=user_obj)
+                                else:
+                                    # Fallback if MockRequest failed
+                                    raise ImportError("MockRequest not available")
                             else:
                                 raise ImportError("Router add_memory not successfully imported")
 
@@ -871,7 +916,7 @@ class MemoryPipeline:
                         # Cache the embedding from deduplication check to avoid re-generating later
                         if dedup_embedding is not None and memory_id:
                             logger.debug(f"Caching embedding from deduplication check for memory {memory_id}")
-                            self.embedding_manager.cache[str(memory_id)] = dedup_embedding
+                            self.embedding_manager.cache.set(str(memory_id), dedup_embedding)
                             # Persist it immediately
                             await self.embedding_manager.store_embedding_persistent(
                                 user_id, str(memory_id), content, dedup_embedding
@@ -960,13 +1005,13 @@ class MemoryPipeline:
                         existing_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
                         if existing_embedding is not None:
                             # Cache in memory for this session
-                            self.embedding_manager.cache[memory_id] = existing_embedding
+                            self.embedding_manager.cache.set(memory_id, existing_embedding)
                         else:
                             # Generate embedding for existing memory using raw content
                             existing_embedding = await self.embedding_manager.get_embedding(content_for_embedding)
                             if existing_embedding is not None:
                                 # Cache in memory and store persistently
-                                self.embedding_manager.cache[memory_id] = existing_embedding
+                                self.embedding_manager.cache.set(memory_id, existing_embedding)
                                 await self.embedding_manager.store_embedding_persistent(
                                     user_id, memory_id, content_for_embedding, existing_embedding
                                 )
@@ -1080,7 +1125,7 @@ class MemoryPipeline:
                 persistent_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
                 if persistent_embedding is not None:
                     # Cache in memory for this session
-                    self.embedding_manager.cache[memory_id] = persistent_embedding
+                    self.embedding_manager.cache.set(memory_id, persistent_embedding)
                     embeddings.append(persistent_embedding)
                 else:
                     # Need to generate
@@ -1098,7 +1143,7 @@ class MemoryPipeline:
                 if new_emb is not None:
                     embeddings[idx] = new_emb
                     # Cache in memory
-                    self.embedding_manager.cache[ids[idx]] = new_emb
+                    self.embedding_manager.cache.set(ids[idx], new_emb)
             
             # Store persistently in batch
             await self.embedding_manager.store_embeddings_batch_persistent(
@@ -1770,9 +1815,9 @@ Your output must be valid JSON only. No additional text.""",
 
         @field_validator("retry_delay")
         def check_non_negative_float(cls, v, info):
-            if not isinstance(v, float) or v < 0.0:
+            if not isinstance(v, (int, float)) or v < 0.0:
                 raise ValueError(f"{info.field_name} must be a non-negative float")
-            return v
+            return float(v)
 
         @field_validator("timezone")
         def check_valid_timezone(cls, v):
@@ -1882,44 +1927,58 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
     async def _query_llm(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         """Unified LLM query method with retries and metrics."""
-        # This replaces the massive query logic from before
         valves = self.valves
-        # ... logic to call Ollama or OpenAI ...
-        # For brevity in this refactor step, simplified:
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = valves.llm_api_endpoint_url
-                headers = {"Content-Type": "application/json"}
-                if valves.llm_api_key:
-                    headers["Authorization"] = f"Bearer {valves.llm_api_key}"
+        last_error = None
+        
+        for attempt in range(valves.max_retries + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    url = valves.llm_api_endpoint_url
+                    headers = {"Content-Type": "application/json"}
+                    if valves.llm_api_key:
+                        headers["Authorization"] = f"Bearer {valves.llm_api_key}"
 
-                payload = {
-                    "model": valves.llm_model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "stream": False,
-                }
+                    payload = {
+                        "model": valves.llm_model_name,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "stream": False,
+                    }
 
-                if valves.llm_provider_type == "openai_compatible":
-                    # For identify_memories, we expect an array. 
-                    # openai_compatible's 'json_object' format requires a root object, not array.
-                    # Only use it if not identification or if the prompt can be adjusted.
-                    # For now, following CodeRabbit: remove to avoid array errors.
-                    pass
+                    if valves.llm_provider_type == "openai_compatible":
+                        # For identify_memories, we expect an array. 
+                        # openai_compatible's 'json_object' format requires a root object, not array.
+                        # Only use it if not identification or if the prompt can be adjusted.
+                        # For now, following CodeRabbit: remove to avoid array errors.
+                        pass
 
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Extract content logic...
-                        if "choices" in data:
-                            return data["choices"][0]["message"]["content"]
-                        elif "message" in data:
-                            return data["message"]["content"]
-        except Exception as e:
-            logger.exception(f"LLM Query failed: {e}")
-            self.error_manager.increment("llm_call_errors")
+                    async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            # Extract content logic...
+                            if "choices" in data:
+                                return data["choices"][0]["message"]["content"]
+                            elif "message" in data:
+                                return data["message"]["content"]
+                        elif resp.status >= 500:
+                            # Server error - retry
+                            raise aiohttp.ClientError(f"Server error: {resp.status}")
+                        else:
+                            # Client error (4xx) - don't retry
+                            logger.warning(f"LLM API client error {resp.status}, not retrying")
+                            return None
+                            
+            except Exception as e:
+                last_error = e
+                if attempt < valves.max_retries:
+                    logger.warning(f"LLM query attempt {attempt + 1}/{valves.max_retries + 1} failed, retrying in {valves.retry_delay}s: {e}")
+                    await asyncio.sleep(valves.retry_delay)
+                else:
+                    logger.exception(f"LLM Query failed after {valves.max_retries + 1} attempts: {e}")
+                    self.error_manager.increment("llm_call_errors")
+        
         return None
 
     # --------------------------------------------------------------------------
