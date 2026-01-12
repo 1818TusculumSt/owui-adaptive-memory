@@ -108,26 +108,29 @@ except ImportError:
     add_memory = None
     AddMemoryForm = None
 
+# --- Advanced Mock Infrastructure for Router Compatibility ---
 class MockConfig:
     def __init__(self):
-        self.ENABLE_VECTOR_DB = True
-        self.USER_PERMISSIONS = {"chat": {"deletion": True}}
+        # Flags required by router.add_memory
+        self.ENABLE_MEMORIES = True
+        self.USER_PERMISSIONS = {"features": {"memories": True}}
 
 class MockAppState:
-    def __init__(self):
+    def __init__(self, embedding_function):
         self.config = MockConfig()
+        self.EMBEDDING_FUNCTION = embedding_function
 
 class MockApp:
-    def __init__(self):
-        self.state = MockAppState()
+    def __init__(self, embedding_function):
+        self.state = MockAppState(embedding_function)
 
 class MockState:
     def __init__(self, user):
         self.user = user
 
 class MockRequest:
-    def __init__(self, user):
-        self.app = MockApp()
+    def __init__(self, user, embedding_function):
+        self.app = MockApp(embedding_function)
         self.state = MockState(user)
         self.user = user
 
@@ -832,24 +835,27 @@ class MemoryPipeline:
                             
                             if add_memory and AddMemoryForm:
                                 form = AddMemoryForm(content=final_content)
+                                
+                                # Define wrapper for embedding function to match Router signature
+                                # The router calls: await request.app.state.EMBEDDING_FUNCTION(content, user=user)
+                                async def mock_embedding_function(content: str, user=None):
+                                    return await self.embedding_manager.get_embedding(content)
+
                                 # Prepare Mock Request for Dependency Injection
-                                req = MockRequest(user_obj) if 'MockRequest' in globals() else None
+                                req = MockRequest(user_obj, mock_embedding_function) if 'MockRequest' in globals() else None
                                 
                                 try:
-                                    # Attempt 1: Standard Router Signature (request + form)
-                                    # Log indicated 'user_id' was an unexpected keyword argument, so we remove it.
-                                    # The user context is passed via request.state.user (MockRequest).
+                                    # Attempt 1: Standard Router Signature (request + form + user + db)
+                                    # We must explicitly pass 'user' and 'db=None' because we are invoking the router 
+                                    # function directly, bypassing FastAPI's dependency injection.
+                                    # Passing db=None relies on Memories.insert_new_memory acting robustly.
                                     if req:
-                                        mem_obj = await add_memory(request=req, form_data=form)
+                                        mem_obj = await add_memory(request=req, form_data=form, user=user_obj, db=None)
                                     else:
-                                        # Fallback if MockRequest failed (unlikely), but router requires request
                                         mem_obj = await add_memory(user_id=user_id, form_data=form)
                                         
                                 except TypeError as te:
                                     logger.warning(f"Router add_memory signature mismatch (try 1): {te}, retrying...")
-                                    # Attempt 2: Positional request? or some other variance.
-                                    # If attempt 1 failed due to missing request (fallback path), we can't do much.
-                                    # Just let it fall through to general exception handler.
                                     raise te
                             else:
                                 raise ImportError("Router add_memory not successfully imported")
