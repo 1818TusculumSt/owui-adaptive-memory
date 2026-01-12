@@ -1156,7 +1156,7 @@ class TaskManager:
         scavenger_task.add_done_callback(self.tasks.discard)
 
         valves = self.filter.valves
-        logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}, deduplication={valves.enable_deduplication_task}")
+        logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}")
 
         if valves.enable_summarization_task:
             task = asyncio.create_task(self.filter._summarize_old_memories_loop())
@@ -1263,14 +1263,7 @@ class Filter:
             default=1800,
             description="Interval in seconds between error counter log entries",
         )
-        enable_deduplication_task: bool = Field(
-            default=False,
-            description="Enable or disable the background memory deduplication task (DEPRECATED - Use pre-save deduplication)",
-        )
-        deduplication_interval: int = Field(
-            default=14400,
-            description="Interval in seconds between memory deduplication runs (default: 4 hours)",
-        )
+
         enable_date_update_task: bool = Field(
             default=True,
             description="Enable or disable the background date update task",
