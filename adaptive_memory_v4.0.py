@@ -1913,12 +1913,11 @@ Your output must be valid JSON only. No additional text.""",
             return body
 
         if not self._tasks_started:
+            self.task_manager.start_tasks()
+            self._tasks_started = True
         
         # Check if valves have changed and restart tasks if needed
         self._check_and_handle_valve_changes()
-        
-            self.task_manager.start_tasks()
-            self._tasks_started = True
 
         user_id = __user__["id"]
         self.seen_users.add(user_id)  # Track active user
@@ -2016,13 +2015,6 @@ Your output must be valid JSON only. No additional text.""",
         self, body: Dict[str, Any], __event_emitter__=None, __user__=None
     ) -> Dict[str, Any]:
         """Process outgoing response: Extract memories, update status."""
-        if not self._tasks_started:
-        
-        # Check if valves have changed and restart tasks if needed
-        self._check_and_handle_valve_changes()
-        
-            self.task_manager.start_tasks()
-            self._tasks_started = True
 
         if not __user__ or not body.get("messages"):
             return body
