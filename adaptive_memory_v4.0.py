@@ -896,8 +896,8 @@ class MemoryPipeline:
         except Exception as e:
             logger.error(f"Error during duplicate check: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
-            # If deduplication fails, err on the side of caution and don't save
-            return True
+            # If deduplication fails, err on the side of caution and keep the memory
+            return False
 
     async def _check_text_similarity(self, text: str, all_memories: List[Any], exclude_id: str = None) -> bool:
         """Check for text-based similarity using difflib."""
@@ -1125,11 +1125,6 @@ class TaskManager:
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
 
-        if valves.enable_deduplication_task:
-            task = asyncio.create_task(self.filter._deduplicate_memories_loop())
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
-
         logger.info(f"Background tasks started: {len(self.tasks)} active tasks")
         return True
 
@@ -1189,8 +1184,8 @@ class Filter:
             description="Interval in seconds between error counter log entries",
         )
         enable_deduplication_task: bool = Field(
-            default=True,
-            description="Enable or disable the background memory deduplication task",
+            default=False,
+            description="Enable or disable the background memory deduplication task (DEPRECATED - Use pre-save deduplication)",
         )
         deduplication_interval: int = Field(
             default=14400,
@@ -2014,92 +2009,3 @@ Your output must be valid JSON only. No additional text.""",
             await asyncio.sleep(self.valves.error_logging_interval)
             logger.debug(f"Error Counters: {self.error_manager.get_counters()}")
 
-    async def _deduplicate_memories_loop(self):
-        """Background task for removing duplicate memories."""
-        logger.info("Deduplication background task launched.")
-        
-        while True:
-            try:
-                # Always get the current valve value in case it changed
-                interval = self.valves.deduplication_interval
-                await asyncio.sleep(interval)
-                
-                logger.info(f"Deduplication task running. Active users: {len(self.seen_users)}")
-
-                if self.valves.enable_deduplication_task and self.seen_users:
-                    logger.info("Background deduplication: starting scan...")
-                    
-                    # Copy set to avoid size change during iteration
-                    active_users = list(self.seen_users)
-                    for user_id in active_users:
-                        try:
-                            logger.info(f"Background deduplication: processing user {user_id}")
-                            duplicates_removed = await self._remove_duplicate_memories(user_id)
-                            if duplicates_removed > 0:
-                                result_msg = f"Removed {duplicates_removed} duplicate memories."
-                                self.notification_queue.append(result_msg)
-                                logger.info(f"Background deduplication: {result_msg}")
-                            else:
-                                logger.debug(f"Background deduplication: no duplicates found for user {user_id}")
-                        except Exception as u_err:
-                            logger.exception(f"Background deduplication error for user {user_id}: {u_err}")
-
-                    logger.info("Background deduplication: cycle complete")
-                else:
-                    logger.debug(f"Background deduplication: skipped (enabled: {self.valves.enable_deduplication_task}, users: {len(self.seen_users)})")
-
-            except asyncio.CancelledError:
-                logger.info("Deduplication task cancelled.")
-                break
-            except Exception as e:
-                logger.exception(f"Deduplication task error: {e}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                await asyncio.sleep(60)
-
-    async def _remove_duplicate_memories(self, user_id: str) -> int:
-        """Remove duplicate memories for a user and return count of removed duplicates."""
-        try:
-            all_memories = Memories.get_memories_by_user_id(user_id)
-            if not all_memories or len(all_memories) < 2:
-                return 0
-                
-            duplicates_removed = 0
-            pipeline = MemoryPipeline(self.valves, self.embedding_manager, self.error_manager)
-            
-            # Optimized logic: Instead of N separate _is_duplicate calls (which each fetch all N memories),
-            # we iterate through the list once and compare each memory against the ones we've already processed.
-            processed_memories = []
-            
-            for memory in all_memories:
-                memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
-                memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
-                
-                # Extract raw content
-                raw_content = memory_content
-                if '[Tags:' in memory_content and '[Memory Bank:' in memory_content:
-                    tags_end = memory_content.find(']', memory_content.find('[Tags:'))
-                    if tags_end != -1:
-                        bank_start = memory_content.find('[Memory Bank:', tags_end)
-                        if bank_start != -1:
-                            raw_content = memory_content[tags_end + 1:bank_start].strip()
-                
-                # Check if this memory is a duplicate of any ALREADY processed memory
-                # We can reuse _is_duplicate but we'll pass the subset we've already seen
-                is_duplicate = await pipeline._is_duplicate(raw_content, user_id, all_memories_override=processed_memories)
-                if is_duplicate:
-                    # Remove this duplicate from DB
-                    try:
-                        Memories.delete_memory_by_id(memory_id)
-                        duplicates_removed += 1
-                        logger.info(f"Removed duplicate memory {memory_id}")
-                    except Exception as del_err:
-                        logger.error(f"Failed to delete duplicate memory {memory_id}: {del_err}")
-                else:
-                    # Keep this one as a reference for future comparisons
-                    processed_memories.append(memory)
-                        
-            return duplicates_removed
-            
-        except Exception as e:
-            logger.exception(f"Error during background deduplication: {e}")
-            return 0
