@@ -101,6 +101,27 @@ from open_webui.models.memories import Memories
 from open_webui.models.users import Users
 from open_webui.main import app as webui_app
 
+# --- Router & Mock Imports for Vector Indexing ---
+try:
+    from open_webui.routers.memories import add_memory, AddMemoryForm
+except ImportError:
+    add_memory = None
+    AddMemoryForm = None
+
+class MockState:
+    def __init__(self, user):
+        self.user = user
+
+class MockApp:
+    def __init__(self):
+        self.state = type('obj', (object,), {})
+
+class MockRequest:
+    def __init__(self, user):
+        self.app = MockApp()
+        self.state = MockState(user)
+        self.user = user
+
 # Set up logging with versioned adapter
 _raw_logger = logging.getLogger("openwebui.plugins.adaptive_memory")
 if not _raw_logger.handlers:
@@ -766,6 +787,8 @@ class MemoryPipeline:
         self, operations: List[Dict[str, Any]], user_id: str, skip_deduplication: bool = False
     ) -> List[Dict[str, Any]]:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
+        # Fetch full user object for Router DI (MockRequest)
+        user_obj = Users.get_user_by_id(user_id)
         success_ops = []
         for op in operations:
             try:
@@ -791,16 +814,37 @@ class MemoryPipeline:
 
                     final_content = f"[Tags: {tags_str}] {content} [Memory Bank: {bank}] [Confidence: {confidence:.2f}]"
 
-                    # Add memory - using Model directly
-                    # NOTE: We try 'add_memory' first as it likely handles vector indexing.
-                    # 'insert_new_memory' is a low-level DB write that might skip indexing.
+                    # Add memory - using Router add_memory for Vector Indexing
                     try:
                         mem_obj = None
                         try:
                             # Try the high-level router function which handles vector indexing
                             logger.info(f"Attempting to add memory via router add_memory (Vector-Aware)...")
-                            form = AddMemoryForm(content=final_content)
-                            mem_obj = await add_memory(user_id=user_id, form_data=form)
+                            
+                            if add_memory and AddMemoryForm:
+                                form = AddMemoryForm(content=final_content)
+                                # Prepare Mock Request for Dependency Injection
+                                req = MockRequest(user_obj) if 'MockRequest' in globals() else None
+                                
+                                try:
+                                    # Attempt 1: Standard Router Signature (request + form)
+                                    # Log indicated 'user_id' was an unexpected keyword argument, so we remove it.
+                                    # The user context is passed via request.state.user (MockRequest).
+                                    if req:
+                                        mem_obj = await add_memory(request=req, form_data=form)
+                                    else:
+                                        # Fallback if MockRequest failed (unlikely), but router requires request
+                                        mem_obj = await add_memory(user_id=user_id, form_data=form)
+                                        
+                                except TypeError as te:
+                                    logger.warning(f"Router add_memory signature mismatch (try 1): {te}, retrying...")
+                                    # Attempt 2: Positional request? or some other variance.
+                                    # If attempt 1 failed due to missing request (fallback path), we can't do much.
+                                    # Just let it fall through to general exception handler.
+                                    raise te
+                            else:
+                                raise ImportError("Router add_memory not successfully imported")
+
                         except Exception as add_err:
                             logger.warning(f"Router add_memory failed ({add_err}), falling back to insert_new_memory")
                             mem_obj = Memories.insert_new_memory(user_id, final_content)
