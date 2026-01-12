@@ -101,16 +101,22 @@ from open_webui.models.memories import Memories
 from open_webui.models.users import Users
 from open_webui.main import app as webui_app
 
-# Set up logging
-logger = logging.getLogger("openwebui.plugins.adaptive_memory")
-if not logger.handlers:
+# Set up logging with versioned adapter
+_raw_logger = logging.getLogger("openwebui.plugins.adaptive_memory")
+if not _raw_logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    _raw_logger.addHandler(handler)
+    _raw_logger.setLevel(logging.INFO)
+
+class AMAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return f"[AM v4.0.1] {msg}", kwargs
+
+logger = AMAdapter(_raw_logger, {})
 
 # ------------------------------------------------------------------------------
 # Data Models and Helper Classes
@@ -1067,13 +1073,7 @@ class MemoryPipeline:
                 )
 
                 if summary:
-                    # 5. Execute Changes
-                    # Delete old
-                    for m in cluster_memories:
-                        Memories.delete_memory_by_id(m.id)
-
-                    # Add new summary
-                    # NOTE: Explicitly setting confidence to 1.0 for summaries as they are consolidated facts.
+                    # 5. Execute Changes Transactionally: Save before Delete
                     op = {
                         "operation": "NEW",
                         "content": summary,
@@ -1081,14 +1081,31 @@ class MemoryPipeline:
                         "memory_bank": "General",
                         "confidence": 1.0,
                     }
-                    await self.process_memory_operations([op], user_id)
-                    logger.info(
-                        f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)"
-                    )
 
-                    return (
-                        f"Consolidated {len(cluster_memories)} memories into a summary."
-                    )
+                    # Process the new summary first
+                    success_ops = await self.process_memory_operations([op], user_id)
+
+                    if success_ops:
+                        logger.info(
+                            f"Summarization: New consolidated summary saved successfully. Now removing {len(cluster_memories)} source memories."
+                        )
+                        # ONLY delete old if saving the new summary succeeded
+                        for m in cluster_memories:
+                            try:
+                                Memories.delete_memory_by_id(m.id)
+                            except Exception as del_err:
+                                logger.error(
+                                    f"Summarization: Failed to delete source memory {m.id}: {del_err}"
+                                )
+
+                        logger.info(
+                            f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)"
+                        )
+                        return f"Consolidated {len(cluster_memories)} memories into a summary."
+                    else:
+                        logger.error(
+                            "Summarization: Failed to save new summary. Aborting source memory deletion to prevent data loss."
+                        )
 
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
@@ -1109,8 +1126,13 @@ class TaskManager:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            logger.warning("TaskManager: No running event loop found. Tasks will be retried on next request.")
+            logger.warning(
+                "TaskManager: No running event loop found. Tasks will be retried on next request."
+            )
             return False
+
+        # Kill rogue ghost tasks from previous versions before starting new ones
+        asyncio.create_task(self._scavenge_rogue_tasks())
 
         valves = self.filter.valves
         logger.info(f"Starting background tasks: summarization={valves.enable_summarization_task}, deduplication={valves.enable_deduplication_task}")
@@ -1134,6 +1156,43 @@ class TaskManager:
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks.clear()
+
+    async def _scavenge_rogue_tasks(self):
+        """Find and terminate any orphaned background tasks from previous versions."""
+        logger.info("TaskManager: Starting rogue task scavenger...")
+        current_task = asyncio.current_task()
+        all_tasks = asyncio.all_tasks()
+
+        scavenged_count = 0
+        for task in all_tasks:
+            if task == current_task:
+                continue
+
+            # Look for tasks running functions related to adaptive memory loops
+            task_repr = repr(task)
+            # We target the specific function names used in v3.1 and v4.0
+            ghost_indicators = [
+                "_summarize_old_memories_loop",
+                "_deduplicate_memories_loop",
+                "_remove_duplicate_memories",
+                "function_adaptive_memory_v31",
+            ]
+
+            if any(indicator in task_repr for indicator in ghost_indicators):
+                # If it's not one of OUR currently tracked tasks, it's a ghost
+                if task not in self.tasks:
+                    logger.warning(
+                        f"TaskManager: Found potentially rogue ghost task: {task_repr}. Requesting cancellation."
+                    )
+                    task.cancel()
+                    scavenged_count += 1
+
+        if scavenged_count > 0:
+            logger.info(
+                f"TaskManager: Scavenger requested cancellation of {scavenged_count} rogue tasks."
+            )
+        else:
+            logger.info("TaskManager: No rogue tasks detected.")
 
 
 # ------------------------------------------------------------------------------
