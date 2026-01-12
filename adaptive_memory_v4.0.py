@@ -335,34 +335,7 @@ class EmbeddingManager:
         if user_id not in self._locks:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
-    def _check_and_handle_valve_changes(self):
-        """Detect if valves have changed and restart tasks if needed."""
-        # Hash important valve settings that affect background tasks
-        import hashlib
-        valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
-        new_hash = hashlib.md5(valve_str.encode()).hexdigest()
-        
-        if self._valve_hash is None:
-            self._valve_hash = new_hash
-            return False
-        
-        if new_hash != self._valve_hash:
-            logger.info(f"Valve changes detected! Restarting background tasks...")
-            self._valve_hash = new_hash
-            # Restart tasks with new valve values
-            if self._tasks_started:
-                import asyncio
-                asyncio.create_task(self._restart_tasks())
-            return True
-        return False
-    
-    async def _restart_tasks(self):
-        """Restart background tasks with new valve settings."""
-        await self.task_manager.stop_tasks()
-        self._tasks_started = False
-        self.task_manager.start_tasks()
-        self._tasks_started = True
-        logger.info("Background tasks restarted with new valve values")
+
 
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
@@ -1062,7 +1035,7 @@ class MemoryPipeline:
                 user_id, 
                 [str(ids[idx]) for idx in uncached_indices],
                 uncached_contents,
-                [new_embeddings[i] for i in range(len(new_embeddings))]
+                new_embeddings  # Already aligned with uncached_contents
             )
         else:
             logger.info(f"Using cached embeddings for all {len(memories)} memories")
@@ -1112,7 +1085,6 @@ class MemoryPipeline:
                 cluster_memories = [memories[i] for i in cluster_indices]
                 cluster_text = "\n".join([f"- {m.content}" for m in cluster_memories])
 
-                prompt = self.valves.summarization_memory_prompt + f"\n\n{cluster_text}"
 
                 summary = await query_llm_func(
                     self.valves.summarization_memory_prompt,
