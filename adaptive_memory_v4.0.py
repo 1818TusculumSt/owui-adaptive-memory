@@ -108,13 +108,22 @@ except ImportError:
     add_memory = None
     AddMemoryForm = None
 
-class MockState:
-    def __init__(self, user):
-        self.user = user
+class MockConfig:
+    def __init__(self):
+        self.ENABLE_VECTOR_DB = True
+        self.USER_PERMISSIONS = {"chat": {"deletion": True}}
+
+class MockAppState:
+    def __init__(self):
+        self.config = MockConfig()
 
 class MockApp:
     def __init__(self):
-        self.state = type('obj', (object,), {})
+        self.state = MockAppState()
+
+class MockState:
+    def __init__(self, user):
+        self.user = user
 
 class MockRequest:
     def __init__(self, user):
