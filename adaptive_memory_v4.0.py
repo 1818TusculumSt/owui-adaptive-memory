@@ -417,12 +417,26 @@ class EmbeddingManager:
         self._session: Optional[aiohttp.ClientSession] = None
         # WeakValueDictionary allows garbage collection of locks when no longer referenced,
         # preventing unbounded growth of the locks dict
-        self._locks = weakref.WeakValueDictionary()
+        # Use regular dict instead of WeakValueDictionary to avoid premature GC of Lock objects
+        self._locks: Dict[str, asyncio.Lock] = {}
 
     def _get_lock(self, user_id: str) -> asyncio.Lock:
+        """Get or create a lock for the given user_id."""
         if user_id not in self._locks:
             self._locks[user_id] = asyncio.Lock()
         return self._locks[user_id]
+    
+    def _cleanup_lock(self, user_id: str) -> None:
+        """Remove lock for user_id if it's not locked and has no waiters.
+        
+        This prevents unbounded growth of the locks dict while ensuring
+        we don't delete locks that are still in use.
+        """
+        if user_id in self._locks:
+            lock = self._locks[user_id]
+            # Only delete if lock is not currently held and has no tasks waiting
+            if not lock.locked() and (not hasattr(lock, '_waiters') or not lock._waiters):
+                del self._locks[user_id]
 
 
     async def cleanup(self):
@@ -533,6 +547,8 @@ class EmbeddingManager:
                 logger.debug(f"Stored embedding for memory {memory_id} in persistent cache")
             except Exception as e:
                 logger.warning(f"Failed to store embedding in persistent cache for memory {memory_id}: {e}")
+        # Clean up lock after use to prevent unbounded growth
+        self._cleanup_lock(user_id)
 
     async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], texts: List[str], embeddings: List[np.ndarray]) -> None:
         """Store multiple embeddings in a single persistent JSON file operation."""
@@ -580,46 +596,52 @@ class EmbeddingManager:
                 logger.info(f"Batched stored {len(ids)} embeddings in persistent cache for user {user_id}")
             except Exception as e:
                 logger.warning(f"Failed to store batch embeddings in persistent cache: {e}")
+        # Clean up lock after use to prevent unbounded growth
+        self._cleanup_lock(user_id)
 
     async def load_embedding_persistent(self, user_id: str, memory_id: str) -> Optional[np.ndarray]:
         """Load a stored embedding from the persistent JSON file."""
+        result = None
         async with self._get_lock(user_id):
             try:
                 cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
                 cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
                 
                 if not await asyncio.to_thread(os.path.exists, cache_file):
-                    return None
-                
-                # Load cache
-                def _load():
-                    with open(cache_file, 'r') as f:
-                        return json.load(f)
-                cache = await asyncio.to_thread(_load)
-                
-                # Ensure ID is handled as string for JSON key lookup
-                memory_id_str = str(memory_id)
-                if memory_id_str in cache:
-                    embedding_data = cache[memory_id_str]
-                    embedding_list = embedding_data["embedding"]
-                    embedding = np.array(embedding_list, dtype=np.float32)
+                    result = None
+                else:
+                    # Load cache
+                    def _load():
+                        with open(cache_file, 'r') as f:
+                            return json.load(f)
+                    cache = await asyncio.to_thread(_load)
                     
-                    # Validate model compatibility
-                    valves = self.get_valves()
-                    stored_model = embedding_data.get("model")
-                    stored_provider = embedding_data.get("provider")
-                    
-                    if (stored_model != valves.embedding_model_name or 
-                        stored_provider != valves.embedding_provider_type):
-                        logger.debug(f"Cache miss for {memory_id_str}: Model/provider changed")
-                        return None
-                    
-                    return embedding
-                
-                return None
+                    # Ensure ID is handled as string for JSON key lookup
+                    memory_id_str = str(memory_id)
+                    if memory_id_str in cache:
+                        embedding_data = cache[memory_id_str]
+                        embedding_list = embedding_data["embedding"]
+                        embedding = np.array(embedding_list, dtype=np.float32)
+                        
+                        # Validate model compatibility
+                        valves = self.get_valves()
+                        stored_model = embedding_data.get("model")
+                        stored_provider = embedding_data.get("provider")
+                        
+                        if (stored_model != valves.embedding_model_name or 
+                            stored_provider != valves.embedding_provider_type):
+                            logger.debug(f"Cache miss for {memory_id_str}: Model/provider changed")
+                            result = None
+                        else:
+                            result = embedding
+                    else:
+                        result = None
             except Exception as e:
                 logger.warning(f"Error loading embedding from persistent cache for memory {memory_id}: {e}")
-                return None
+                result = None
+        # Clean up lock after use to prevent unbounded growth
+        self._cleanup_lock(user_id)
+        return result
 
     async def get_embedding_with_persistence(self, text: str, user_id: str, memory_id: str) -> Optional[np.ndarray]:
         """Get embedding with full caching hierarchy: memory -> persistent -> generate."""
