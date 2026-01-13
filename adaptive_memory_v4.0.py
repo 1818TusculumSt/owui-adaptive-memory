@@ -24,6 +24,7 @@ import time
 import os
 import hashlib
 import random
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -411,7 +412,9 @@ class EmbeddingManager:
         self.provider: Optional[EmbeddingProvider] = None
         self._current_provider_type = None
         self._session: Optional[aiohttp.ClientSession] = None
-        self._locks: Dict[str, asyncio.Lock] = {}
+        # WeakValueDictionary allows garbage collection of locks when no longer referenced,
+        # preventing unbounded growth of the locks dict
+        self._locks = weakref.WeakValueDictionary()
 
     def _get_lock(self, user_id: str) -> asyncio.Lock:
         if user_id not in self._locks:
@@ -1116,8 +1119,7 @@ class MemoryPipeline:
         uncached_indices = []
         uncached_contents = []
         
-        for i, (memory_id, content) in enumerate(zip(ids, contents)):
-            # Check in-memory cache first
+        for i, (memory_id, content) in enumerate(zip(ids, contents, strict=True)):            # Check in-memory cache first
             cached_embedding = self.embedding_manager.cache.get(memory_id)
             if cached_embedding is not None:
                 embeddings.append(cached_embedding)
