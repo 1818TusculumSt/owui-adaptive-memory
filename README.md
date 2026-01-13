@@ -1,51 +1,143 @@
-**OVERVIEW**
+# Adaptive Memory v4.0 🧠
 
-Adaptive Memory is a sophisticated plugin that provides persistent, personalized memory capabilities for Large Language Models (LLMs) within OpenWebUI. It enables LLMs to remember key information about users across separate conversations, creating a more natural and personalized experience. The system dynamically extracts, filters, stores, and retrieves user-specific information from conversations, then intelligently injects relevant memories into future LLM prompts.
+> **Intelligent, persistent memory for your LLMs**  
+> Transform conversations into lasting knowledge with enterprise-grade memory management for Open WebUI.
 
-**KEY FEATURES**
+## What is Adaptive Memory?
 
-* **Intelligent Memory Extraction**: Automatically identifies facts, preferences, relationships, and goals from user messages using LLM-powered analysis
-* **Smart Categorization**: Categorizes memories with appropriate tags (identity, preference, behavior, relationship, goal, possession) and memory banks (Personal, Work, General)
-* **Advanced Filtering**: Multi-layered pipeline that focuses on user-specific information while filtering out general knowledge or trivia
-* **Robust Processing**: JSON parsing with multiple fallback mechanisms for reliable memory extraction
-* **Semantic Deduplication**: Smart deduplication using embedding-based similarity to prevent duplicate memories
-* **Vector-Based Retrieval**: Efficient memory retrieval using cosine similarity with configurable thresholds
-* **Background Summarization**: Automatic clustering and summarization of related older memories to prevent clutter and maintain relevance
-* **Flexible Embedding Support**: Choice between local SentenceTransformer models or OpenAI-compatible API endpoints
-* **Configurable LLM Integration**: Support for both Ollama and OpenAI-compatible APIs with customizable endpoints
-* **Real-time Status Updates**: Live status notifications during memory processing and background operations
-* **Comprehensive Monitoring**: Prometheus metrics instrumentation for performance tracking
-* **Memory Bank Organization**: Categorize memories into Personal, Work, General contexts for focused retrieval
-* **Background Task Management**: Automated maintenance tasks with configurable intervals
+Adaptive Memory is a sophisticated plugin that gives Large Language Models persistent, personalized memory across conversations. It automatically extracts, categorizes, and retrieves user-specific information—creating natural, context-aware interactions that remember what matters.
 
-**ARCHITECTURE (v4.0)**
+## ✨ Key Features
 
-The system is built with a modular, pipeline-based architecture:
+### 🎯 **Intelligent Memory Extraction**
+Automatically identifies and stores facts, preferences, relationships, and goals from conversations using LLM-powered analysis with confidence scoring.
 
-* **EmbeddingManager**: Handles embedding generation with support for local and API-based providers
-* **MemoryPipeline**: Core logic for memory identification, retrieval, and processing
-* **TaskManager**: Manages background tasks for summarization and maintenance
-* **ErrorManager**: Centralized error tracking and reporting
-* **JSONParser**: Robust JSON extraction with multiple fallback strategies
+### 🏗️ **Modular Architecture**
+Built on a clean, pipeline-based design for reliability and extensibility:
+- **EmbeddingManager**: Flexible embedding generation with local and API provider support
+- **MemoryPipeline**: Core memory identification, retrieval, and processing logic
+- **TaskManager**: Robust background task lifecycle with ghost task detection
+- **ErrorManager**: Centralized error tracking and reporting
+- **JSONParser**: Multi-strategy parsing with fallback mechanisms
 
-**BACKGROUND TASKS**
+### ⚡ **Advanced Background Processing**
+- **Automatic Summarization**: Intelligently clusters and consolidates older memories (configurable interval, default 2 hours)
+- **Semantic Deduplication**: Prevents duplicate memories using embedding-based similarity
+- **Task Health Monitoring**: Built-in scavenger system detects and eliminates rogue tasks
 
-* **Memory Summarization**: Automatically clusters and summarizes related memories (default: every 2 hours)
-* **Error Logging**: Periodic logging of error counters for monitoring (default: every 30 minutes)
-* **Date Updates**: Keeps temporal context current (default: every hour)
+### 🎨 **Smart Categorization**
+Organizes memories with:
+- **Tags**: identity, preference, behavior, relationship, goal, possession
+- **Memory Banks**: Personal, Work, General contexts for focused retrieval
 
-**MAJOR CHANGES (v4.0)**
+### 🔍 **Vector-Based Retrieval**
+Efficient semantic search using cosine similarity with configurable thresholds and LRU caching for performance.
 
-* **Complete Architecture Refactor**: Modular pipeline-based design for better maintainability and extensibility
-* **Enhanced Background Processing**: Automatic memory summarization with clustering algorithms
-* **Task Management System**: Robust background task system with proper lifecycle management
-* **Improved Embedding Support**: Flexible provider system with local and API options
-* **Comprehensive Logging**: Detailed logging throughout the pipeline for debugging and monitoring
-* **Memory Confidence Scoring**: Confidence-based filtering for higher quality memories
-* **Prometheus Metrics**: Full instrumentation for performance monitoring
-* **Status Notifications**: Real-time updates during memory operations
-* **Error Resilience**: Improved error handling and recovery mechanisms
+### 📊 **Enterprise Monitoring**
+- **Prometheus Metrics**: Full instrumentation for embedding requests, retrieval latency, and error tracking
+- **Real-time Status**: Live notifications during memory operations
+- **Comprehensive Logging**: Timestamped, versioned logging throughout the pipeline
 
-**KNOWN ISSUES**
+### 🔌 **Flexible Integration**
+- **Embedding Providers**: Local SentenceTransformer models or OpenAI-compatible APIs
+- **LLM Support**: Ollama and OpenAI-compatible endpoints with customizable configurations
+- **Persistent Caching**: File-based embedding cache with automatic model compatibility validation
 
-* **Valve UI Persistence**: OpenWebUI valve changes may not persist properly in some installations. If valve settings don't take effect, try restarting OpenWebUI completely or temporarily modify default values in the code.
+## 🏛️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Adaptive Memory v4.0                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────┐  ┌──────────────────┐                │
+│  │ EmbeddingManager│  │  MemoryPipeline  │                │
+│  ├─────────────────┤  ├──────────────────┤                │
+│  │ • LRU Cache     │  │ • Identification │                │
+│  │ • Persistence   │  │ • Retrieval      │                │
+│  │ • Providers     │  │ • Processing     │                │
+│  └────────┬────────┘  └────────┬─────────┘                │
+│           │                    │                           │
+│  ┌────────┴────────────────────┴─────────┐                │
+│  │         TaskManager                   │                │
+│  ├───────────────────────────────────────┤                │
+│  │ • Background Summarization            │                │
+│  │ • Ghost Task Detection                │                │
+│  │ • Lifecycle Management                │                │
+│  └───────────────────────────────────────┘                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 🚀 Background Tasks
+
+| Task | Purpose | Default Interval |
+|------|---------|-----------------|
+| **Memory Summarization** | Clusters and consolidates related older memories | 2 hours |
+| **Error Logging** | Reports error counters for monitoring | 30 minutes |
+| **Date Updates** | Maintains current temporal context | 1 hour |
+
+## 🎛️ Configuration
+
+All settings are configurable via Open WebUI valves:
+
+### Embedding Settings
+- **Provider Type**: `local` or `openai_compatible`
+- **Model Name**: Choose your embedding model
+- **API Configuration**: URL and API key for remote providers
+
+### LLM Settings
+- **Provider**: Ollama or OpenAI-compatible APIs
+- **Model Selection**: Configure analysis and summarization models
+- **Endpoints**: Custom API URLs
+
+### Memory Management
+- **Confidence Threshold**: Minimum confidence for memory extraction (default: 0.7)
+- **Similarity Threshold**: Vector similarity cutoff for retrieval (default: 0.6)
+- **Max Related Memories**: Number of memories to inject per prompt (default: 5)
+- **Task Intervals**: Customize background processing schedules
+
+## 📦 Installation
+
+1. Download `adaptive_memory_v4.0.py`
+2. Navigate to Open WebUI → Functions
+3. Upload the plugin file
+4. Configure valves according to your setup
+5. Enable the function for desired models
+
+## 🔧 Requirements
+
+**Core Dependencies** (included with Open WebUI):
+- `numpy`, `aiohttp`, `pydantic`
+
+**Optional Dependencies**:
+- `sentence-transformers` - For local embedding models (falls back to API provider if not installed)
+- `prometheus-client` - For metrics instrumentation (gracefully disabled if not available)
+
+## 💡 How It Works
+
+1. **Extraction**: User messages are analyzed by an LLM to identify memorable information
+2. **Filtering**: Multi-layered pipeline focuses on user-specific facts, not general knowledge
+3. **Storage**: Memories are categorized, tagged, and stored with vector embeddings
+4. **Retrieval**: Semantic search finds relevant memories for each conversation
+5. **Injection**: Top-N memories are added to the system prompt for context
+6. **Maintenance**: Background tasks consolidate and optimize memory over time
+
+## 🛠️ Recent Improvements (v4.0.1)
+
+✅ **Fixed**: Lock management now uses regular dict instead of WeakValueDictionary to prevent premature garbage collection  
+✅ **Enhanced**: Explicit lock cleanup prevents unbounded memory growth  
+✅ **Improved**: Background task scavenger eliminates ghost tasks  
+✅ **Added**: Comprehensive task lifecycle management
+
+## 🤝 Contributing
+
+This is a fork of the original OpenWebUI Adaptive Memory plugin, evolved with enterprise-grade features and architectural improvements. Contributions, issues, and feature requests are welcome!
+
+## 📄 License
+
+Follow the original Open WebUI licensing terms.
+
+---
+
+**Made with ❤️ for the Open WebUI community**
