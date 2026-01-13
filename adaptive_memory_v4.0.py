@@ -1898,7 +1898,6 @@ Your output must be valid JSON only. No additional text.""",
     def _check_and_handle_valve_changes(self):
         """Detect if valves have changed and restart tasks if needed."""
         # Hash important valve settings that affect background tasks
-        import hashlib
         valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
         new_hash = hashlib.md5(valve_str.encode()).hexdigest()
         
@@ -1911,8 +1910,22 @@ Your output must be valid JSON only. No additional text.""",
             self._valve_hash = new_hash
             # Restart tasks with new valve values
             if self._tasks_started:
-                import asyncio
-                asyncio.create_task(self._restart_tasks())
+                # Cancel existing restart task if running
+                if hasattr(self, '_restart_task') and self._restart_task and not self._restart_task.done():
+                    self._restart_task.cancel()
+                
+                # Create managed task with error callback
+                self._restart_task = asyncio.create_task(self._restart_tasks())
+                
+                def _log_restart_exception(task):
+                    try:
+                        task.result()
+                    except asyncio.CancelledError:
+                        pass  # Expected when task is cancelled
+                    except Exception as e:
+                        logger.exception(f"Background restart task failed: {e}")
+                
+                self._restart_task.add_done_callback(_log_restart_exception)
             return True
         return False
     
