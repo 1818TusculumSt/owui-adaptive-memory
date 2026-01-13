@@ -239,8 +239,9 @@ class LRUCache:
         """
         self._cache = OrderedDict()
         self._max_size = max_size
+        self._lock = asyncio.Lock()  # Thread-safe for concurrent async access
     
-    def get(self, key: str) -> Optional[np.ndarray]:
+    async def get(self, key: str) -> Optional[np.ndarray]:
         """Get value from cache, moving it to end (most recently used).
         
         Args:
@@ -249,24 +250,26 @@ class LRUCache:
         Returns:
             Cached value if found, None otherwise
         """
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-        return None
+        async with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return None
     
-    def set(self, key: str, value: np.ndarray) -> None:
+    async def set(self, key: str, value: np.ndarray) -> None:
         """Set value in cache, evicting oldest entry if at capacity.
         
         Args:
             key: Cache key
             value: Value to cache
         """
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        else:
-            if len(self._cache) >= self._max_size:
-                self._cache.popitem(last=False)
-        self._cache[key] = value
+        async with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            else:
+                if len(self._cache) >= self._max_size:
+                    self._cache.popitem(last=False)
+            self._cache[key] = value
 
 
 # ------------------------------------------------------------------------------
@@ -627,7 +630,7 @@ class EmbeddingManager:
         memory_id_str = str(memory_id)
 
         # 1. Check in-memory cache first
-        cached_emb = self.cache.get(memory_id_str)
+        cached_emb = await self.cache.get(memory_id_str)
         if cached_emb is not None:
             return cached_emb
 
@@ -635,14 +638,14 @@ class EmbeddingManager:
         persistent_emb = await self.load_embedding_persistent(user_id, memory_id_str)
         if persistent_emb is not None:
             # Cache in memory for this session
-            self.cache.set(memory_id_str, persistent_emb)
+            await self.cache.set(memory_id_str, persistent_emb)
             return persistent_emb
 
         # 3. Generate new embedding
         new_emb = await self.get_embedding(text)
         if new_emb is not None:
             # Cache in memory
-            self.cache.set(memory_id_str, new_emb)
+            await self.cache.set(memory_id_str, new_emb)
             # Store persistently
             await self.store_embedding_persistent(user_id, memory_id_str, text, new_emb)
         
@@ -765,7 +768,7 @@ class MemoryPipeline:
                 continue
 
             # Check in-memory cache first
-            cached_emb = self.embedding_manager.cache.get(mem_id)
+            cached_emb = await self.embedding_manager.cache.get(mem_id)
             if cached_emb is not None:
                 sim = self._cosine_similarity(query_embedding, cached_emb)
                 if sim >= self.valves.vector_similarity_threshold:
@@ -775,7 +778,7 @@ class MemoryPipeline:
                 persistent_emb = await self.embedding_manager.load_embedding_persistent(user_id, mem_id)
                 if persistent_emb is not None:
                     # Cache in memory for this session
-                    self.embedding_manager.cache.set(mem_id, persistent_emb)
+                    await self.embedding_manager.cache.set(mem_id, persistent_emb)
                     sim = self._cosine_similarity(query_embedding, persistent_emb)
                     if sim >= self.valves.vector_similarity_threshold:
                         scored_memories.append((sim, mem))
@@ -794,7 +797,7 @@ class MemoryPipeline:
             for i, emb in enumerate(new_embeddings):
                 if emb is not None:
                     # Update in-memory cache
-                    self.embedding_manager.cache.set(ids_to_embed[i], emb)
+                    await self.embedding_manager.cache.set(ids_to_embed[i], emb)
                     # Score
                     sim = self._cosine_similarity(query_embedding, emb)
                     if sim >= self.valves.vector_similarity_threshold:
@@ -920,7 +923,7 @@ class MemoryPipeline:
                         # Cache the embedding from deduplication check to avoid re-generating later
                         if dedup_embedding is not None and memory_id:
                             logger.debug(f"Caching embedding from deduplication check for memory {memory_id}")
-                            self.embedding_manager.cache.set(str(memory_id), dedup_embedding)
+                            await self.embedding_manager.cache.set(str(memory_id), dedup_embedding)
                             # Persist it immediately
                             await self.embedding_manager.store_embedding_persistent(
                                 user_id, str(memory_id), content, dedup_embedding
@@ -1003,19 +1006,19 @@ class MemoryPipeline:
                     # Use raw content for embedding comparison
                     content_for_embedding = raw_memory_content
                     # Check in-memory cache first
-                    existing_embedding = self.embedding_manager.cache.get(memory_id)
+                    existing_embedding = await self.embedding_manager.cache.get(memory_id)
                     if existing_embedding is None:
                         # Check persistent cache
                         existing_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
                         if existing_embedding is not None:
                             # Cache in memory for this session
-                            self.embedding_manager.cache.set(memory_id, existing_embedding)
+                            await self.embedding_manager.cache.set(memory_id, existing_embedding)
                         else:
                             # Generate embedding for existing memory using raw content
                             existing_embedding = await self.embedding_manager.get_embedding(content_for_embedding)
                             if existing_embedding is not None:
                                 # Cache in memory and store persistently
-                                self.embedding_manager.cache.set(memory_id, existing_embedding)
+                                await self.embedding_manager.cache.set(memory_id, existing_embedding)
                                 await self.embedding_manager.store_embedding_persistent(
                                     user_id, memory_id, content_for_embedding, existing_embedding
                                 )
@@ -1120,7 +1123,7 @@ class MemoryPipeline:
         uncached_contents = []
         
         for i, (memory_id, content) in enumerate(zip(ids, contents, strict=True)):            # Check in-memory cache first
-            cached_embedding = self.embedding_manager.cache.get(memory_id)
+            cached_embedding = await self.embedding_manager.cache.get(memory_id)
             if cached_embedding is not None:
                 embeddings.append(cached_embedding)
             else:
@@ -1128,7 +1131,7 @@ class MemoryPipeline:
                 persistent_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
                 if persistent_embedding is not None:
                     # Cache in memory for this session
-                    self.embedding_manager.cache.set(memory_id, persistent_embedding)
+                    await self.embedding_manager.cache.set(memory_id, persistent_embedding)
                     embeddings.append(persistent_embedding)
                 else:
                     # Need to generate
@@ -1146,7 +1149,7 @@ class MemoryPipeline:
                 if new_emb is not None:
                     embeddings[idx] = new_emb
                     # Cache in memory
-                    self.embedding_manager.cache.set(ids[idx], new_emb)
+                    await self.embedding_manager.cache.set(ids[idx], new_emb)
             
             # Store persistently in batch
             await self.embedding_manager.store_embeddings_batch_persistent(
