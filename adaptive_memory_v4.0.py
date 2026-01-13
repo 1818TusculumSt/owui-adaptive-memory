@@ -1142,7 +1142,7 @@ class MemoryPipeline:
             new_embeddings = await self.embedding_manager.get_embeddings_batch(uncached_contents)
             
             # Update cache and embeddings list
-            for idx, new_emb in zip(uncached_indices, new_embeddings):
+            for idx, new_emb in zip(uncached_indices, new_embeddings, strict=True):
                 if new_emb is not None:
                     embeddings[idx] = new_emb
                     # Cache in memory
