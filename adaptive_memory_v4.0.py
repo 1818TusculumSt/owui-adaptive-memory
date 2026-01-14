@@ -420,6 +420,13 @@ class EmbeddingManager:
         # Use regular dict instead of WeakValueDictionary to avoid premature GC of Lock objects
         self._locks: Dict[str, asyncio.Lock] = {}
 
+    def _sanitize_filename(self, filename: str) -> str:
+        """Sanitize filename to prevent path traversal and invalid characters."""
+        # Remove any path components
+        filename = os.path.basename(filename)
+        # Keep only safe characters (alphanumeric, hyphens, underscores, dots)
+        return re.sub(r'[^a-zA-Z0-9_.-]', '_', filename)
+
     def _get_lock(self, user_id: str) -> asyncio.Lock:
         """Get or create a lock for the given user_id."""
         if user_id not in self._locks:
@@ -512,7 +519,8 @@ class EmbeddingManager:
                 # Use data directory for persistence
                 cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
                 await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                safe_user_id = self._sanitize_filename(user_id)
+                cache_file = os.path.join(cache_dir, f"{safe_user_id}_embeddings.json")
                 
                 # Load existing cache
                 cache = {}
@@ -559,7 +567,8 @@ class EmbeddingManager:
             try:
                 cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
                 await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                safe_user_id = self._sanitize_filename(user_id)
+                cache_file = os.path.join(cache_dir, f"{safe_user_id}_embeddings.json")
                 
                 # Load existing cache
                 cache = {}
@@ -605,7 +614,8 @@ class EmbeddingManager:
         async with self._get_lock(user_id):
             try:
                 cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                safe_user_id = self._sanitize_filename(user_id)
+                cache_file = os.path.join(cache_dir, f"{safe_user_id}_embeddings.json")
                 
                 if not await asyncio.to_thread(os.path.exists, cache_file):
                     result = None
