@@ -1,8 +1,8 @@
-# Adaptive Memory for Open WebUI
+# Adaptive Memory for Open WebUI 🧠
 
 Give your AI persistent memory across conversations. It remembers your preferences, facts about you, and past discussions automatically.
 
-## What This Does
+## ✨ What This Does
 
 This plugin makes your AI remember things about you between chats. Tell it once that you prefer Python over JavaScript, and it'll remember for future conversations. No manual management needed.
 
@@ -12,7 +12,7 @@ This plugin makes your AI remember things about you between chats. Tell it once 
 3. Those facts get stored and retrieved automatically in future chats
 4. Your AI has context about you without you repeating yourself
 
-## Credit Where It's Due
+## 🙏 Credit Where It's Due
 
 This is a fork of [gramanoid's owui-adaptive-memory](https://github.com/gramanoid/owui-adaptive-memory). His original plugin proved the concept works and laid the foundation.
 
@@ -34,14 +34,14 @@ I added proper vector database synchronization, background task lifecycle manage
 
 **I actively maintain and use this function.**
 
-## Installation
+## 📦 Installation
 
 1. Download `adaptive_memory_v4.0.py`
 2. In Open WebUI: **Functions** → **+** → Upload the file
 3. Configure the settings (called "valves" in OWUI)
 4. Enable it for your models
 
-## Configuration
+## ⚙️ Configuration
 
 The important settings:
 
@@ -58,7 +58,7 @@ The important settings:
 - `summarization_interval`: How often to consolidate old memories (default: 2 hours)
 - Lower `summarization_similarity_threshold` to group more memories together (0.5-0.7 recommended)
 
-## How to Use It
+## 💬 How to Use It
 
 Just chat. That's it.
 
@@ -69,7 +69,7 @@ The plugin works silently in the background:
 
 Want to see what it remembers? Check **Settings** → **Personalization** → **Memories** in Open WebUI.
 
-## Requirements
+## 📋 Requirements
 
 Comes with Open WebUI:
 - `numpy`, `aiohttp`, `pydantic`
@@ -78,10 +78,10 @@ Optional (improves functionality):
 - `sentence-transformers` - For local embeddings (otherwise uses API)
 - `prometheus-client` - For metrics (gracefully skips if unavailable)
 
-## License
+## 📄 License
 
 MIT License - Use it however you want.
 
-## Issues?
+## 🐛 Issues?
 
 Open an issue on this repo. I actively maintain and use this function.
