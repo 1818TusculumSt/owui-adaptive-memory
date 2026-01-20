@@ -1398,6 +1398,11 @@ class TaskManager:
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
 
+        if valves.enable_vector_cleanup_task:
+            task = asyncio.create_task(self.filter._cleanup_vectors_loop())
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
         logger.info(f"Background tasks started: {len(self.tasks)} active tasks")
         return True
 
@@ -1492,6 +1497,15 @@ class Filter:
         error_logging_interval: int = Field(
             default=1800,
             description="Interval in seconds between error counter log entries",
+        )
+
+        enable_vector_cleanup_task: bool = Field(
+            default=True,
+            description="Enable or disable the background vector cleanup task",
+        )
+        vector_cleanup_interval: int = Field(
+            default=7200,
+            description="Interval in seconds between vector cleanup runs (removes orphaned embeddings)",
         )
 
         enable_date_update_task: bool = Field(
@@ -2437,4 +2451,48 @@ Your output must be valid JSON only. No additional text.""",
         except Exception as e:
             logger.exception(f"Error during vector cleanup: {e}")
             return {"error": str(e), "orphans_deleted": 0}
+
+    async def _cleanup_vectors_loop(self):
+        """Background task for cleaning up orphaned vectors."""
+        logger.info(f"Vector cleanup background task launched with interval: {self.valves.vector_cleanup_interval} seconds")
+        while True:
+            try:
+                interval = self.valves.vector_cleanup_interval
+                await asyncio.sleep(interval)
+                logger.info(
+                    f"Vector cleanup task running. Active users: {len(self.seen_users)}, enabled: {self.valves.enable_vector_cleanup_task}"
+                )
+
+                if self.valves.enable_vector_cleanup_task and self.seen_users:
+                    logger.info("Background vector cleanup: starting scan...")
+                    
+                    # Copy set to avoid size change during iteration
+                    active_users = list(self.seen_users)
+                    for user_id in active_users:
+                        try:
+                            logger.info(f"Background vector cleanup: processing user {user_id}")
+                            result = await self.cleanup_orphaned_vectors(user_id)
+                            
+                            if "orphans_deleted" in result and result["orphans_deleted"] > 0:
+                                msg = f"Cleaned up {result['orphans_deleted']} orphaned vectors for user {user_id}"
+                                self.notification_queue.append(msg)
+                                logger.info(f"Background vector cleanup: {msg}")
+                            else:
+                                logger.debug(f"Background vector cleanup: no orphans found for user {user_id}")
+                        except Exception as u_err:
+                            logger.exception(
+                                f"Background vector cleanup error for user {user_id}: {u_err}"
+                            )
+
+                    logger.info("Background vector cleanup: cycle complete")
+                else:
+                    logger.debug(f"Background vector cleanup: skipped (enabled: {self.valves.enable_vector_cleanup_task}, users: {len(self.seen_users)})")
+
+            except asyncio.CancelledError:
+                logger.info("Vector cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.exception(f"Vector cleanup task error: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                await asyncio.sleep(60)
 
