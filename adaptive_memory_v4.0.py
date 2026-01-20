@@ -110,6 +110,13 @@ except ImportError:
     add_memory = None
     AddMemoryForm = None
 
+# --- Vector Database Client for Synchronization ---
+try:
+    from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+except ImportError:
+    VECTOR_DB_CLIENT = None
+    # Note: Custom logger not yet defined, will log via standard logging
+
 # --- Advanced Mock Infrastructure for Router Compatibility ---
 class MockConfig:
     def __init__(self):
@@ -953,10 +960,75 @@ class MemoryPipeline:
                     except Exception as ins_err:
                         logger.error(f"Failed to insert memory: {ins_err}")
 
+                elif kind == "UPDATE" and op.get("id") and op.get("content"):
+                    try:
+                        memory_id = op["id"]
+                        new_content = op["content"]
+                        
+                        # Update in database
+                        updated_memory = Memories.update_memory_by_id_and_user_id(
+                            memory_id, user_id, new_content
+                        )
+                        
+                        if updated_memory:
+                            # Regenerate embedding for updated content
+                            new_embedding = await self.embedding_manager.get_embedding(new_content)
+                            
+                            if new_embedding is not None:
+                                # Update in-memory cache
+                                await self.embedding_manager.cache.set(str(memory_id), new_embedding)
+                                
+                                # Update persistent cache
+                                await self.embedding_manager.store_embedding_persistent(
+                                    user_id, str(memory_id), new_content, new_embedding
+                                )
+                                
+                                # Update vector database if available
+                                if VECTOR_DB_CLIENT:
+                                    try:
+                                        VECTOR_DB_CLIENT.upsert(
+                                            collection_name=f"user-memory-{user_id}",
+                                            items=[{
+                                                "id": str(memory_id),
+                                                "text": new_content,
+                                                "vector": new_embedding.tolist() if hasattr(new_embedding, 'tolist') else new_embedding,
+                                                "metadata": {
+                                                    "updated_at": updated_memory.updated_at if hasattr(updated_memory, 'updated_at') else None,
+                                                }
+                                            }]
+                                        )
+                                        logger.info(f"Memory updated in vector DB (ID: {memory_id})")
+                                    except Exception as vec_err:
+                                        logger.warning(f"Failed to update memory in vector DB: {vec_err}")
+                            
+                            success_ops.append(op)
+                            logger.info(f"Memory updated (ID: {memory_id})")
+                        else:
+                            logger.warning(f"Memory not found for update (ID: {memory_id})")
+                            
+                    except Exception as upd_err:
+                        logger.exception(f"Failed to update memory: {upd_err}")
+
                 elif kind == "DELETE" and op.get("id"):
                     try:
-                        Memories.delete_memory_by_id(op["id"])
+                        memory_id = op["id"]
+                        
+                        # Delete from database
+                        Memories.delete_memory_by_id(memory_id)
+                        
+                        # Delete from vector database if available
+                        if VECTOR_DB_CLIENT:
+                            try:
+                                VECTOR_DB_CLIENT.delete(
+                                    collection_name=f"user-memory-{user_id}",
+                                    ids=[str(memory_id)]
+                                )
+                                logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
+                            except Exception as vec_err:
+                                logger.warning(f"Failed to delete memory from vector DB: {vec_err}")
+                        
                         success_ops.append(op)
+                        logger.info(f"Memory deleted (ID: {memory_id})")
                     except Exception as del_err:
                         logger.exception(f"Failed to delete memory: {del_err}")
 
@@ -1254,7 +1326,22 @@ class MemoryPipeline:
                         # ONLY delete old if saving the new summary succeeded
                         for m in cluster_memories:
                             try:
-                                Memories.delete_memory_by_id(m.id)
+                                memory_id = str(m.id)
+                                
+                                # Delete from database
+                                Memories.delete_memory_by_id(memory_id)
+                                
+                                # Delete from vector database if available
+                                if VECTOR_DB_CLIENT:
+                                    try:
+                                        VECTOR_DB_CLIENT.delete(
+                                            collection_name=f"user-memory-{user_id}",
+                                            ids=[memory_id]
+                                        )
+                                        logger.debug(f"Summarization: Deleted memory {memory_id} from vector DB")
+                                    except Exception as vec_err:
+                                        logger.warning(f"Summarization: Failed to delete memory {memory_id} from vector DB: {vec_err}")
+                                
                             except Exception as del_err:
                                 logger.error(
                                     f"Summarization: Failed to delete source memory {m.id}: {del_err}"
