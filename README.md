@@ -1,143 +1,87 @@
-# Adaptive Memory v4.0 🧠
+# Adaptive Memory for Open WebUI
 
-> **Intelligent, persistent memory for your LLMs**  
-> Transform conversations into lasting knowledge with enterprise-grade memory management for Open WebUI.
+Give your AI persistent memory across conversations. It remembers your preferences, facts about you, and past discussions automatically.
 
-## What is Adaptive Memory?
+## What This Does
 
-Adaptive Memory is a sophisticated plugin that gives Large Language Models persistent, personalized memory across conversations. It automatically extracts, categorizes, and retrieves user-specific information—creating natural, context-aware interactions that remember what matters.
+This plugin makes your AI remember things about you between chats. Tell it once that you prefer Python over JavaScript, and it'll remember for future conversations. No manual management needed.
 
-## ✨ Key Features
+**How it works:**
+1. You chat normally with your AI
+2. The plugin extracts important facts about you from the conversation
+3. Those facts get stored and retrieved automatically in future chats
+4. Your AI has context about you without you repeating yourself
 
-### 🎯 **Intelligent Memory Extraction**
-Automatically identifies and stores facts, preferences, relationships, and goals from conversations using LLM-powered analysis with confidence scoring.
+## Credit Where It's Due
 
-### 🏗️ **Modular Architecture**
-Built on a clean, pipeline-based design for reliability and extensibility:
-- **EmbeddingManager**: Flexible embedding generation with local and API provider support
-- **MemoryPipeline**: Core memory identification, retrieval, and processing logic
-- **TaskManager**: Robust background task lifecycle with ghost task detection
-- **ErrorManager**: Centralized error tracking and reporting
-- **JSONParser**: Multi-strategy parsing with fallback mechanisms
+This is a fork of [gramanoid's owui-adaptive-memory](https://github.com/gramanoid/owui-adaptive-memory). His original plugin proved the concept works and laid the foundation.
 
-### ⚡ **Advanced Background Processing**
-- **Automatic Summarization**: Intelligently clusters and consolidates older memories (configurable interval, default 2 hours)
-- **Semantic Deduplication**: Prevents duplicate memories using embedding-based similarity
-- **Task Health Monitoring**: Built-in scavenger system detects and eliminates rogue tasks
+**Why fork it?**
 
-### 🎨 **Smart Categorization**
-Organizes memories with:
-- **Tags**: identity, preference, behavior, relationship, goal, possession
-- **Memory Banks**: Personal, Work, General contexts for focused retrieval
+The original worked but the code was difficult to follow and had bugs that made it unreliable. I wanted:
+- **Cleaner, more elegant code** that's easier to understand and modify
+- **Shorter, more maintainable architecture** without unnecessary complexity
+- **Clear, understandable memory processes** so you can actually see what's happening
 
-### 🔍 **Vector-Based Retrieval**
-Efficient semantic search using cosine similarity with configurable thresholds and LRU caching for performance.
+Plus I fixed the production issues:
+- Memory deletions left orphaned embeddings in the vector database
+- Summarization created memory leaks
+- Background tasks duplicated themselves after plugin reloads
+- No UPDATE operation support
+- Lock management issues
 
-### 📊 **Enterprise Monitoring**
-- **Prometheus Metrics**: Full instrumentation for embedding requests, retrieval latency, and error tracking
-- **Real-time Status**: Live notifications during memory operations
-- **Comprehensive Logging**: Timestamped, versioned logging throughout the pipeline
+I added proper vector database synchronization, background task lifecycle management, comprehensive error handling, and persistent embedding cache to reduce API calls.
 
-### 🔌 **Flexible Integration**
-- **Embedding Providers**: Local SentenceTransformer models or OpenAI-compatible APIs
-- **LLM Support**: Ollama and OpenAI-compatible endpoints with customizable configurations
-- **Persistent Caching**: File-based embedding cache with automatic model compatibility validation
+**I actively maintain and use this function.**
 
-## 🏛️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Adaptive Memory v4.0                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌─────────────────┐  ┌──────────────────┐                │
-│  │ EmbeddingManager│  │  MemoryPipeline  │                │
-│  ├─────────────────┤  ├──────────────────┤                │
-│  │ • LRU Cache     │  │ • Identification │                │
-│  │ • Persistence   │  │ • Retrieval      │                │
-│  │ • Providers     │  │ • Processing     │                │
-│  └────────┬────────┘  └────────┬─────────┘                │
-│           │                    │                           │
-│  ┌────────┴────────────────────┴─────────┐                │
-│  │         TaskManager                   │                │
-│  ├───────────────────────────────────────┤                │
-│  │ • Background Summarization            │                │
-│  │ • Ghost Task Detection                │                │
-│  │ • Lifecycle Management                │                │
-│  └───────────────────────────────────────┘                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 🚀 Background Tasks
-
-| Task | Purpose | Default Interval |
-|------|---------|-----------------|
-| **Memory Summarization** | Clusters and consolidates related older memories | 2 hours |
-| **Error Logging** | Reports error counters for monitoring | 30 minutes |
-| **Date Updates** | Maintains current temporal context | 1 hour |
-
-## 🎛️ Configuration
-
-All settings are configurable via Open WebUI valves:
-
-### Embedding Settings
-- **Provider Type**: `local` or `openai_compatible`
-- **Model Name**: Choose your embedding model
-- **API Configuration**: URL and API key for remote providers
-
-### LLM Settings
-- **Provider**: Ollama or OpenAI-compatible APIs
-- **Model Selection**: Configure analysis and summarization models
-- **Endpoints**: Custom API URLs
-
-### Memory Management
-- **Confidence Threshold**: Minimum confidence for memory extraction (default: 0.7)
-- **Similarity Threshold**: Vector similarity cutoff for retrieval (default: 0.6)
-- **Max Related Memories**: Number of memories to inject per prompt (default: 5)
-- **Task Intervals**: Customize background processing schedules
-
-## 📦 Installation
+## Installation
 
 1. Download `adaptive_memory_v4.0.py`
-2. Navigate to Open WebUI → Functions
-3. Upload the plugin file
-4. Configure valves according to your setup
-5. Enable the function for desired models
+2. In Open WebUI: **Functions** → **+** → Upload the file
+3. Configure the settings (called "valves" in OWUI)
+4. Enable it for your models
 
-## 🔧 Requirements
+## Configuration
 
-**Core Dependencies** (included with Open WebUI):
+The important settings:
+
+**Embedding Model:**
+- Use `local` with `all-MiniLM-L6-v2` for offline/free operation
+- Or use `openai_compatible` with any API endpoint
+
+**LLM Model:**
+- Point to your Ollama instance or any OpenAI-compatible API
+- This is what extracts memories from conversations
+
+**Memory Settings:**
+- `max_total_memories`: How many memories to keep per user (default: 200)
+- `summarization_interval`: How often to consolidate old memories (default: 2 hours)
+- Lower `summarization_similarity_threshold` to group more memories together (0.5-0.7 recommended)
+
+## How to Use It
+
+Just chat. That's it.
+
+The plugin works silently in the background:
+- Extracts facts about you from conversations
+- Retrieves relevant memories when needed
+- Shows status messages when saving/loading memories (can be disabled)
+
+Want to see what it remembers? Check **Settings** → **Personalization** → **Memories** in Open WebUI.
+
+## Requirements
+
+Comes with Open WebUI:
 - `numpy`, `aiohttp`, `pydantic`
 
-**Optional Dependencies**:
-- `sentence-transformers` - For local embedding models (falls back to API provider if not installed)
-- `prometheus-client` - For metrics instrumentation (gracefully disabled if not available)
+Optional (improves functionality):
+- `sentence-transformers` - For local embeddings (otherwise uses API)
+- `prometheus-client` - For metrics (gracefully skips if unavailable)
 
-## 💡 How It Works
+## License
 
-1. **Extraction**: User messages are analyzed by an LLM to identify memorable information
-2. **Filtering**: Multi-layered pipeline focuses on user-specific facts, not general knowledge
-3. **Storage**: Memories are categorized, tagged, and stored with vector embeddings
-4. **Retrieval**: Semantic search finds relevant memories for each conversation
-5. **Injection**: Top-N memories are added to the system prompt for context
-6. **Maintenance**: Background tasks consolidate and optimize memory over time
+MIT License - Use it however you want.
 
-## 🛠️ Recent Improvements (v4.0.1)
+## Issues?
 
-✅ **Fixed**: Lock management now uses regular dict instead of WeakValueDictionary to prevent premature garbage collection  
-✅ **Enhanced**: Explicit lock cleanup prevents unbounded memory growth  
-✅ **Improved**: Background task scavenger eliminates ghost tasks  
-✅ **Added**: Comprehensive task lifecycle management
-
-## 🤝 Contributing
-
-This is a fork of the original OpenWebUI Adaptive Memory plugin, evolved with enterprise-grade features and architectural improvements. Contributions, issues, and feature requests are welcome!
-
-## 📄 License
-
-Follow the original Open WebUI licensing terms.
-
----
-
-**Made with ❤️ for the Open WebUI community**
+Open an issue on this repo. I actively maintain and use this function.
