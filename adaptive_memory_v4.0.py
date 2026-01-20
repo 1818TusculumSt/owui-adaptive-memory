@@ -2374,3 +2374,67 @@ Your output must be valid JSON only. No additional text.""",
         except Exception as e:
             logger.exception(f"Error in error logging loop: {e}")
 
+    async def cleanup_orphaned_vectors(self, user_id: str) -> Dict[str, int]:
+        """
+        Audit and clean up orphaned vector embeddings.
+        
+        Returns dict with:
+        - db_memories: count of memories in database
+        - orphans_deleted: count of orphaned vectors removed
+        """
+        if not VECTOR_DB_CLIENT:
+            logger.warning("Vector DB not available - cannot cleanup orphaned vectors")
+            return {"error": "Vector DB not available", "orphans_deleted": 0}
+        
+        try:
+            # Get all memory IDs from database
+            db_memories = Memories.get_memories_by_user_id(user_id)
+            valid_ids = {str(m.id) for m in db_memories}
+            
+            collection_name = f"user-memory-{user_id}"
+            
+            # Get all vector IDs - method depends on vector DB implementation
+            try:
+                # Try to get all items from collection
+                result = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+                if result and 'ids' in result:
+                    vector_ids = result['ids']
+                else:
+                    logger.warning(f"Unable to retrieve vector IDs for cleanup - collection may not exist")
+                    return {"db_memories": len(valid_ids), "orphans_deleted": 0}
+            except Exception as e:
+                logger.error(f"Failed to retrieve vector IDs: {e}")
+                return {"error": str(e), "orphans_deleted": 0}
+            
+            # Find orphans (vectors without corresponding database entry)
+            orphaned_ids = [vid for vid in vector_ids if vid not in valid_ids]
+            
+            # Delete orphans
+            if orphaned_ids:
+                try:
+                    VECTOR_DB_CLIENT.delete(
+                        collection_name=collection_name,
+                        ids=orphaned_ids
+                    )
+                    logger.info(f"Deleted {len(orphaned_ids)} orphaned vectors for user {user_id}")
+                except Exception as del_err:
+                    logger.error(f"Failed to delete orphaned vectors: {del_err}")
+                    return {
+                        "db_memories": len(valid_ids),
+                        "orphans_found": len(orphaned_ids),
+                        "orphans_deleted": 0,
+                        "error": str(del_err)
+                    }
+            else:
+                logger.info(f"No orphaned vectors found for user {user_id}")
+            
+            return {
+                "db_memories": len(valid_ids),
+                "vector_count": len(vector_ids),
+                "orphans_deleted": len(orphaned_ids)
+            }
+            
+        except Exception as e:
+            logger.exception(f"Error during vector cleanup: {e}")
+            return {"error": str(e), "orphans_deleted": 0}
+
