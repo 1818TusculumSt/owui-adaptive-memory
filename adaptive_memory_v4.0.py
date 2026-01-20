@@ -2388,13 +2388,14 @@ Your output must be valid JSON only. No additional text.""",
         except Exception as e:
             logger.exception(f"Error in error logging loop: {e}")
 
-    async def cleanup_orphaned_vectors(self, user_id: str) -> Dict[str, int]:
+    async def cleanup_orphaned_vectors(self, user_id: str) -> Dict[str, Union[int, str]]:
         """
         Audit and clean up orphaned vector embeddings.
         
         Returns dict with:
         - db_memories: count of memories in database
         - orphans_deleted: count of orphaned vectors removed
+        - error: (optional) error message if cleanup failed
         """
         if not VECTOR_DB_CLIENT:
             logger.warning("Vector DB not available - cannot cleanup orphaned vectors")
