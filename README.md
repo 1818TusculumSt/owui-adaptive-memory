@@ -30,7 +30,13 @@ Plus I fixed the production issues:
 - No UPDATE operation support
 - Lock management issues
 
-I added proper vector database synchronization, background task lifecycle management, comprehensive error handling, and persistent embedding cache to reduce API calls.
+I added proper vector database synchronization, background task lifecycle management, comprehensive error handling, and a persistent embedding cache to reduce API calls.
+
+Recent improvements:
+- Better extraction and recall quality by embedding the actual memory text instead of the metadata wrapper
+- Safer deduplication, pruning, and summarization behavior
+- Cleaner memory injection with configurable formatting
+- Persistent embedding cache migrated to a private SQLite sidecar with lazy import from legacy JSON cache files
 
 **I actively maintain and use this function.**
 
@@ -58,6 +64,21 @@ The important settings:
 - `summarization_interval`: How often to consolidate old memories (default: 2 hours)
 - Lower `summarization_similarity_threshold` to group more memories together (0.5-0.7 recommended)
 
+## 🔒 Open WebUI Compatibility
+
+This function keeps Open WebUI's own memory system intact:
+- Open WebUI's database remains the source of truth for memories
+- Open WebUI's vector database remains the source of truth for memory search
+- The plugin's persistent cache is private to this function and exists only to avoid regenerating embeddings unnecessarily
+
+The current cache backend is:
+- `DATA_DIR/cache/embeddings.sqlite`
+
+Legacy cache migration:
+- Older per-user JSON cache files are imported automatically on first access
+- JSON fallback is still kept for safety if SQLite is unavailable
+- No Open WebUI schema changes are required
+
 ## 💬 How to Use It
 
 Just chat. That's it.
@@ -68,6 +89,8 @@ The plugin works silently in the background:
 - Shows status messages when saving/loading memories (can be disabled)
 
 Want to see what it remembers? Check **Settings** → **Personalization** → **Memories** in Open WebUI.
+
+If you change embedding models/providers and want a clean re-embed of Open WebUI's native memory vectors, use Open WebUI's own memory reset/rebuild flow rather than editing the plugin cache by hand.
 
 ## 📋 Requirements
 

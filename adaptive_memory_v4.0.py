@@ -25,6 +25,7 @@ import os
 import hashlib
 import random
 import weakref
+import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -171,7 +172,7 @@ class MemoryOperation(BaseModel):
     operation: Literal["NEW", "UPDATE", "DELETE"]
     id: Optional[str] = None
     content: Optional[str] = None
-    tags: List[str] = []
+    tags: List[str] = Field(default_factory=list)
     memory_bank: Optional[str] = None
     confidence: Optional[float] = None
 
@@ -231,6 +232,111 @@ class JSONParser:
         return None
 
 
+SUPPORTED_MEMORY_TAGS = {
+    "identity",
+    "behavior",
+    "preference",
+    "goal",
+    "relationship",
+    "possession",
+    "summary",
+}
+MEMORY_STORAGE_PATTERN = re.compile(
+    r"^\[Tags:\s*(?P<tags>[^\]]*)\]\s*(?P<content>.*?)\s*\[Memory Bank:\s*(?P<memory_bank>[^\]]+)\]\s*\[Confidence:\s*(?P<confidence>[^\]]+)\]\s*$",
+    re.DOTALL,
+)
+
+
+@dataclass
+class StoredMemoryRecord:
+    content: str
+    tags: List[str] = field(default_factory=list)
+    memory_bank: str = "General"
+    confidence: Optional[float] = None
+
+
+def normalize_memory_id(memory_id: Any) -> str:
+    return str(memory_id)
+
+
+def extract_message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "text":
+                continue
+            text = item.get("text") or item.get("content") or ""
+            if text:
+                text_parts.append(str(text).strip())
+        return " ".join(part for part in text_parts if part).strip()
+    if content is None:
+        return ""
+    return str(content).strip()
+
+
+def parse_stored_memory(memory_text: Any) -> StoredMemoryRecord:
+    if memory_text is None:
+        return StoredMemoryRecord(content="")
+
+    text = str(memory_text).strip()
+    if not text:
+        return StoredMemoryRecord(content="")
+
+    match = MEMORY_STORAGE_PATTERN.match(text)
+    if not match:
+        return StoredMemoryRecord(content=text)
+
+    tags_raw = match.group("tags").strip()
+    tags = [
+        tag.strip().lower()
+        for tag in tags_raw.split(",")
+        if tag.strip() and tag.strip().lower() != "none"
+    ]
+
+    confidence = None
+    confidence_raw = match.group("confidence").strip()
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        confidence = None
+
+    return StoredMemoryRecord(
+        content=match.group("content").strip(),
+        tags=tags,
+        memory_bank=match.group("memory_bank").strip() or "General",
+        confidence=confidence,
+    )
+
+
+def format_memory_content(
+    content: str,
+    tags: List[str],
+    memory_bank: str,
+    confidence: Optional[float],
+) -> str:
+    cleaned_content = re.sub(r"\s+", " ", str(content or "")).strip()
+    cleaned_tags = [str(tag).strip().lower() for tag in tags if str(tag).strip()]
+    tags_str = ", ".join(cleaned_tags) if cleaned_tags else "none"
+    safe_confidence = 1.0 if confidence is None else float(confidence)
+    return (
+        f"[Tags: {tags_str}] {cleaned_content} "
+        f"[Memory Bank: {memory_bank}] [Confidence: {safe_confidence:.2f}]"
+    )
+
+
+def truncate_text(text: str, max_length: int) -> str:
+    if max_length <= 0:
+        return ""
+    stripped = str(text or "").strip()
+    if len(stripped) <= max_length:
+        return stripped
+    return stripped[: max_length - 3].rstrip() + "..."
+
+
 class LRUCache:
     """A simple LRU (Least Recently Used) cache with bounded size.
     
@@ -277,6 +383,16 @@ class LRUCache:
                 if len(self._cache) >= self._max_size:
                     self._cache.popitem(last=False)
             self._cache[key] = value
+
+    async def delete(self, key: str) -> None:
+        """Remove a value from cache if it exists."""
+        async with self._lock:
+            self._cache.pop(key, None)
+
+    async def clear(self) -> None:
+        """Clear the entire cache."""
+        async with self._lock:
+            self._cache.clear()
 
 
 # ------------------------------------------------------------------------------
@@ -420,12 +536,15 @@ class EmbeddingManager:
         self.error_manager = error_manager
         self.cache = LRUCache()  # Bounded LRU cache (default max_size=10000)
         self.provider: Optional[EmbeddingProvider] = None
-        self._current_provider_type = None
+        self._provider_signature: Optional[Tuple[Any, ...]] = None
         self._session: Optional[aiohttp.ClientSession] = None
         # WeakValueDictionary allows garbage collection of locks when no longer referenced,
         # preventing unbounded growth of the locks dict
         # Use regular dict instead of WeakValueDictionary to avoid premature GC of Lock objects
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._cache_root = os.path.join(DATA_DIR, "cache")
+        self._legacy_cache_dir = os.path.join(self._cache_root, "embeddings")
+        self._sqlite_cache_file = os.path.join(self._cache_root, "embeddings.sqlite")
 
     def _get_lock(self, user_id: str) -> asyncio.Lock:
         """Get or create a lock for the given user_id."""
@@ -459,12 +578,19 @@ class EmbeddingManager:
 
     def _ensure_provider(self):
         valves = self.get_valves()
-        # Initialize if not set or if provider type changed
-        if (
-            not self.provider
-            or self._current_provider_type != valves.embedding_provider_type
-        ):
-            self._current_provider_type = valves.embedding_provider_type
+        provider_signature = (
+            valves.embedding_provider_type,
+            valves.embedding_model_name,
+            valves.embedding_api_url,
+            valves.embedding_api_key,
+        )
+        if not self.provider or self._provider_signature != provider_signature:
+            if self._provider_signature and self._provider_signature != provider_signature:
+                logger.info(
+                    "Embedding provider configuration changed; recreating provider and clearing in-memory embedding cache"
+                )
+            self._provider_signature = provider_signature
+            self.cache = LRUCache()
             if valves.embedding_provider_type == "local":
                 self.provider = LocalEmbeddingProvider(valves.embedding_model_name)
             elif valves.embedding_provider_type == "openai_compatible":
@@ -512,143 +638,466 @@ class EmbeddingManager:
         self._ensure_session()
         return await self.provider.get_embeddings_batch(texts, session=self._session)
 
-    async def store_embedding_persistent(self, user_id: str, memory_id: str, memory_text: str, embedding: np.ndarray) -> None:
-        """Store memory embedding in a persistent JSON file for reload across restarts."""
-        async with self._get_lock(user_id):
-            try:
-                # Use data directory for persistence
-                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-                await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
-                
-                # Load existing cache
-                cache = {}
-                if await asyncio.to_thread(os.path.exists, cache_file):
-                    try:
-                        def _load():
-                            with open(cache_file, 'r') as f:
-                                return json.load(f)
-                        cache = await asyncio.to_thread(_load)
-                    except Exception as e:
-                        logger.warning(f"Error loading embedding cache, starting fresh: {e}")
-                
-                # Convert numpy array to list for JSON storage
-                embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
-                
-                # Store embedding with metadata (Ensure ID is string for JSON key)
-                cache[str(memory_id)] = {
-                    "embedding": embedding_list,
-                    "model": self.get_valves().embedding_model_name,
-                    "provider": self.get_valves().embedding_provider_type,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-                
-                # Save cache atomically
-                def _save_atomic(data):
-                    tmp_file = cache_file + ".tmp"
-                    with open(tmp_file, 'w') as f:
-                        json.dump(data, f)
-                    os.replace(tmp_file, cache_file)
-                    
-                await asyncio.to_thread(_save_atomic, cache)
-                logger.debug(f"Stored embedding for memory {memory_id} in persistent cache")
-            except Exception as e:
-                logger.warning(f"Failed to store embedding in persistent cache for memory {memory_id}: {e}")
-        # Clean up lock after use to prevent unbounded growth
-        self._cleanup_lock(user_id)
+    def _get_legacy_cache_file(self, user_id: str) -> str:
+        return os.path.join(self._legacy_cache_dir, f"{user_id}_embeddings.json")
 
-    async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], texts: List[str], embeddings: List[np.ndarray]) -> None:
-        """Store multiple embeddings in a single persistent JSON file operation."""
+    def _connect_cache_db(self) -> sqlite3.Connection:
+        os.makedirs(self._cache_root, exist_ok=True)
+        conn = sqlite3.connect(self._sqlite_cache_file, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _ensure_cache_db_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embeddings (
+                user_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                model TEXT,
+                provider TEXT,
+                timestamp TEXT,
+                PRIMARY KEY (user_id, memory_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS legacy_cache_migrations (
+                user_id TEXT PRIMARY KEY,
+                legacy_cache_file TEXT NOT NULL,
+                legacy_mtime REAL NOT NULL,
+                migrated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _build_embedding_record(
+        self,
+        embedding: np.ndarray,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        timestamp: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        embedding_array = np.asarray(embedding, dtype=np.float32)
+        valves = self.get_valves()
+        return {
+            "embedding_json": json.dumps(embedding_array.tolist()),
+            "model": model or valves.embedding_model_name,
+            "provider": provider or valves.embedding_provider_type,
+            "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _record_to_embedding(self, record: Dict[str, Any]) -> Optional[np.ndarray]:
+        try:
+            embedding_json = record.get("embedding_json")
+            if embedding_json is None and "embedding" in record:
+                embedding_json = json.dumps(record["embedding"])
+            if embedding_json is None:
+                return None
+            return np.array(json.loads(embedding_json), dtype=np.float32)
+        except Exception:
+            return None
+
+    def _load_legacy_cache_sync(self, user_id: str) -> Dict[str, Any]:
+        cache_file = self._get_legacy_cache_file(user_id)
+        if not os.path.exists(cache_file):
+            return {}
+        with open(cache_file, "r") as f:
+            return json.load(f)
+
+    def _save_legacy_cache_sync(self, user_id: str, cache: Dict[str, Any]) -> None:
+        os.makedirs(self._legacy_cache_dir, exist_ok=True)
+        cache_file = self._get_legacy_cache_file(user_id)
+        tmp_file = cache_file + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp_file, cache_file)
+
+    def _store_embedding_legacy_json_sync(
+        self, user_id: str, memory_id: str, embedding: np.ndarray
+    ) -> None:
+        memory_id_str = normalize_memory_id(memory_id)
+        cache = self._load_legacy_cache_sync(user_id)
+        cache[memory_id_str] = {
+            "embedding": np.asarray(embedding, dtype=np.float32).tolist(),
+            "model": self.get_valves().embedding_model_name,
+            "provider": self.get_valves().embedding_provider_type,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_legacy_cache_sync(user_id, cache)
+
+    def _store_embeddings_batch_legacy_json_sync(
+        self, user_id: str, ids: List[str], embeddings: List[np.ndarray]
+    ) -> None:
         if not ids:
             return
-            
+        cache = self._load_legacy_cache_sync(user_id)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        model = self.get_valves().embedding_model_name
+        provider = self.get_valves().embedding_provider_type
+        for memory_id, embedding in zip(ids, embeddings, strict=True):
+            if embedding is None:
+                continue
+            cache[normalize_memory_id(memory_id)] = {
+                "embedding": np.asarray(embedding, dtype=np.float32).tolist(),
+                "model": model,
+                "provider": provider,
+                "timestamp": timestamp,
+            }
+        self._save_legacy_cache_sync(user_id, cache)
+
+    def _load_embedding_legacy_json_sync(
+        self, user_id: str, memory_id: str
+    ) -> Optional[Dict[str, Any]]:
+        memory_id_str = normalize_memory_id(memory_id)
+        cache = self._load_legacy_cache_sync(user_id)
+        embedding_data = cache.get(memory_id_str)
+        if not embedding_data:
+            return None
+        return {
+            "embedding_json": json.dumps(embedding_data.get("embedding")),
+            "model": embedding_data.get("model"),
+            "provider": embedding_data.get("provider"),
+            "timestamp": embedding_data.get("timestamp"),
+        }
+
+    def _delete_embedding_legacy_json_sync(self, user_id: str, memory_id: str) -> None:
+        cache_file = self._get_legacy_cache_file(user_id)
+        if not os.path.exists(cache_file):
+            return
+        cache = self._load_legacy_cache_sync(user_id)
+        memory_id_str = normalize_memory_id(memory_id)
+        if memory_id_str not in cache:
+            return
+        cache.pop(memory_id_str, None)
+        if cache:
+            self._save_legacy_cache_sync(user_id, cache)
+        else:
+            try:
+                os.remove(cache_file)
+            except FileNotFoundError:
+                pass
+
+    def _store_embedding_sqlite_sync(
+        self, user_id: str, memory_id: str, embedding: np.ndarray
+    ) -> None:
+        memory_id_str = normalize_memory_id(memory_id)
+        record = self._build_embedding_record(embedding)
+        with self._connect_cache_db() as conn:
+            self._ensure_cache_db_schema(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO embeddings
+                    (user_id, memory_id, embedding_json, model, provider, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    memory_id_str,
+                    record["embedding_json"],
+                    record["model"],
+                    record["provider"],
+                    record["timestamp"],
+                ),
+            )
+            conn.commit()
+
+    def _store_embeddings_batch_sqlite_sync(
+        self, user_id: str, ids: List[str], embeddings: List[np.ndarray]
+    ) -> int:
+        rows = []
+        timestamp = datetime.now(timezone.utc).isoformat()
+        model = self.get_valves().embedding_model_name
+        provider = self.get_valves().embedding_provider_type
+        for memory_id, embedding in zip(ids, embeddings, strict=True):
+            if embedding is None:
+                continue
+            record = self._build_embedding_record(
+                embedding, model=model, provider=provider, timestamp=timestamp
+            )
+            rows.append(
+                (
+                    user_id,
+                    normalize_memory_id(memory_id),
+                    record["embedding_json"],
+                    record["model"],
+                    record["provider"],
+                    record["timestamp"],
+                )
+            )
+
+        if not rows:
+            return 0
+
+        with self._connect_cache_db() as conn:
+            self._ensure_cache_db_schema(conn)
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO embeddings
+                    (user_id, memory_id, embedding_json, model, provider, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+        return len(rows)
+
+    def _load_embedding_sqlite_sync(
+        self, user_id: str, memory_id: str
+    ) -> Optional[Dict[str, Any]]:
+        memory_id_str = normalize_memory_id(memory_id)
+        with self._connect_cache_db() as conn:
+            self._ensure_cache_db_schema(conn)
+            row = conn.execute(
+                """
+                SELECT embedding_json, model, provider, timestamp
+                FROM embeddings
+                WHERE user_id = ? AND memory_id = ?
+                """,
+                (user_id, memory_id_str),
+            ).fetchone()
+            if row is None:
+                return None
+            return dict(row)
+
+    def _delete_embedding_sqlite_sync(self, user_id: str, memory_id: str) -> None:
+        memory_id_str = normalize_memory_id(memory_id)
+        with self._connect_cache_db() as conn:
+            self._ensure_cache_db_schema(conn)
+            conn.execute(
+                "DELETE FROM embeddings WHERE user_id = ? AND memory_id = ?",
+                (user_id, memory_id_str),
+            )
+            conn.commit()
+
+    def _migrate_legacy_cache_if_needed_sync(self, user_id: str) -> int:
+        cache_file = self._get_legacy_cache_file(user_id)
+        if not os.path.exists(cache_file):
+            return 0
+
+        legacy_mtime = os.path.getmtime(cache_file)
+        with self._connect_cache_db() as conn:
+            self._ensure_cache_db_schema(conn)
+            existing = conn.execute(
+                """
+                SELECT legacy_mtime
+                FROM legacy_cache_migrations
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            if existing and float(existing["legacy_mtime"]) == float(legacy_mtime):
+                return 0
+
+            cache = self._load_legacy_cache_sync(user_id)
+            rows = []
+            for memory_id, embedding_data in cache.items():
+                embedding = self._record_to_embedding(embedding_data)
+                if embedding is None:
+                    continue
+                record = self._build_embedding_record(
+                    embedding,
+                    model=embedding_data.get("model"),
+                    provider=embedding_data.get("provider"),
+                    timestamp=embedding_data.get("timestamp"),
+                )
+                rows.append(
+                    (
+                        user_id,
+                        normalize_memory_id(memory_id),
+                        record["embedding_json"],
+                        record["model"],
+                        record["provider"],
+                        record["timestamp"],
+                    )
+                )
+
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO embeddings
+                        (user_id, memory_id, embedding_json, model, provider, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO legacy_cache_migrations
+                    (user_id, legacy_cache_file, legacy_mtime, migrated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    cache_file,
+                    legacy_mtime,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+            return len(rows)
+
+    def _is_record_compatible(self, record: Dict[str, Any]) -> bool:
+        valves = self.get_valves()
+        return (
+            record.get("model") == valves.embedding_model_name
+            and record.get("provider") == valves.embedding_provider_type
+        )
+
+    async def store_embedding_persistent(self, user_id: str, memory_id: str, memory_text: str, embedding: np.ndarray) -> None:
+        """Store memory embedding in the plugin's persistent sidecar cache."""
+        del memory_text
+
         async with self._get_lock(user_id):
             try:
-                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-                await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
-                
-                # Load existing cache
-                cache = {}
-                if await asyncio.to_thread(os.path.exists, cache_file):
-                    try:
-                        def _load():
-                            with open(cache_file, 'r') as f:
-                                return json.load(f)
-                        cache = await asyncio.to_thread(_load)
-                    except Exception as e:
-                        logger.warning(f"Error loading embedding cache for batch store: {e}")
-                
-                # Update cache with new embeddings
-                for memory_id, embedding in zip(ids, embeddings, strict=True):
-                    if embedding is None:
-                        continue
-                        
-                    embedding_list = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
-                    cache[str(memory_id)] = {
-                        "embedding": embedding_list,
-                        "model": self.get_valves().embedding_model_name,
-                        "provider": self.get_valves().embedding_provider_type,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }
-                
-                # Save cache atomically
-                def _save_atomic(data):
-                    tmp_file = cache_file + ".tmp"
-                    with open(tmp_file, 'w') as f:
-                        json.dump(data, f)
-                    os.replace(tmp_file, cache_file)
-                    
-                await asyncio.to_thread(_save_atomic, cache)
-                logger.info(f"Batched stored {len(ids)} embeddings in persistent cache for user {user_id}")
+                migrated_count = await asyncio.to_thread(
+                    self._migrate_legacy_cache_if_needed_sync, user_id
+                )
+                if migrated_count:
+                    logger.info(
+                        f"Migrated {migrated_count} legacy embeddings into SQLite cache for user {user_id}"
+                    )
+
+                await asyncio.to_thread(
+                    self._store_embedding_sqlite_sync, user_id, memory_id, embedding
+                )
+                logger.debug(f"Stored embedding for memory {memory_id} in SQLite cache")
             except Exception as e:
-                logger.warning(f"Failed to store batch embeddings in persistent cache: {e}")
-        # Clean up lock after use to prevent unbounded growth
-        self._cleanup_lock(user_id)
+                logger.warning(
+                    f"SQLite cache store failed for memory {memory_id}; falling back to legacy JSON cache: {e}"
+                )
+                try:
+                    await asyncio.to_thread(
+                        self._store_embedding_legacy_json_sync, user_id, memory_id, embedding
+                    )
+                except Exception as legacy_err:
+                    logger.warning(
+                        f"Failed to store embedding in persistent cache for memory {memory_id}: {legacy_err}"
+                    )
+            finally:
+                self._cleanup_lock(user_id)
+
+    async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], texts: List[str], embeddings: List[np.ndarray]) -> None:
+        """Store multiple embeddings in the plugin's persistent sidecar cache."""
+        del texts
+        if not ids:
+            return
+
+        async with self._get_lock(user_id):
+            try:
+                migrated_count = await asyncio.to_thread(
+                    self._migrate_legacy_cache_if_needed_sync, user_id
+                )
+                if migrated_count:
+                    logger.info(
+                        f"Migrated {migrated_count} legacy embeddings into SQLite cache for user {user_id}"
+                    )
+
+                stored_count = await asyncio.to_thread(
+                    self._store_embeddings_batch_sqlite_sync, user_id, ids, embeddings
+                )
+                logger.info(
+                    f"Batched stored {stored_count} embeddings in SQLite cache for user {user_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"SQLite batch cache store failed; falling back to legacy JSON cache: {e}"
+                )
+                try:
+                    await asyncio.to_thread(
+                        self._store_embeddings_batch_legacy_json_sync,
+                        user_id,
+                        ids,
+                        embeddings,
+                    )
+                except Exception as legacy_err:
+                    logger.warning(
+                        f"Failed to store batch embeddings in persistent cache: {legacy_err}"
+                    )
+            finally:
+                self._cleanup_lock(user_id)
 
     async def load_embedding_persistent(self, user_id: str, memory_id: str) -> Optional[np.ndarray]:
-        """Load a stored embedding from the persistent JSON file."""
+        """Load a stored embedding from the plugin's persistent sidecar cache."""
         result = None
+        memory_id_str = normalize_memory_id(memory_id)
+
         async with self._get_lock(user_id):
             try:
-                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
-                
-                if not await asyncio.to_thread(os.path.exists, cache_file):
-                    result = None
-                else:
-                    # Load cache
-                    def _load():
-                        with open(cache_file, 'r') as f:
-                            return json.load(f)
-                    cache = await asyncio.to_thread(_load)
-                    
-                    # Ensure ID is handled as string for JSON key lookup
-                    memory_id_str = str(memory_id)
-                    if memory_id_str in cache:
-                        embedding_data = cache[memory_id_str]
-                        embedding_list = embedding_data["embedding"]
-                        embedding = np.array(embedding_list, dtype=np.float32)
-                        
-                        # Validate model compatibility
-                        valves = self.get_valves()
-                        stored_model = embedding_data.get("model")
-                        stored_provider = embedding_data.get("provider")
-                        
-                        if (stored_model != valves.embedding_model_name or 
-                            stored_provider != valves.embedding_provider_type):
-                            logger.debug(f"Cache miss for {memory_id_str}: Model/provider changed")
-                            result = None
-                        else:
-                            result = embedding
-                    else:
-                        result = None
+                migrated_count = await asyncio.to_thread(
+                    self._migrate_legacy_cache_if_needed_sync, user_id
+                )
+                if migrated_count:
+                    logger.info(
+                        f"Migrated {migrated_count} legacy embeddings into SQLite cache for user {user_id}"
+                    )
+
+                sqlite_record = await asyncio.to_thread(
+                    self._load_embedding_sqlite_sync, user_id, memory_id_str
+                )
+                if sqlite_record and self._is_record_compatible(sqlite_record):
+                    result = self._record_to_embedding(sqlite_record)
+                elif sqlite_record:
+                    logger.debug(
+                        f"Cache miss for {memory_id_str}: Model/provider changed"
+                    )
+
+                if result is None:
+                    legacy_record = await asyncio.to_thread(
+                        self._load_embedding_legacy_json_sync, user_id, memory_id_str
+                    )
+                    if legacy_record and self._is_record_compatible(legacy_record):
+                        result = self._record_to_embedding(legacy_record)
+                        if result is not None:
+                            try:
+                                await asyncio.to_thread(
+                                    self._store_embedding_sqlite_sync,
+                                    user_id,
+                                    memory_id_str,
+                                    result,
+                                )
+                            except Exception as sqlite_err:
+                                logger.debug(
+                                    f"Failed to hydrate SQLite cache from legacy JSON for {memory_id_str}: {sqlite_err}"
+                                )
             except Exception as e:
-                logger.warning(f"Error loading embedding from persistent cache for memory {memory_id}: {e}")
+                logger.warning(
+                    f"Error loading embedding from persistent cache for memory {memory_id}: {e}"
+                )
                 result = None
-        # Clean up lock after use to prevent unbounded growth
-        self._cleanup_lock(user_id)
+            finally:
+                self._cleanup_lock(user_id)
         return result
+
+    async def delete_embedding_persistent(self, user_id: str, memory_id: str) -> None:
+        """Delete a stored embedding from memory and all persistent cache backends."""
+        memory_id_str = normalize_memory_id(memory_id)
+        await self.cache.delete(memory_id_str)
+
+        async with self._get_lock(user_id):
+            try:
+                await asyncio.to_thread(
+                    self._delete_embedding_sqlite_sync, user_id, memory_id_str
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to delete embedding from SQLite cache for memory {memory_id_str}: {e}"
+                )
+
+            try:
+                await asyncio.to_thread(
+                    self._delete_embedding_legacy_json_sync, user_id, memory_id_str
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to delete embedding from legacy JSON cache for memory {memory_id_str}: {e}"
+                )
+            finally:
+                self._cleanup_lock(user_id)
 
     async def get_embedding_with_persistence(self, text: str, user_id: str, memory_id: str) -> Optional[np.ndarray]:
         """Get embedding with full caching hierarchy: memory -> persistent -> generate."""
@@ -699,6 +1148,237 @@ class MemoryPipeline:
         self.embedding_manager = embedding_manager
         self.error_manager = error_manager
 
+    def _get_memory_id(self, memory: Any) -> Optional[str]:
+        memory_id = memory.id if hasattr(memory, "id") else memory.get("id")
+        if memory_id is None:
+            return None
+        return normalize_memory_id(memory_id)
+
+    def _get_memory_record(self, memory: Any) -> StoredMemoryRecord:
+        memory_content = memory.content if hasattr(memory, "content") else memory.get("content")
+        return parse_stored_memory(memory_content)
+
+    def _enabled_memory_tags(self) -> Set[str]:
+        enabled_tags = {"summary"}
+        tag_flag_map = {
+            "identity": self.valves.enable_identity_memories,
+            "behavior": self.valves.enable_behavior_memories,
+            "preference": self.valves.enable_preference_memories,
+            "goal": self.valves.enable_goal_memories,
+            "relationship": self.valves.enable_relationship_memories,
+            "possession": self.valves.enable_possession_memories,
+        }
+        for tag, enabled in tag_flag_map.items():
+            if enabled:
+                enabled_tags.add(tag)
+        return enabled_tags
+
+    def _normalize_tags(self, tags: Any) -> List[str]:
+        if tags is None:
+            return []
+        if not isinstance(tags, list):
+            tags = [tags]
+
+        enabled_tags = self._enabled_memory_tags()
+        cleaned_tags = []
+        seen = set()
+        for tag in tags:
+            normalized_tag = str(tag).strip().lower()
+            if (
+                normalized_tag
+                and normalized_tag in SUPPORTED_MEMORY_TAGS
+                and normalized_tag in enabled_tags
+                and normalized_tag not in seen
+            ):
+                seen.add(normalized_tag)
+                cleaned_tags.append(normalized_tag)
+        return cleaned_tags
+
+    def _normalize_memory_bank(self, memory_bank: Any) -> str:
+        allowed_banks = [
+            str(bank).strip() for bank in self.valves.allowed_memory_banks if str(bank).strip()
+        ]
+        default_bank = str(self.valves.default_memory_bank or "General").strip() or "General"
+
+        if not allowed_banks:
+            return default_bank
+
+        requested_bank = str(memory_bank or "").strip()
+        for allowed_bank in allowed_banks:
+            if requested_bank.lower() == allowed_bank.lower():
+                return allowed_bank
+
+        for allowed_bank in allowed_banks:
+            if default_bank.lower() == allowed_bank.lower():
+                return allowed_bank
+
+        return allowed_banks[0]
+
+    def _normalize_confidence(self, value: Any, default: float = 0.0) -> float:
+        try:
+            confidence = float(default if value is None else value)
+        except (TypeError, ValueError):
+            confidence = float(default)
+        return max(0.0, min(1.0, confidence))
+
+    def _parse_csv_keywords(self, value: Optional[str]) -> Set[str]:
+        if not value:
+            return set()
+        return {item.strip().lower() for item in str(value).split(",") if item.strip()}
+
+    def _has_whitelist_keyword(self, content: str) -> bool:
+        lowered = content.lower()
+        return any(
+            keyword in lowered for keyword in self._parse_csv_keywords(self.valves.whitelist_keywords)
+        )
+
+    def _looks_like_trivia(self, content: str) -> bool:
+        lowered = content.strip().lower()
+        if not lowered:
+            return False
+        trivia_patterns = [
+            r"^(what|who|where|when|why|how)\b",
+            r"\b(the capital of|world war|boiling point|photosynthesis|periodic table)\b",
+        ]
+        return lowered.endswith("?") or any(
+            re.search(pattern, lowered) for pattern in trivia_patterns
+        )
+
+    def _passes_memory_filters(self, content: str) -> bool:
+        if not content:
+            return False
+
+        if self._has_whitelist_keyword(content):
+            return True
+
+        lowered = content.lower()
+        blacklist_topics = self._parse_csv_keywords(self.valves.blacklist_topics)
+        if blacklist_topics and any(topic in lowered for topic in blacklist_topics):
+            return False
+
+        if self.valves.filter_trivia and self._looks_like_trivia(content):
+            return False
+
+        return True
+
+    def _should_skip_dedupe_for_short_preference(self, content: str) -> bool:
+        if not content or len(content) > self.valves.short_preference_no_dedupe_length:
+            return False
+
+        lowered = content.lower()
+        preference_keywords = self._parse_csv_keywords(
+            self.valves.preference_keywords_no_dedupe
+        )
+        if not preference_keywords:
+            return False
+
+        has_first_person_marker = bool(re.search(r"\b(i|i'm|im|my)\b", lowered))
+        return has_first_person_marker and any(
+            keyword in lowered for keyword in preference_keywords
+        )
+
+    def _extract_fallback_operations(self, response: str) -> List[Dict[str, Any]]:
+        operations = []
+        for match in re.finditer(
+            r'"operation"\s*:\s*"(?P<operation>NEW|UPDATE|DELETE)"(?P<body>.*?)(?=\{?"operation"\s*:|$)',
+            response,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            body = match.group("body")
+            op = {"operation": match.group("operation").upper()}
+
+            id_match = re.search(r'"id"\s*:\s*"(?P<id>(?:\\.|[^"\\])*)"', body)
+            if id_match:
+                op["id"] = bytes(id_match.group("id"), "utf-8").decode("unicode_escape")
+
+            content_match = re.search(
+                r'"content"\s*:\s*"(?P<content>(?:\\.|[^"\\])*)"', body
+            )
+            if content_match:
+                op["content"] = bytes(
+                    content_match.group("content"), "utf-8"
+                ).decode("unicode_escape")
+
+            tags_match = re.search(r'"tags"\s*:\s*\[(?P<tags>[^\]]*)\]', body)
+            if tags_match:
+                op["tags"] = re.findall(r'"([^"]+)"', tags_match.group("tags"))
+
+            bank_match = re.search(
+                r'"memory_bank"\s*:\s*"(?P<memory_bank>(?:\\.|[^"\\])*)"', body
+            )
+            if bank_match:
+                op["memory_bank"] = bytes(
+                    bank_match.group("memory_bank"), "utf-8"
+                ).decode("unicode_escape")
+
+            confidence_match = re.search(
+                r'"confidence"\s*:\s*(?P<confidence>-?\d+(?:\.\d+)?)', body
+            )
+            if confidence_match:
+                try:
+                    op["confidence"] = float(confidence_match.group("confidence"))
+                except ValueError:
+                    pass
+
+            operations.append(op)
+        return operations
+
+    def _normalize_operation(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        operation = str(item.get("operation", "")).upper().strip()
+        if operation not in {"NEW", "UPDATE", "DELETE"}:
+            return None
+
+        if operation == "DELETE":
+            memory_id = item.get("id")
+            if not memory_id:
+                return None
+            return {"operation": "DELETE", "id": normalize_memory_id(memory_id)}
+
+        content = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
+        if not content or len(content) < self.valves.min_memory_length:
+            return None
+        if not self._passes_memory_filters(content):
+            return None
+
+        confidence = self._normalize_confidence(item.get("confidence"), default=0.0)
+        if confidence < self.valves.min_confidence_threshold:
+            return None
+
+        tags = self._normalize_tags(item.get("tags", []))
+        if item.get("tags") and not tags:
+            return None
+
+        normalized_op = {
+            "operation": operation,
+            "content": content,
+            "tags": tags,
+            "memory_bank": self._normalize_memory_bank(item.get("memory_bank")),
+            "confidence": confidence,
+        }
+
+        if operation == "UPDATE" and item.get("id"):
+            normalized_op["id"] = normalize_memory_id(item["id"])
+
+        return normalized_op
+
+    def _build_short_preference_operation(self, user_message: str) -> Optional[Dict[str, Any]]:
+        if not self.valves.enable_short_preference_shortcut:
+            return None
+
+        content = re.sub(r"\s+", " ", user_message).strip()
+        if not self._should_skip_dedupe_for_short_preference(content):
+            return None
+
+        return self._normalize_operation(
+            {
+                "operation": "NEW",
+                "content": content,
+                "tags": ["preference"],
+                "memory_bank": self._normalize_memory_bank(self.valves.default_memory_bank),
+                "confidence": 0.95,
+            }
+        )
+
     # --- Memory Identification ---
     async def identify_memories(
         self,
@@ -717,43 +1397,74 @@ class MemoryPipeline:
 
         user_prompt = f"User Message: {user_message}"
         if context_memories:
-            user_prompt += "\n\nContext Memories:\n" + "\n".join(
-                [f"- {m.get('content', '')}" for m in context_memories]
-            )
+            context_lines = []
+            for memory in context_memories:
+                memory_id = self._get_memory_id(memory)
+                memory_record = self._get_memory_record(memory)
+                if not memory_id or not memory_record.content:
+                    continue
+
+                metadata = []
+                if memory_record.memory_bank:
+                    metadata.append(f"bank={memory_record.memory_bank}")
+                if memory_record.tags:
+                    metadata.append(f"tags={', '.join(memory_record.tags)}")
+                metadata_suffix = f" ({'; '.join(metadata)})" if metadata else ""
+                context_lines.append(
+                    f"- ID: {memory_id}{metadata_suffix} | Content: {memory_record.content}"
+                )
+
+            if context_lines:
+                user_prompt += (
+                    "\n\nRelevant Existing Memories (use these IDs for UPDATE/DELETE when appropriate):\n"
+                    + "\n".join(context_lines)
+                )
+
+        fallback_operation = self._build_short_preference_operation(user_message)
 
         # Call LLM
         if not query_llm_func:
-            return []
+            return [fallback_operation] if fallback_operation else []
 
         try:
             response = await query_llm_func(system_prompt, user_prompt)
-            if not response:
+            parsed_operations = []
+
+            if response:
+                data = (
+                    JSONParser.extract_and_parse(response)
+                    if self.valves.enable_json_stripping
+                    else json.loads(response)
+                )
+                if isinstance(data, list):
+                    parsed_operations = data
+                elif isinstance(data, dict):
+                    parsed_operations = [data]
+                elif self.valves.enable_fallback_regex:
+                    parsed_operations = self._extract_fallback_operations(response)
+            elif fallback_operation:
+                return [fallback_operation]
+            else:
                 return []
 
-            # Parse JSON
-            data = JSONParser.extract_and_parse(response)
-            if not isinstance(data, list):
-                return []
-
-            # Validate and filter
             valid_ops = []
-            for item in data:
+            for item in parsed_operations:
                 if not isinstance(item, dict):
                     continue
-                op = item.get("operation")
-                content = item.get("content")
-                confidence = item.get("confidence", 0.0)
+                normalized_op = self._normalize_operation(item)
+                if normalized_op:
+                    valid_ops.append(normalized_op)
 
-                if op in ["NEW", "UPDATE"] and content:
-                    if confidence >= self.valves.min_confidence_threshold:
-                        valid_ops.append(item)
-                elif op == "DELETE" and item.get("id"):
-                    # DELETE doesn't require content
-                    valid_ops.append(item)
+            if valid_ops:
+                return valid_ops
 
-            return valid_ops
+            return [fallback_operation] if fallback_operation else []
 
         except Exception as e:
+            self.error_manager.increment("json_parse_errors")
+            logger.warning(f"Identify memories parsing failed, attempting fallback: {e}")
+            if fallback_operation:
+                return [fallback_operation]
             self.error_manager.increment("llm_call_errors")
             logger.exception(f"Identify memories failed: {e}")
             return []
@@ -789,9 +1500,9 @@ class MemoryPipeline:
         ids_to_embed = []
 
         for mem in all_memories:
-            # Handle object vs dict
-            mem_content = mem.content if hasattr(mem, "content") else mem.get("content")
-            mem_id = mem.id if hasattr(mem, "id") else mem.get("id")
+            memory_record = self._get_memory_record(mem)
+            mem_content = memory_record.content
+            mem_id = self._get_memory_id(mem)
 
             if not mem_id or not mem_content:
                 continue
@@ -842,7 +1553,11 @@ class MemoryPipeline:
 
         # Sort by similarity
         scored_memories.sort(key=lambda x: x[0], reverse=True)
-        top_memories = [mem for sim, mem in scored_memories[: self.valves.related_memories_n]]
+        top_memories = [
+            mem
+            for sim, mem in scored_memories
+            if sim >= self.valves.relevance_threshold
+        ][: self.valves.related_memories_n]
         
         RETRIEVAL_LATENCY.observe(time.perf_counter() - start_time)
         return top_memories
@@ -888,146 +1603,212 @@ class MemoryPipeline:
         success_ops = []
         for op in operations:
             try:
-                kind = op.get("operation")
-                content = op.get("content")
+                normalized_op = self._normalize_operation(op)
+                if normalized_op is None:
+                    logger.debug(f"Skipping invalid memory operation payload: {op}")
+                    continue
+                kind = normalized_op.get("operation")
+                content = normalized_op.get("content")
 
                 if kind == "NEW" and content:
-                    # Incorporate metadata into content string for storage
-                    tags = op.get("tags", [])
-                    bank = op.get("memory_bank", "General")
+                    tags = self._normalize_tags(normalized_op.get("tags", []))
+                    bank = self._normalize_memory_bank(normalized_op.get("memory_bank"))
+                    confidence = self._normalize_confidence(
+                        normalized_op.get("confidence"), default=1.0
+                    )
 
-                    # Deduplication check (skip for summaries)
                     dedup_embedding = None
-                    if self.valves.deduplicate_memories and not skip_deduplication:
+                    skip_preference_dedupe = self._should_skip_dedupe_for_short_preference(content)
+                    if (
+                        self.valves.deduplicate_memories
+                        and not skip_deduplication
+                        and not skip_preference_dedupe
+                    ):
                         is_dupe, dedup_embedding = await self._is_duplicate(content, user_id)
                         if is_dupe:
                             logger.info(f"Skipping duplicate memory (length: {len(content)})")
                             continue
 
-                    # Format: [Tags: tag1, tag2] Content [Memory Bank: Bank] [Confidence: X.XX]
-                    tags_str = ", ".join(tags) if tags else "none"
-                    confidence = op.get("confidence", 1.0)
+                    final_content = format_memory_content(content, tags, bank, confidence)
 
-                    final_content = f"[Tags: {tags_str}] {content} [Memory Bank: {bank}] [Confidence: {confidence:.2f}]"
-
-                    # Add memory - using Router add_memory for Vector Indexing
                     try:
                         mem_obj = None
                         try:
-                            # Try the high-level router function which handles vector indexing
-                            logger.info(f"Attempting to add memory via router add_memory (Vector-Aware)...")
-                            
+                            logger.info("Attempting to add memory via router add_memory (Vector-Aware)...")
+
                             if add_memory and (AddMemoryForm or LocalAddMemoryForm):
-                                # Use imported AddMemoryForm if available, otherwise local
                                 FormClass = AddMemoryForm if AddMemoryForm else LocalAddMemoryForm
                                 form = FormClass(content=final_content)
-                                
-                                # Define wrapper for embedding function to match Router signature
-                                # The router calls: await request.app.state.EMBEDDING_FUNCTION(content, user=user)
-                                async def mock_embedding_function(content: str, user=None):
-                                    return await self.embedding_manager.get_embedding(content)
 
-                                # Prepare Mock Request for Dependency Injection
-                                req = MockRequest(user_obj, mock_embedding_function) if 'MockRequest' in globals() else None
-                                
-                                # Call add_memory with correct signature (request, form_data, user)
-                                # No db parameter - the function signature is:
-                                # async def add_memory(request: Request, form_data: AddMemoryForm, user: User = None)
+                                async def mock_embedding_function(content: str, user=None):
+                                    return await self.embedding_manager.get_embedding(
+                                        parse_stored_memory(content).content
+                                    )
+
+                                req = (
+                                    MockRequest(user_obj, mock_embedding_function)
+                                    if "MockRequest" in globals()
+                                    else None
+                                )
                                 if req:
-                                    mem_obj = await add_memory(request=req, form_data=form, user=user_obj)
+                                    mem_obj = await add_memory(
+                                        request=req, form_data=form, user=user_obj
+                                    )
                                 else:
-                                    # Fallback if MockRequest failed
                                     raise ImportError("MockRequest not available")
                             else:
                                 raise ImportError("Router add_memory not successfully imported")
 
                         except Exception as add_err:
-                            logger.warning(f"Router add_memory failed ({add_err}), falling back to insert_new_memory")
+                            logger.warning(
+                                f"Router add_memory failed ({add_err}), falling back to insert_new_memory"
+                            )
                             mem_obj = Memories.insert_new_memory(user_id, final_content)
 
-                        memory_id = getattr(mem_obj, 'id', None)
-                        success_ops.append(op)
-                        logger.info(f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]")
-                        
-                        # Cache the embedding from deduplication check to avoid re-generating later
+                        memory_id = getattr(mem_obj, "id", None)
+                        success_ops.append(normalized_op)
+                        logger.info(
+                            f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]"
+                        )
+
                         if dedup_embedding is not None and memory_id:
-                            logger.debug(f"Caching embedding from deduplication check for memory {memory_id}")
-                            await self.embedding_manager.cache.set(str(memory_id), dedup_embedding)
-                            # Persist it immediately
+                            memory_key = normalize_memory_id(memory_id)
+                            logger.debug(
+                                f"Caching embedding from deduplication check for memory {memory_key}"
+                            )
+                            await self.embedding_manager.cache.set(memory_key, dedup_embedding)
                             await self.embedding_manager.store_embedding_persistent(
-                                user_id, str(memory_id), content, dedup_embedding
+                                user_id, memory_key, content, dedup_embedding
                             )
                     except Exception as ins_err:
                         logger.error(f"Failed to insert memory: {ins_err}")
 
-                elif kind == "UPDATE" and op.get("id") and op.get("content"):
+                elif kind == "UPDATE" and normalized_op.get("id") and content:
                     try:
-                        memory_id = op["id"]
-                        new_content = op["content"]
-                        
-                        # Update in database
-                        updated_memory = Memories.update_memory_by_id_and_user_id(
-                            memory_id, user_id, new_content
+                        memory_id = normalize_memory_id(normalized_op["id"])
+                        new_content = content
+                        existing_memories = Memories.get_memories_by_user_id(user_id)
+                        existing_memory = next(
+                            (
+                                memory
+                                for memory in existing_memories
+                                if self._get_memory_id(memory) == memory_id
+                            ),
+                            None,
                         )
-                        
-                        if updated_memory:
-                            # Regenerate embedding for updated content
-                            new_embedding = await self.embedding_manager.get_embedding(new_content)
-                            
-                            if new_embedding is not None:
-                                # Update in-memory cache
-                                await self.embedding_manager.cache.set(str(memory_id), new_embedding)
-                                
-                                # Update persistent cache
-                                await self.embedding_manager.store_embedding_persistent(
-                                    user_id, str(memory_id), new_content, new_embedding
+
+                        if not existing_memory:
+                            logger.warning(f"Memory not found for update (ID: {memory_id})")
+                            continue
+
+                        existing_record = self._get_memory_record(existing_memory)
+                        tags = self._normalize_tags(
+                            normalized_op.get("tags", existing_record.tags)
+                        ) or existing_record.tags
+                        bank = self._normalize_memory_bank(
+                            normalized_op.get("memory_bank", existing_record.memory_bank)
+                        )
+                        confidence = self._normalize_confidence(
+                            normalized_op.get("confidence", existing_record.confidence),
+                            default=existing_record.confidence or 1.0,
+                        )
+
+                        new_embedding = None
+                        skip_preference_dedupe = self._should_skip_dedupe_for_short_preference(
+                            new_content
+                        )
+                        if (
+                            self.valves.deduplicate_memories
+                            and not skip_preference_dedupe
+                        ):
+                            is_dupe, new_embedding = await self._is_duplicate(
+                                new_content, user_id, exclude_id=memory_id
+                            )
+                            if is_dupe:
+                                logger.info(
+                                    f"Skipping update because content would duplicate another memory (ID: {memory_id})"
                                 )
-                                
-                                # Update vector database if available
+                                continue
+
+                        final_content = format_memory_content(
+                            new_content, tags, bank, confidence
+                        )
+                        updated_memory = Memories.update_memory_by_id_and_user_id(
+                            memory_id, user_id, final_content
+                        )
+
+                        if updated_memory:
+                            if new_embedding is None:
+                                new_embedding = await self.embedding_manager.get_embedding(
+                                    new_content
+                                )
+
+                            if new_embedding is not None:
+                                await self.embedding_manager.cache.set(memory_id, new_embedding)
+                                await self.embedding_manager.store_embedding_persistent(
+                                    user_id, memory_id, new_content, new_embedding
+                                )
+
                                 if VECTOR_DB_CLIENT:
                                     try:
                                         VECTOR_DB_CLIENT.upsert(
                                             collection_name=f"user-memory-{user_id}",
-                                            items=[{
-                                                "id": str(memory_id),
-                                                "text": new_content,
-                                                "vector": new_embedding.tolist() if hasattr(new_embedding, 'tolist') else new_embedding,
-                                                "metadata": {
-                                                    "updated_at": updated_memory.updated_at if hasattr(updated_memory, 'updated_at') else None,
+                                            items=[
+                                                {
+                                                    "id": memory_id,
+                                                    "text": final_content,
+                                                    "vector": (
+                                                        new_embedding.tolist()
+                                                        if hasattr(new_embedding, "tolist")
+                                                        else new_embedding
+                                                    ),
+                                                    "metadata": {
+                                                        "updated_at": (
+                                                            updated_memory.updated_at
+                                                            if hasattr(updated_memory, "updated_at")
+                                                            else None
+                                                        ),
+                                                    },
                                                 }
-                                            }]
+                                            ],
                                         )
-                                        logger.info(f"Memory updated in vector DB (ID: {memory_id})")
+                                        logger.info(
+                                            f"Memory updated in vector DB (ID: {memory_id})"
+                                        )
                                     except Exception as vec_err:
-                                        logger.warning(f"Failed to update memory in vector DB: {vec_err}")
-                            
-                            success_ops.append(op)
+                                        logger.warning(
+                                            f"Failed to update memory in vector DB: {vec_err}"
+                                        )
+
+                            success_ops.append(normalized_op)
                             logger.info(f"Memory updated (ID: {memory_id})")
                         else:
                             logger.warning(f"Memory not found for update (ID: {memory_id})")
-                            
+
                     except Exception as upd_err:
                         logger.exception(f"Failed to update memory: {upd_err}")
 
-                elif kind == "DELETE" and op.get("id"):
+                elif kind == "DELETE" and normalized_op.get("id"):
                     try:
-                        memory_id = op["id"]
-                        
-                        # Delete from database
+                        memory_id = normalize_memory_id(normalized_op["id"])
                         Memories.delete_memory_by_id(memory_id)
-                        
-                        # Delete from vector database if available
+
                         if VECTOR_DB_CLIENT:
                             try:
                                 VECTOR_DB_CLIENT.delete(
                                     collection_name=f"user-memory-{user_id}",
-                                    ids=[str(memory_id)]
+                                    ids=[memory_id],
                                 )
                                 logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
                             except Exception as vec_err:
-                                logger.warning(f"Failed to delete memory from vector DB: {vec_err}")
-                        
-                        success_ops.append(op)
+                                logger.warning(
+                                    f"Failed to delete memory from vector DB: {vec_err}"
+                                )
+
+                        await self.embedding_manager.delete_embedding_persistent(
+                            user_id, memory_id
+                        )
+                        success_ops.append(normalized_op)
                         logger.info(f"Memory deleted (ID: {memory_id})")
                     except Exception as del_err:
                         logger.exception(f"Failed to delete memory: {del_err}")
@@ -1035,6 +1816,15 @@ class MemoryPipeline:
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
                 logger.exception(f"Memory operation failed: {e}")
+
+        # Prune old memories if we exceeded the limit
+        if success_ops and user_id:
+            try:
+                deleted_count = await self._prune_old_memories(user_id)
+                if deleted_count > 0:
+                    logger.info(f"Pruned {deleted_count} old memories to maintain limit of {self.valves.max_total_memories}")
+            except Exception as prune_err:
+                logger.exception(f"Memory pruning failed: {prune_err}")
 
         return success_ops
 
@@ -1059,121 +1849,74 @@ class MemoryPipeline:
                 return False, None
 
             if self.valves.use_embeddings_for_deduplication:
-                # Use embedding-based similarity
                 new_embedding = await self.embedding_manager.get_embedding(text)
                 if new_embedding is None:
                     logger.warning("Could not generate embedding for duplicate check, falling back to text similarity")
-                    # Fallback to text similarity - no embedding to cache
                     is_dup = await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
                     return is_dup, None
                     
-                # Check similarity against existing memories
-                for i, memory in enumerate(all_memories):
-                    memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
-                    
-                    # SAFETY: Skip comparing memory against itself
-                    if exclude_id and str(memory_id) == str(exclude_id):
+                for memory in all_memories:
+                    memory_id = self._get_memory_id(memory)
+                    if not memory_id:
                         continue
-                        
-                    memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
-                    
-                    # Extract raw content from formatted memory for comparison
-                    # Format: [Tags: ...] CONTENT [Memory Bank: ...] [Confidence: ...]
-                    raw_memory_content = memory_content
-                    
-                    # Extract content between tags and memory bank
-                    if '[Tags:' in memory_content and '[Memory Bank:' in memory_content:
-                        # Find the end of tags section
-                        tags_end = memory_content.find(']', memory_content.find('[Tags:'))
-                        if tags_end != -1:
-                            # Find the start of memory bank section
-                            bank_start = memory_content.find('[Memory Bank:', tags_end)
-                            if bank_start != -1:
-                                # Extract content between tags and memory bank
-                                raw_memory_content = memory_content[tags_end + 1:bank_start].strip()
-                    
-                    # Check for exact match first (ignoring punctuation and case)
+                    if exclude_id and memory_id == normalize_memory_id(exclude_id):
+                        continue
+
+                    raw_memory_content = self._get_memory_record(memory).content
+                    if not raw_memory_content:
+                        continue
+
                     if self._normalize_text(text) == self._normalize_text(raw_memory_content):
                         logger.info(f"Exact match found for memory {memory_id}")
-                        return True, new_embedding  # Return the embedding we generated
-                    
-                    # Use raw content for embedding comparison
-                    content_for_embedding = raw_memory_content
-                    # Check in-memory cache first
+                        return True, new_embedding
+
                     existing_embedding = await self.embedding_manager.cache.get(memory_id)
                     if existing_embedding is None:
-                        # Check persistent cache
                         existing_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
                         if existing_embedding is not None:
-                            # Cache in memory for this session
                             await self.embedding_manager.cache.set(memory_id, existing_embedding)
                         else:
-                            # Generate embedding for existing memory using raw content
-                            existing_embedding = await self.embedding_manager.get_embedding(content_for_embedding)
+                            existing_embedding = await self.embedding_manager.get_embedding(raw_memory_content)
                             if existing_embedding is not None:
-                                # Cache in memory and store persistently
                                 await self.embedding_manager.cache.set(memory_id, existing_embedding)
                                 await self.embedding_manager.store_embedding_persistent(
-                                    user_id, memory_id, content_for_embedding, existing_embedding
+                                    user_id, memory_id, raw_memory_content, existing_embedding
                                 )
                     
                     if existing_embedding is not None:
-                        # Calculate similarity
                         similarity = self._cosine_similarity(new_embedding, existing_embedding)
-                        
-                        # Use embedding similarity threshold from valves
                         if similarity >= self.valves.embedding_similarity_threshold:
                             logger.info(f"Duplicate detected via embeddings (similarity: {similarity:.3f}) for memory {memory_id}")
-                            return True, new_embedding  # Return the embedding we generated
+                            return True, new_embedding
                     else:
                         logger.warning(f"Could not generate embedding for existing memory {memory_id}")
             else:
-                # Use text-based similarity - no embedding to cache
                 is_dup = await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
                 return is_dup, None
                         
-            return False, new_embedding if self.valves.use_embeddings_for_deduplication else None  # Not duplicate, return embedding for caching
+            return False, new_embedding if self.valves.use_embeddings_for_deduplication else None
             
         except Exception as e:
             logger.error(f"Error during duplicate check: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
-            # If deduplication fails, err on the side of caution and keep the memory
             return False, None
+
     async def _check_text_similarity(self, text: str, all_memories: List[Any], exclude_id: str = None) -> bool:
         """Check for text-based similarity using difflib."""
-        import difflib
-        
-        # Helper for normalization (could be moved to a shared utility)
-        # def normalize_text(t):
-        #     import re
-        #     normalized = re.sub(r'[^\w\s]', '', t.strip().lower())
-        #     normalized = re.sub(r'\bs\b', '', normalized)
-        #     normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
-        #     normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
-        #     normalized = re.sub(r'\s+', ' ', normalized).strip()
-        #     return normalized
 
         normalized_text = self._normalize_text(text)
         
-        for i, memory in enumerate(all_memories):
-            memory_id = memory.id if hasattr(memory, 'id') else memory.get('id')
-            
-            # SAFETY: Skip comparing memory against itself
-            if exclude_id and str(memory_id) == str(exclude_id):
+        for memory in all_memories:
+            memory_id = self._get_memory_id(memory)
+            if not memory_id:
                 continue
-                
-            memory_content = memory.content if hasattr(memory, 'content') else memory.get('content')
-            
-            # Extract raw content from formatted memory for comparison
-            raw_memory_content = memory_content
-            if '[Tags:' in memory_content and '[Memory Bank:' in memory_content:
-                tags_end = memory_content.find(']', memory_content.find('[Tags:'))
-                if tags_end != -1:
-                    bank_start = memory_content.find('[Memory Bank:', tags_end)
-                    if bank_start != -1:
-                        raw_memory_content = memory_content[tags_end + 1:bank_start].strip()
+            if exclude_id and memory_id == normalize_memory_id(exclude_id):
+                continue
 
-            # Calculate text similarity using normalized raw content
+            raw_memory_content = self._get_memory_record(memory).content
+            if not raw_memory_content:
+                continue
+
             normalized_raw = self._normalize_text(raw_memory_content)
             similarity = difflib.SequenceMatcher(None, normalized_text, normalized_raw).ratio()
             
@@ -1182,6 +1925,106 @@ class MemoryPipeline:
                 return True
                 
         return False
+
+    # --- Memory Pruning ---
+    async def _prune_old_memories(self, user_id: str) -> int:
+        """Prune memories when total count exceeds max_total_memories.
+        
+        Returns:
+            Number of memories deleted
+        """
+        try:
+            # Get all memories for the user
+            all_memories = Memories.get_memories_by_user_id(user_id)
+            
+            if not all_memories:
+                return 0
+            
+            total_count = len(all_memories)
+            max_allowed = self.valves.max_total_memories
+            
+            if total_count <= max_allowed:
+                logger.debug(f"Memory count ({total_count}) within limit ({max_allowed}), no pruning needed")
+                return 0
+            
+            # Calculate how many to delete
+            num_to_delete = total_count - max_allowed
+            logger.info(f"Pruning {num_to_delete} memories (total: {total_count}, limit: {max_allowed})")
+            
+            # Select memories to delete based on strategy
+            if self.valves.pruning_strategy == "fifo":
+                # Sort by created_at (oldest first)
+                sorted_memories = sorted(
+                    all_memories, 
+                    key=lambda m: m.created_at if hasattr(m, 'created_at') else 0
+                )
+                memories_to_delete = sorted_memories[:num_to_delete]
+                logger.info(f"Using FIFO strategy: deleting {num_to_delete} oldest memories")
+                
+            elif self.valves.pruning_strategy == "least_relevant":
+                scored_memories = []
+                for m in all_memories:
+                    confidence = self._get_memory_record(m).confidence or 1.0
+                    if hasattr(m, 'created_at') and m.created_at:
+                        try:
+                            age_days = (datetime.now(timezone.utc) - m.created_at).days
+                        except TypeError:
+                            age_days = 9999
+                    else:
+                        age_days = 9999
+
+                    relevance_score = confidence - (age_days * 0.01)
+                    scored_memories.append((relevance_score, m))
+                
+                # Sort by relevance score (lowest first)
+                sorted_memories = sorted(scored_memories, key=lambda x: x[0])
+                memories_to_delete = [m for _, m in sorted_memories[:num_to_delete]]
+                logger.info(f"Using least_relevant strategy: deleting {num_to_delete} least relevant memories")
+            else:
+                logger.warning(f"Unknown pruning strategy: {self.valves.pruning_strategy}, defaulting to FIFO")
+                sorted_memories = sorted(
+                    all_memories,
+                    key=lambda m: m.created_at if hasattr(m, 'created_at') else 0
+                )
+                memories_to_delete = sorted_memories[:num_to_delete]
+            
+            # Delete the selected memories
+            deleted_count = 0
+            for memory in memories_to_delete:
+                try:
+                    memory_id = self._get_memory_id(memory)
+                    if not memory_id:
+                        continue
+
+                    Memories.delete_memory_by_id(memory_id)
+
+                    if VECTOR_DB_CLIENT:
+                        try:
+                            VECTOR_DB_CLIENT.delete(
+                                collection_name=f"user-memory-{user_id}",
+                                ids=[memory_id]
+                            )
+                            logger.debug(f"Pruning: Deleted memory {memory_id} from vector DB")
+                        except Exception as vec_err:
+                            logger.warning(f"Pruning: Failed to delete memory {memory_id} from vector DB: {vec_err}")
+
+                    await self.embedding_manager.delete_embedding_persistent(
+                        user_id, memory_id
+                    )
+                    deleted_count += 1
+                    logger.debug(f"Pruning: Deleted memory {memory_id}")
+                    
+                except Exception as del_err:
+                    logger.error(
+                        f"Pruning: Failed to delete memory {getattr(memory, 'id', 'unknown')}: {del_err}"
+                    )
+            
+            logger.info(f"Pruning complete: deleted {deleted_count}/{num_to_delete} memories")
+            return deleted_count
+            
+        except Exception as e:
+            logger.exception(f"Error during memory pruning: {e}")
+            return 0
 
     # --- Summarization ---
     async def cluster_and_summarize(
@@ -1192,69 +2035,84 @@ class MemoryPipeline:
         
         # 1. Fetch memories
         try:
-            memories = Memories.get_memories_by_user_id(user_id)
-            logger.info(f"Found {len(memories) if memories else 0} memories for user {user_id}")
-            
-            if not memories:
+            all_memories = Memories.get_memories_by_user_id(user_id)
+            logger.info(f"Found {len(all_memories) if all_memories else 0} memories for user {user_id}")
+
+            if not all_memories:
                 logger.info(f"No memories found for user {user_id}, skipping summarization")
                 return
-                
+
+            memories = []
+            now = datetime.now(timezone.utc)
+            for memory in all_memories:
+                memory_record = self._get_memory_record(memory)
+                if not memory_record.content or "summary" in memory_record.tags:
+                    continue
+
+                created_at = getattr(memory, "created_at", None)
+                if self.valves.summarization_min_memory_age_days > 0:
+                    if not created_at:
+                        continue
+                    if getattr(created_at, "tzinfo", None) is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    age_days = (now - created_at).days
+                    if age_days < self.valves.summarization_min_memory_age_days:
+                        continue
+
+                memories.append(memory)
+
             if len(memories) < self.valves.summarization_min_cluster_size:
-                logger.info(f"Only {len(memories)} memories found for user {user_id}, need at least {self.valves.summarization_min_cluster_size} for clustering")
+                logger.info(
+                    f"Only {len(memories)} eligible memories found for user {user_id}, need at least {self.valves.summarization_min_cluster_size} for clustering"
+                )
                 return
         except Exception as e:
             logger.exception(f"Summarization fetch failed: {e}")
             return
 
-        # 2. Get embeddings (use cache when possible)
         logger.info(f"Processing embeddings for {len(memories)} memories")
-        contents = [m.content for m in memories]
-        ids = [m.id for m in memories]
-        
-        # Check cache hierarchy: memory -> persistent -> generate
+        contents = [self._get_memory_record(m).content for m in memories]
+        ids = [self._get_memory_id(m) for m in memories]
+
         embeddings = []
         uncached_indices = []
         uncached_contents = []
-        
-        for i, (memory_id, content) in enumerate(zip(ids, contents, strict=True)):            # Check in-memory cache first
+
+        for i, (memory_id, content) in enumerate(zip(ids, contents, strict=True)):
+            if not memory_id or not content:
+                embeddings.append(None)
+                continue
             cached_embedding = await self.embedding_manager.cache.get(memory_id)
             if cached_embedding is not None:
                 embeddings.append(cached_embedding)
             else:
-                # Check persistent cache
                 persistent_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
                 if persistent_embedding is not None:
-                    # Cache in memory for this session
                     await self.embedding_manager.cache.set(memory_id, persistent_embedding)
                     embeddings.append(persistent_embedding)
                 else:
-                    # Need to generate
-                    embeddings.append(None)  # Placeholder
+                    embeddings.append(None)
                     uncached_indices.append(i)
                     uncached_contents.append(content)
-        
-        # Generate embeddings for uncached memories
+
         if uncached_contents:
             logger.info(f"Generating embeddings for {len(uncached_contents)} uncached memories (using cache for {len(memories) - len(uncached_contents)})")
             new_embeddings = await self.embedding_manager.get_embeddings_batch(uncached_contents)
             
-            # Update cache and embeddings list
             for idx, new_emb in zip(uncached_indices, new_embeddings, strict=True):
                 if new_emb is not None:
                     embeddings[idx] = new_emb
-                    # Cache in memory
                     await self.embedding_manager.cache.set(ids[idx], new_emb)
             
-            # Store persistently in batch
             await self.embedding_manager.store_embeddings_batch_persistent(
                 user_id, 
                 [str(ids[idx]) for idx in uncached_indices],
                 uncached_contents,
-                new_embeddings  # Already aligned with uncached_contents
+                new_embeddings
             )
         else:
             logger.info(f"Using cached embeddings for all {len(memories)} memories")
-            new_embeddings = []  # No new embeddings when all are cached
+            new_embeddings = []
 
         valid_indices = [i for i, e in enumerate(embeddings) if e is not None]
         newly_generated_count = len([e for e in new_embeddings if e is not None]) if new_embeddings else 0
@@ -1264,8 +2122,7 @@ class MemoryPipeline:
             logger.info(f"Only {len(valid_indices)} valid embeddings, need at least {self.valves.summarization_min_cluster_size} for clustering")
             return
 
-        # 3. Simple Greedy Clustering
-        logger.info(f"Starting clustering with similarity threshold {self.valves.summarization_similarity_threshold}")
+        logger.info(f"Starting complete linkage clustering with similarity threshold {self.valves.summarization_similarity_threshold}")
         clusters = []
         visited = set()
 
@@ -1275,31 +2132,42 @@ class MemoryPipeline:
 
             cluster = [i]
             visited.add(i)
-            vec_i = embeddings[i]
 
             for j in valid_indices:
                 if j in visited:
                     continue
 
                 vec_j = embeddings[j]
-                sim = self._cosine_similarity(vec_i, vec_j)
-
-                if sim >= self.valves.summarization_similarity_threshold:
+                similar_to_all = True
+                for cluster_idx in cluster:
+                    vec_cluster = embeddings[cluster_idx]
+                    sim = self._cosine_similarity(vec_j, vec_cluster)
+                    
+                    if sim < self.valves.summarization_similarity_threshold:
+                        similar_to_all = False
+                        break
+                
+                if similar_to_all:
                     cluster.append(j)
                     visited.add(j)
 
+                    if len(cluster) >= self.valves.summarization_max_cluster_size:
+                        break
+
             if len(cluster) >= self.valves.summarization_min_cluster_size:
                 clusters.append(cluster)
-                logger.info(f"Found cluster with {len(cluster)} memories (similarity >= {self.valves.summarization_similarity_threshold})")
+                logger.info(f"Found cluster with {len(cluster)} memories (all members mutually similar >= {self.valves.summarization_similarity_threshold})")
 
         logger.info(f"Found {len(clusters)} clusters ready for summarization")
 
-        # 4. Summarize Clusters
+        summaries_created = 0
+        source_memories_deleted = 0
         for cluster_indices in clusters:
             try:
                 cluster_memories = [memories[i] for i in cluster_indices]
-                cluster_text = "\n".join([f"- {m.content}" for m in cluster_memories])
-
+                cluster_text = "\n".join(
+                    [f"- {self._get_memory_record(m).content}" for m in cluster_memories]
+                )
 
                 summary = await query_llm_func(
                     self.valves.summarization_memory_prompt,
@@ -1307,31 +2175,36 @@ class MemoryPipeline:
                 )
 
                 if summary:
-                    # 5. Execute Changes Transactionally: Save before Delete
+                    confidence_scores = []
+                    for m in cluster_memories:
+                        conf = self._get_memory_record(m).confidence
+                        if conf is not None:
+                            confidence_scores.append(conf)
+
+                    avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.85
+
                     op = {
                         "operation": "NEW",
-                        "content": summary,
+                        "content": re.sub(r"\s+", " ", summary).strip(),
                         "tags": ["summary"],
                         "memory_bank": "General",
-                        "confidence": 1.0,
+                        "confidence": avg_confidence,
                     }
 
-                    # Process the new summary first (skip deduplication for summaries)
                     success_ops = await self.process_memory_operations([op], user_id, skip_deduplication=True)
 
                     if success_ops:
                         logger.info(
                             f"Summarization: New consolidated summary saved successfully. Now removing {len(cluster_memories)} source memories."
                         )
-                        # ONLY delete old if saving the new summary succeeded
                         for m in cluster_memories:
                             try:
-                                memory_id = str(m.id)
-                                
-                                # Delete from database
+                                memory_id = self._get_memory_id(m)
+                                if not memory_id:
+                                    continue
+
                                 Memories.delete_memory_by_id(memory_id)
-                                
-                                # Delete from vector database if available
+
                                 if VECTOR_DB_CLIENT:
                                     try:
                                         VECTOR_DB_CLIENT.delete(
@@ -1341,16 +2214,20 @@ class MemoryPipeline:
                                         logger.debug(f"Summarization: Deleted memory {memory_id} from vector DB")
                                     except Exception as vec_err:
                                         logger.warning(f"Summarization: Failed to delete memory {memory_id} from vector DB: {vec_err}")
-                                
+
+                                await self.embedding_manager.delete_embedding_persistent(
+                                    user_id, memory_id
+                                )
+                                source_memories_deleted += 1
                             except Exception as del_err:
                                 logger.error(
-                                    f"Summarization: Failed to delete source memory {m.id}: {del_err}"
+                                    f"Summarization: Failed to delete source memory {getattr(m, 'id', 'unknown')}: {del_err}"
                                 )
 
+                        summaries_created += 1
                         logger.info(
-                            f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)"
+                            f"Summarized {len(cluster_memories)} memories into new summary (Confidence {avg_confidence:.2f})"
                         )
-                        return f"Consolidated {len(cluster_memories)} memories into a summary."
                     else:
                         logger.error(
                             "Summarization: Failed to save new summary. Aborting source memory deletion to prevent data loss."
@@ -1359,6 +2236,12 @@ class MemoryPipeline:
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
                 logger.exception(f"Memory operation failed: {e}")
+
+        if summaries_created:
+            return (
+                f"Consolidated {source_memories_deleted} memories into "
+                f"{summaries_created} summary {'memory' if summaries_created == 1 else 'memories'}."
+            )
 
         return None
 
@@ -2021,7 +2904,11 @@ Your output must be valid JSON only. No additional text.""",
     def _check_and_handle_valve_changes(self):
         """Detect if valves have changed and restart tasks if needed."""
         # Hash important valve settings that affect background tasks
-        valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
+        valve_str = (
+            f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_"
+            f"{self.valves.enable_error_logging_task}_{self.valves.error_logging_interval}_"
+            f"{self.valves.enable_vector_cleanup_task}_{self.valves.vector_cleanup_interval}"
+        )
         new_hash = hashlib.md5(valve_str.encode()).hexdigest()
         
         if self._valve_hash is None:
@@ -2056,13 +2943,69 @@ Your output must be valid JSON only. No additional text.""",
         """Restart background tasks with new valve settings."""
         await self.task_manager.stop_tasks()
         self._tasks_started = False
-        self.task_manager.start_tasks()
-        self._tasks_started = True
+        self._tasks_started = self.task_manager.start_tasks()
         logger.info("Background tasks restarted with new valve values")
 
     async def cleanup(self):
         await self.task_manager.stop_tasks()
         await self.embedding_manager.cleanup()
+
+    def _load_user_valves(self, __user__: Optional[Dict[str, Any]]) -> "Filter.UserValves":
+        raw_valves = (__user__ or {}).get("valves", {})
+        if hasattr(raw_valves, "model_dump"):
+            return self.UserValves(**raw_valves.model_dump())
+        if hasattr(raw_valves, "dict"):
+            return self.UserValves(**raw_valves.dict())
+        if isinstance(raw_valves, dict):
+            return self.UserValves(**raw_valves)
+        if isinstance(raw_valves, self.UserValves):
+            return raw_valves
+        return self.UserValves()
+
+    def _get_recent_user_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
+        user_messages = []
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            text = extract_message_text(message.get("content"))
+            if text:
+                user_messages.append(text)
+        return user_messages[-self.valves.recent_messages_n :]
+
+    def _format_relevant_memories(self, relevant_memories: List[Any]) -> str:
+        formatted_memories = []
+        for index, memory in enumerate(relevant_memories, start=1):
+            memory_record = parse_stored_memory(
+                memory.content if hasattr(memory, "content") else memory.get("content")
+            )
+            if not memory_record.content:
+                continue
+            content = truncate_text(
+                memory_record.content, self.valves.max_injected_memory_length
+            )
+            if self.valves.memory_format == "numbered":
+                formatted_memories.append(f"{index}. {content}")
+            elif self.valves.memory_format == "paragraph":
+                formatted_memories.append(content)
+            else:
+                formatted_memories.append(f"- {content}")
+
+        if not formatted_memories:
+            return ""
+
+        if self.valves.memory_format == "paragraph":
+            return "User Memories:\n" + " ".join(formatted_memories)
+        return "User Memories:\n" + "\n".join(formatted_memories)
+
+    async def _emit_queued_notifications(self, __event_emitter__) -> None:
+        while self.notification_queue:
+            msg = self.notification_queue.pop(0)
+            bg_status_dict = {
+                "type": "status",
+                "data": {"description": f"🧹 {msg}", "done": True},
+            }
+            if __event_emitter__:
+                await __event_emitter__(bg_status_dict)
 
     # --------------------------------------------------------------------------
     # Helper: LLM Query Wrapper
@@ -2133,24 +3076,12 @@ Your output must be valid JSON only. No additional text.""",
         if not __user__ or not body.get("messages"):
             return body
 
-        # Safe UserValves instantiation
-        raw_valves = __user__.get("valves", {})
-        if hasattr(raw_valves, "model_dump"):
-            user_valves = self.UserValves(**raw_valves.model_dump())
-        elif hasattr(raw_valves, "dict"):
-            user_valves = self.UserValves(**raw_valves.dict())
-        elif isinstance(raw_valves, dict):
-            user_valves = self.UserValves(**raw_valves)
-        elif isinstance(raw_valves, self.UserValves):
-            user_valves = raw_valves
-        else:
-            user_valves = self.UserValves()
+        user_valves = self._load_user_valves(__user__)
         if not user_valves.enabled:
             return body
 
         if not self._tasks_started:
-            self.task_manager.start_tasks()
-            self._tasks_started = True
+            self._tasks_started = self.task_manager.start_tasks()
         
         # Check if valves have changed and restart tasks if needed
         self._check_and_handle_valve_changes()
@@ -2158,27 +3089,19 @@ Your output must be valid JSON only. No additional text.""",
         user_id = __user__["id"]
         self.seen_users.add(user_id)  # Track active user
         messages = body["messages"]
-        last_message_content = messages[-1]["content"]
-
-        # Handle multimodal content (list of dicts)
-        if isinstance(last_message_content, list):
-            last_message = " ".join(
-                [
-                    m.get("text", "")
-                    for m in last_message_content
-                    if isinstance(m, dict) and m.get("type") == "text"
-                ]
-            ).strip()
-        else:
-            last_message = last_message_content
+        last_message = extract_message_text(messages[-1].get("content"))
 
         # Skip command processing
         if last_message.startswith("/"):
             logger.info("Skipping memory processing for command")
+            if user_valves.show_status:
+                await self._emit_queued_notifications(__event_emitter__)
             return body
 
         if not last_message:
             logger.debug("Skipping memory processing for empty message.")
+            if user_valves.show_status:
+                await self._emit_queued_notifications(__event_emitter__)
             return body
 
         # Pipeline
@@ -2205,42 +3128,30 @@ Your output must be valid JSON only. No additional text.""",
             logger.debug(f"Memory retrieval: no existing memories found for user {user_id}")
 
         # 3. Inject into system prompt
-        if relevant_memories:
-            context_text = "User Memories:\n" + "\n".join(
-                [f"- {m.content}" for m in relevant_memories]
-            )
+        if relevant_memories and self.valves.show_memories:
+            context_text = self._format_relevant_memories(relevant_memories)
 
-            # Find system message or insert one
-            if messages[0]["role"] == "system":
-                messages[0]["content"] += f"\n\n{context_text}"
-            else:
-                messages.insert(0, {"role": "system", "content": context_text})
+            if context_text:
+                if messages[0]["role"] == "system":
+                    messages[0]["content"] += f"\n\n{context_text}"
+                else:
+                    messages.insert(0, {"role": "system", "content": context_text})
 
-            # Show status if enabled
-            if user_valves.show_status:
-                # 1. Recall Notifications
-                count = len(relevant_memories)
-                if count > 0:
-                    suffix = "memory" if count == 1 else "memories"
-                    status_dict = {
-                        "type": "status",
-                        "data": {
-                            "description": f"🧠 Recalled {count} {suffix}.",
-                            "done": True,
-                        },
-                    }
-                    if __event_emitter__:
-                        await __event_emitter__(status_dict)
+        if user_valves.show_status:
+            count = len(relevant_memories)
+            if count > 0:
+                suffix = "memory" if count == 1 else "memories"
+                status_dict = {
+                    "type": "status",
+                    "data": {
+                        "description": f"🧠 Recalled {count} {suffix}.",
+                        "done": True,
+                    },
+                }
+                if __event_emitter__:
+                    await __event_emitter__(status_dict)
 
-                # 2. Background Notifications (queued)
-                while self.notification_queue:
-                    msg = self.notification_queue.pop(0)
-                    bg_status_dict = {
-                        "type": "status",  # Or "status" with a different message
-                        "data": {"description": f"🧹 {msg}", "done": True},
-                    }
-                    if __event_emitter__:
-                        await __event_emitter__(bg_status_dict)
+            await self._emit_queued_notifications(__event_emitter__)
 
         return body
 
@@ -2255,30 +3166,20 @@ Your output must be valid JSON only. No additional text.""",
         if not __user__ or not body.get("messages"):
             return body
 
-        # Safe UserValves instantiation
-        raw_valves = __user__.get("valves", {})
-        if hasattr(raw_valves, "model_dump"):
-            user_valves = self.UserValves(**raw_valves.model_dump())
-        elif hasattr(raw_valves, "dict"):
-            user_valves = self.UserValves(**raw_valves.dict())
-        elif isinstance(raw_valves, dict):
-            user_valves = self.UserValves(**raw_valves)
-        elif isinstance(raw_valves, self.UserValves):
-            user_valves = raw_valves
-        else:
-            user_valves = self.UserValves()
+        user_valves = self._load_user_valves(__user__)
         if not user_valves.enabled:
             return body
 
         user_id = __user__["id"]
         messages = body["messages"]
 
-        # Get last user message
-        user_message = ""
-        for m in reversed(messages):
-            if m["role"] == "user":
-                user_message = m["content"]
-                break
+        recent_user_messages = self._get_recent_user_messages(messages)
+        user_message = "\n".join(recent_user_messages).strip()
+        retrieval_query = recent_user_messages[-1] if recent_user_messages else ""
+
+        if retrieval_query.startswith("/"):
+            logger.info("Skipping memory extraction for command")
+            return body
 
         # Pipeline
         pipeline = MemoryPipeline(
@@ -2287,10 +3188,22 @@ Your output must be valid JSON only. No additional text.""",
 
         # Identify Memories
         if user_message:
+            try:
+                all_memories = Memories.get_memories_by_user_id(user_id)
+            except Exception as e:
+                logger.error(f"Failed to fetch memories for extraction context: {e}")
+                all_memories = []
+
+            context_memories = []
+            if all_memories and retrieval_query:
+                context_memories = await pipeline.get_relevant_memories(
+                    retrieval_query, user_id, all_memories
+                )
+
             # Pass our _query_llm as callback
             ops = await pipeline.identify_memories(
                 user_message,
-                context_memories=[],
+                context_memories=context_memories,
                 query_llm_func=self._query_llm,
             )
             logger.info(f"Memory extraction: identified {len(ops)} potential memories from user message")
@@ -2404,7 +3317,7 @@ Your output must be valid JSON only. No additional text.""",
         try:
             # Get all memory IDs from database
             db_memories = Memories.get_memories_by_user_id(user_id)
-            valid_ids = {str(m.id) for m in db_memories}
+            valid_ids = {normalize_memory_id(m.id) for m in db_memories}
             
             collection_name = f"user-memory-{user_id}"
             
@@ -2412,9 +3325,23 @@ Your output must be valid JSON only. No additional text.""",
             try:
                 # Try to get all items from collection
                 result = VECTOR_DB_CLIENT.get(collection_name=collection_name)
-                if result and 'ids' in result:
-                    vector_ids = result['ids']
-                else:
+                vector_ids = []
+                if isinstance(result, dict):
+                    vector_ids = result.get("ids") or []
+                elif hasattr(result, "ids"):
+                    vector_ids = getattr(result, "ids") or []
+                elif isinstance(result, list):
+                    vector_ids = [
+                        item.get("id", item) if isinstance(item, dict) else item
+                        for item in result
+                    ]
+
+                if vector_ids and isinstance(vector_ids[0], list):
+                    vector_ids = vector_ids[0]
+
+                vector_ids = [normalize_memory_id(vector_id) for vector_id in vector_ids]
+
+                if not vector_ids:
                     logger.warning(f"Unable to retrieve vector IDs for cleanup - collection may not exist")
                     return {"db_memories": len(valid_ids), "orphans_deleted": 0}
             except Exception as e:
