@@ -1256,13 +1256,14 @@ class Mem0SyncManager:
         self._sqlite_file = os.path.join(self._cache_root, "mem0_sync.sqlite")
         self._reconcile_locks: Dict[str, asyncio.Lock] = {}
         self._last_reconcile_check: Dict[str, float] = {}
-        self._reconcile_cooldown_seconds = 30.0
 
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
         if self._session:
             await self._session.close()
             self._session = None
+        self._reconcile_locks.clear()
+        self._last_reconcile_check.clear()
 
     def _is_enabled(self) -> bool:
         valves = self.get_valves()
@@ -1448,6 +1449,27 @@ class Mem0SyncManager:
             lock = asyncio.Lock()
             self._reconcile_locks[user_id] = lock
         return lock
+
+    def _cleanup_reconcile_state(self, user_id: str) -> None:
+        """Remove reconciliation state for user_id if it is no longer in use."""
+        lock = self._reconcile_locks.get(user_id)
+        if lock is None:
+            self._last_reconcile_check.pop(user_id, None)
+            return
+
+        has_waiters = bool(getattr(lock, "_waiters", None))
+        if not lock.locked() and not has_waiters:
+            del self._reconcile_locks[user_id]
+            self._last_reconcile_check.pop(user_id, None)
+
+    def _get_reconcile_cooldown_seconds(self) -> float:
+        try:
+            cooldown = float(
+                getattr(self.get_valves(), "mem0_reconcile_cooldown_seconds", 30.0)
+            )
+        except (TypeError, ValueError):
+            cooldown = 30.0
+        return max(0.0, cooldown)
 
     def _render_mem0_user_id(self, user_id: str) -> str:
         template = str(
@@ -1655,46 +1677,50 @@ class Mem0SyncManager:
             return result
 
         lock = self._get_reconcile_lock(user_id)
-        async with lock:
-            now = time.monotonic()
-            last_check = self._last_reconcile_check.get(user_id, 0.0)
-            if not force and (now - last_check) < self._reconcile_cooldown_seconds:
-                result["skipped"] = 1
+        try:
+            async with lock:
+                now = time.monotonic()
+                last_check = self._last_reconcile_check.get(user_id, 0.0)
+                cooldown_seconds = self._get_reconcile_cooldown_seconds()
+                if not force and (now - last_check) < cooldown_seconds:
+                    result["skipped"] = 1
+                    return result
+                self._last_reconcile_check[user_id] = now
+
+                mappings = await self._list_mappings(user_id)
+                if not mappings:
+                    return result
+
+                for owui_memory_id, mem0_memory_id in mappings:
+                    if owui_memory_id not in local_memory_ids:
+                        await self._delete_mapping(user_id, owui_memory_id)
+                        result["stale_mappings"] += 1
+                        continue
+
+                    exists_in_mem0 = await self._mem0_memory_exists(mem0_memory_id)
+                    if exists_in_mem0 is None:
+                        continue
+
+                    result["checked"] += 1
+                    if exists_in_mem0:
+                        continue
+
+                    deleted = await delete_local_memory(owui_memory_id)
+                    if deleted:
+                        local_memory_ids.discard(owui_memory_id)
+                        await self._delete_mapping(user_id, owui_memory_id)
+                        result["deleted"] += 1
+                        logger.info(
+                            f"Reconciled deleted Mem0 memory back into Open WebUI (Open WebUI ID: {owui_memory_id}, Mem0 ID: {mem0_memory_id})"
+                        )
+                    else:
+                        logger.warning(
+                            f"Mem0 memory {mem0_memory_id} is gone but local cleanup failed for Open WebUI memory {owui_memory_id}"
+                        )
+
                 return result
-            self._last_reconcile_check[user_id] = now
-
-            mappings = await self._list_mappings(user_id)
-            if not mappings:
-                return result
-
-            for owui_memory_id, mem0_memory_id in mappings:
-                if owui_memory_id not in local_memory_ids:
-                    await self._delete_mapping(user_id, owui_memory_id)
-                    result["stale_mappings"] += 1
-                    continue
-
-                exists_in_mem0 = await self._mem0_memory_exists(mem0_memory_id)
-                if exists_in_mem0 is None:
-                    continue
-
-                result["checked"] += 1
-                if exists_in_mem0:
-                    continue
-
-                deleted = await delete_local_memory(owui_memory_id)
-                if deleted:
-                    local_memory_ids.discard(owui_memory_id)
-                    await self._delete_mapping(user_id, owui_memory_id)
-                    result["deleted"] += 1
-                    logger.info(
-                        f"Reconciled deleted Mem0 memory back into Open WebUI (Open WebUI ID: {owui_memory_id}, Mem0 ID: {mem0_memory_id})"
-                    )
-                else:
-                    logger.warning(
-                        f"Mem0 memory {mem0_memory_id} is gone but local cleanup failed for Open WebUI memory {owui_memory_id}"
-                    )
-
-            return result
+        finally:
+            self._cleanup_reconcile_state(user_id)
 
     async def sync_memory_create(
         self,
@@ -2279,8 +2305,8 @@ class MemoryPipeline:
     async def identify_memories(
         self,
         user_message: str,
-        context_memories: List[Dict[str, Any]] = None,
-        query_llm_func: Callable = None,
+        context_memories: Optional[List[Dict[str, Any]]] = None,
+        query_llm_func: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
         """Identify potential memories from user message using LLM."""
         if not user_message:
@@ -2755,7 +2781,7 @@ class MemoryPipeline:
 
         return success_ops
 
-    async def _is_duplicate(self, text: str, user_id: str, exclude_id: str = None, all_memories_override: List[Any] = None) -> Tuple[bool, Optional[np.ndarray]]:
+    async def _is_duplicate(self, text: str, user_id: str, exclude_id: Optional[str] = None, all_memories_override: Optional[List[Any]] = None) -> Tuple[bool, Optional[np.ndarray]]:
         """Check if the given text is a duplicate of existing memories.
         
         Returns:
@@ -3306,6 +3332,10 @@ class Filter:
             default=30,
             description="Timeout in seconds for Mem0 API requests.",
         )
+        mem0_reconcile_cooldown_seconds: float = Field(
+            default=30.0,
+            description="Minimum seconds between Mem0 delete-reconciliation checks for the same user during inbound requests.",
+        )
         mem0_user_id_template: str = Field(
             default="owui:{user_id}",
             description="Template used to map an Open WebUI user id into a Mem0 user id. May include {user_id} for per-user mapping, or be a fixed string such as 'jefe' to force all mirrored memories into one Mem0 user/entity.",
@@ -3783,12 +3813,18 @@ Your output must be valid JSON only. No additional text.""",
                 raise ValueError(f"{info.field_name} must be a non-negative float")
             return float(v)
 
+        @field_validator("mem0_reconcile_cooldown_seconds")
+        def check_non_negative_mem0_cooldown(cls, v, info):
+            if not isinstance(v, (int, float)) or v < 0.0:
+                raise ValueError(f"{info.field_name} must be a non-negative float")
+            return float(v)
+
         @field_validator("timezone")
         def check_valid_timezone(cls, v):
             try:
                 pytz.timezone(v)
             except Exception as e:
-                raise ValueError(f"Invalid timezone string in config: {v}")
+                raise ValueError(f"Invalid timezone string in config: {v}") from e
             return v
 
         @model_validator(mode="after")
@@ -3889,7 +3925,7 @@ Your output must be valid JSON only. No additional text.""",
             return False
         
         if new_hash != self._valve_hash:
-            logger.info(f"Valve changes detected! Restarting background tasks...")
+            logger.info("Valve changes detected! Restarting background tasks...")
             self._valve_hash = new_hash
             # Restart tasks with new valve values
             if self._tasks_started:

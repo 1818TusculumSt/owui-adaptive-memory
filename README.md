@@ -154,6 +154,7 @@ Examples:
 - `mem0_api_key`
 - `mem0_app_id`
 - `mem0_timeout_seconds`
+- `mem0_reconcile_cooldown_seconds`
 - `mem0_user_id_template`
 - `mem0_user_id_override`
 
