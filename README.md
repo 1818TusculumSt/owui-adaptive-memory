@@ -1,145 +1,160 @@
-# Adaptive Memory for Open WebUI 🧠
+# Adaptive Memory for Open WebUI
 
-Give your AI persistent memory across conversations. It remembers your preferences, facts about you, and past discussions automatically.
+Give your Open WebUI assistant persistent memory across conversations.
 
-## ✨ What This Does
+This function remembers useful things you tell it, brings back relevant memories in later chats, and can optionally mirror those memories to Mem0.
 
-This plugin makes your AI remember things about you between chats. Tell it once that you prefer Python over JavaScript, and it'll remember for future conversations. No manual management needed.
+## What It Does
 
-**How it works:**
-1. You chat normally with your AI
-2. The plugin extracts important facts about you from the conversation
-3. Those facts get stored and retrieved automatically in future chats
-4. Your AI has context about you without you repeating yourself
+Once enabled, the function works in the background to:
+- Save important facts, preferences, goals, and relationships from your conversations
+- Recall relevant memories when you start a new chat or continue an old one
+- Avoid saving obvious duplicates
+- Keep memory growth under control with pruning and summarization
+- Optionally mirror memory changes to Mem0
 
-## 🙏 Credit Where It's Due
+Example:
+- You say: "I prefer Python over JavaScript."
+- Later, when you ask for coding help, that preference can be recalled automatically.
 
-This is a fork of [gramanoid's owui-adaptive-memory](https://github.com/gramanoid/owui-adaptive-memory). His original plugin proved the concept works and laid the foundation.
+## How It Works
 
-**Why fork it?**
+At a high level:
+1. You chat normally.
+2. The function looks at your recent user messages and asks an LLM to identify memories worth saving.
+3. Those memories are stored in Open WebUI's memory system.
+4. On future messages, the function finds the most relevant saved memories and injects them back into context.
 
-The original worked but the code was difficult to follow and had bugs that made it unreliable. I wanted:
-- **Cleaner, more elegant code** that's easier to understand and modify
-- **Shorter, more maintainable architecture** without unnecessary complexity
-- **Clear, understandable memory processes** so you can actually see what's happening
+Everything is designed to stay mostly automatic once configured.
 
-Plus I fixed the production issues:
-- Memory deletions left orphaned embeddings in the vector database
-- Summarization created memory leaks
-- Background tasks duplicated themselves after plugin reloads
-- No UPDATE operation support
-- Lock management issues
+## Installation
 
-I added proper vector database synchronization, background task lifecycle management, comprehensive error handling, and a persistent embedding cache to reduce API calls.
+1. Upload `adaptive_memory_v4.0.py` in Open WebUI Functions.
+2. Open the function settings and configure the valves you want.
+3. Enable the function for the model or models you use.
 
-Recent improvements:
-- Better extraction and recall quality by embedding the actual memory text instead of the metadata wrapper
-- Safer deduplication, pruning, and summarization behavior
-- Cleaner memory injection with configurable formatting
-- Persistent embedding cache migrated to a private SQLite sidecar with lazy import from legacy JSON cache files
-- Optional Mem0 mirroring for memory create, update, and delete operations
-- Configurable Mem0 user routing with global and per-user override support
-- Safer Mem0 API handling with the documented `/v1/memories/` endpoint and fallback to `/v1/memories`
+## Recommended Setup
 
-**I actively maintain and use this function.**
+### For Most People
 
-## 📦 Installation
+Use:
+- `embedding_source = auto`
+- `embedding_provider_type = local`
+- `embedding_model_name = all-MiniLM-L6-v2`
+- your normal Ollama or OpenAI-compatible model for memory extraction
 
-1. Download `adaptive_memory_v4.0.py`
-2. In Open WebUI: **Functions** → **+** → Upload the file
-3. Configure the settings (called "valves" in OWUI)
-4. Enable it for your models
+This gives you a solid default setup with local embeddings when available.
 
-## ⚙️ Configuration
+### If You Want Mem0 Mirroring
 
-The important settings:
+Enable:
+- `enable_mem0_sync = true`
 
-**Embedding Model:**
-- Use `local` with `all-MiniLM-L6-v2` for offline/free operation
-- Or use `openai_compatible` with any API endpoint
+Then configure:
+- `mem0_api_base_url`
+- `mem0_api_key`
+- `mem0_app_id`
 
-**LLM Model:**
-- Point to your Ollama instance or any OpenAI-compatible API
-- This is what extracts memories from conversations
+If you want all mirrored memories to go to one Mem0 user ID, set:
+- `mem0_user_id_override = jefe`
 
-**Memory Settings:**
-- `max_total_memories`: How many memories to keep per user (default: 200)
-- `summarization_interval`: How often to consolidate old memories (default: 2 hours)
-- Lower `summarization_similarity_threshold` to group more memories together (0.5-0.7 recommended)
+## Important Settings
 
-**Optional Mem0 Mirroring:**
-- `enable_mem0_sync`: Mirror local memory CRUD operations to Mem0
-- `mem0_api_base_url`: Base URL for the Mem0 API
-- `mem0_api_key`: Required when Mem0 mirroring is enabled
-- `mem0_app_id`: App namespace used for mirrored memories
-- `mem0_user_id_template`: Default mapping from Open WebUI user id to Mem0 user id
-- `mem0_user_id_override`: Global override shown in the main valve UI; when set, it forces all mirrored memories to use that exact Mem0 user id
+### Memory Quality
 
-**Mem0 user id precedence:**
+Useful valves:
+- `recent_messages_n`: how much recent user context to use during extraction
+- `related_memories_n`: how many relevant memories to inject
+- `relevance_threshold`: how strict retrieval should be
+- `deduplicate_memories`: whether to skip near-duplicates
+- `use_embeddings_for_deduplication`: usually best left on
+
+### Memory Size Control
+
+Useful valves:
+- `max_total_memories`: max memories per user before pruning begins
+- `pruning_strategy`: `fifo` or `least_relevant`
+- `enable_summarization_task`: whether to summarize older memories
+- `summarization_interval`: how often summarization runs
+
+### Chat Experience
+
+Useful valves:
+- `show_memories`: whether recalled memories are injected into prompt context
+- `show_status`: whether chat status messages are shown
+- `memory_format`: `bullet`, `paragraph`, or `numbered`
+
+### Mem0
+
+Useful valves:
+- `enable_mem0_sync`
+- `mem0_user_id_template`
+- `mem0_user_id_override`
+- `mem0_timeout_seconds`
+
+## Mem0 User ID Behavior
+
+If Mem0 mirroring is enabled, the function decides which Mem0 user ID to use in this order:
 1. Per-user `mem0_user_id_override`
 2. Global `mem0_user_id_override`
-3. Stored Mem0 user mapping from previous syncs
+3. Previously stored Mem0 user mapping
 4. `mem0_user_id_template`
 
-## 🔒 Open WebUI Compatibility
+In practice, this means:
+- If you set the global override to `jefe`, new mirrored memories will use `jefe`
+- A per-user override can still beat the global one
+- Older cached mappings no longer win over the global override
 
-This function keeps Open WebUI's own memory system intact:
-- Open WebUI's database remains the source of truth for memories
-- Open WebUI's vector database remains the source of truth for memory search
-- The plugin's persistent sidecar databases are private to this function and exist only to avoid regenerating embeddings or losing Mem0 linkage state unnecessarily
+## What Stays In Open WebUI
 
-The current sidecar backends are:
-- `DATA_DIR/cache/embeddings.sqlite`
-- `DATA_DIR/cache/mem0_sync.sqlite`
+Open WebUI remains the local source of truth for the actual memories.
 
-Legacy cache migration:
-- Older per-user JSON cache files are imported automatically on first access
-- JSON fallback is still kept for safety if SQLite is unavailable
-- No Open WebUI schema changes are required
+This function adds:
+- embedding cache persistence
+- optional Mem0 sync state
+- retrieval, deduplication, summarization, and cleanup logic
 
-Mem0 sync state:
-- Open WebUI memories stay authoritative even when Mem0 mirroring is enabled
-- The plugin stores Open WebUI memory id -> Mem0 memory id mappings privately so updates/deletes stay aligned
-- The plugin also stores Open WebUI user id -> resolved Mem0 user id mappings so background activity stays consistent
+## Background Features
 
-## 🔁 Mem0 Mirroring Notes
+The function currently supports:
+- Memory summarization
+- Error counter logging
+- Orphaned vector cleanup
 
-When enabled, the plugin mirrors local memory lifecycle events to Mem0 on a best-effort basis:
-- New memories are mirrored to Mem0 after local save succeeds
-- Updated memories are pushed to the existing mirrored Mem0 record
-- Deleted, pruned, and summarized-away memories attempt to delete the mirrored Mem0 record too
+It also has valves for some future-facing background settings, but not every valve in the schema currently has a matching running task in this file.
 
-API behavior:
-- The plugin uses Mem0's documented create route `/v1/memories/`
-- If a proxy or deployment rejects that path with `404` or `405`, it retries with `/v1/memories`
-- Request logging is summarized for debugging so failures are easier to trace without dumping full payloads
+## Files It Maintains
 
-## 💬 How to Use It
+Besides Open WebUI's own memory records, the function may create private sidecar files under `DATA_DIR/cache`:
+- `embeddings.sqlite`
+- `mem0_sync.sqlite`
 
-Just chat. That's it.
+These are internal support files used for embedding persistence and Mem0 mapping state.
 
-The plugin works silently in the background:
-- Extracts facts about you from conversations
-- Retrieves relevant memories when needed
-- Shows status messages when saving/loading memories (can be disabled)
+## Requirements
 
-Want to see what it remembers? Check **Settings** → **Personalization** → **Memories** in Open WebUI.
+Needed:
+- Open WebUI
+- `numpy`
+- `aiohttp`
+- `pydantic`
+- `pytz`
 
-If you change embedding models/providers and want a clean re-embed of Open WebUI's native memory vectors, use Open WebUI's own memory reset/rebuild flow rather than editing the plugin cache by hand.
+Optional:
+- `sentence-transformers` for local embeddings
+- `prometheus-client` for metrics
 
-## 📋 Requirements
+## Notes
 
-Comes with Open WebUI:
-- `numpy`, `aiohttp`, `pydantic`
+- The function stores memories in Open WebUI's memory system.
+- It keeps Open WebUI's vector DB in sync when possible, but its own retrieval path is based on the stored memories plus embeddings it manages.
+- If you change embedding models or providers, previously cached embeddings may no longer match and will be regenerated over time.
+- Summarization only deletes source memories after the new summary memory is successfully saved.
 
-Optional (improves functionality):
-- `sentence-transformers` - For local embeddings (otherwise uses API)
-- `prometheus-client` - For metrics (gracefully skips if unavailable)
+## Credit
 
-## 📄 License
+This project is a fork of [gramanoid's owui-adaptive-memory](https://github.com/gramanoid/owui-adaptive-memory).
 
-MIT License - Use it however you want.
+## License
 
-## 🐛 Issues?
-
-Open an issue on this repo. I actively maintain and use this function.
+MIT
