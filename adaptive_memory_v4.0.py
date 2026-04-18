@@ -1434,9 +1434,23 @@ class Mem0SyncManager:
         rendered = str(rendered).strip()
         return rendered or str(user_id)
 
-    async def _resolve_mem0_user_id(self, user_id: str) -> str:
-        mem0_user_id = self._render_mem0_user_id(user_id)
+    async def _resolve_mem0_user_id(
+        self, user_id: str, override: Optional[str] = None
+    ) -> str:
+        override_value = str(override or "").strip()
+        global_override = str(
+            getattr(self.get_valves(), "mem0_user_id_override", "") or ""
+        ).strip()
         existing_mapping = await self._get_user_mapping(user_id)
+        if override_value:
+            mem0_user_id = override_value
+        elif global_override:
+            mem0_user_id = global_override
+        elif existing_mapping:
+            mem0_user_id = existing_mapping
+        else:
+            mem0_user_id = self._render_mem0_user_id(user_id)
+
         if existing_mapping != mem0_user_id:
             await self._store_user_mapping(user_id, mem0_user_id)
         return mem0_user_id
@@ -1467,6 +1481,25 @@ class Mem0SyncManager:
             confidence = 1.0
         return max(0.0, min(1.0, confidence))
 
+    def _summarize_payload_for_logs(
+        self, payload: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Return a safe, compact summary of a Mem0 payload for debugging."""
+        if not isinstance(payload, dict):
+            return {"has_payload": False}
+
+        messages = payload.get("messages")
+        return {
+            "keys": sorted(payload.keys()),
+            "has_user_id": bool(str(payload.get("user_id") or "").strip()),
+            "has_app_id": bool(str(payload.get("app_id") or "").strip()),
+            "has_agent_id": bool(str(payload.get("agent_id") or "").strip()),
+            "has_run_id": bool(str(payload.get("run_id") or "").strip()),
+            "messages_count": len(messages) if isinstance(messages, list) else 0,
+            "infer": payload.get("infer"),
+            "async_mode": payload.get("async_mode"),
+        }
+
     async def _request(
         self, method: str, path: str, payload: Optional[Dict[str, Any]] = None
     ) -> Tuple[int, Any]:
@@ -1493,10 +1526,28 @@ class Mem0SyncManager:
                         data = text
 
                 if not (200 <= response.status < 300):
+                    payload_summary = self._summarize_payload_for_logs(payload)
                     logger.warning(
                         f"Mem0 mirror {method} {path} failed with status {response.status}: "
                         f"{truncate_text(text, 300)}"
                     )
+                    logger.warning(
+                        f"Mem0 request summary for {method} {path}: {payload_summary}"
+                    )
+                    if (
+                        method == "POST"
+                        and path.rstrip("/") == "/v1/memories"
+                        and isinstance(data, list)
+                        and any(
+                            "One of the filters" in str(item)
+                            for item in data
+                        )
+                    ):
+                        logger.warning(
+                            "Mem0 returned a filter-validation error for a create request. "
+                            "This often means the API/proxy treated '/v1/memories' like the retrieval route. "
+                            "Retrying or configuring the documented trailing-slash endpoint '/v1/memories/' is recommended."
+                        )
                 return response.status, data
         except Exception as e:
             logger.warning(f"Mem0 mirror {method} {path} failed: {e}")
@@ -1523,6 +1574,7 @@ class Mem0SyncManager:
         tags: List[str],
         memory_bank: str,
         confidence: Optional[float],
+        mem0_user_id_override: Optional[str] = None,
     ) -> Optional[str]:
         if not self._is_enabled() or not content or not owui_memory_id:
             return None
@@ -1531,7 +1583,9 @@ class Mem0SyncManager:
         if existing_mapping:
             return existing_mapping
 
-        mem0_user_id = await self._resolve_mem0_user_id(user_id)
+        mem0_user_id = await self._resolve_mem0_user_id(
+            user_id, override=mem0_user_id_override
+        )
 
         payload = {
             "user_id": mem0_user_id,
@@ -1543,7 +1597,14 @@ class Mem0SyncManager:
                 user_id, mem0_user_id, owui_memory_id, tags, memory_bank, confidence
             ),
         }
-        status, response_data = await self._request("POST", "/v1/memories", payload)
+        status, response_data = await self._request("POST", "/v1/memories/", payload)
+        if status in {404, 405}:
+            logger.warning(
+                "Mem0 create request to '/v1/memories/' was not accepted; retrying legacy path '/v1/memories'"
+            )
+            status, response_data = await self._request(
+                "POST", "/v1/memories", payload
+            )
         if not (200 <= status < 300):
             return None
 
@@ -1567,6 +1628,7 @@ class Mem0SyncManager:
         tags: List[str],
         memory_bank: str,
         confidence: Optional[float],
+        mem0_user_id_override: Optional[str] = None,
     ) -> bool:
         if not self._is_enabled() or not content or not owui_memory_id:
             return False
@@ -1577,11 +1639,19 @@ class Mem0SyncManager:
                 f"Mem0 mapping missing for memory {owui_memory_id}; creating a fresh mirrored record"
             )
             created_id = await self.sync_memory_create(
-                user_id, owui_memory_id, content, tags, memory_bank, confidence
+                user_id,
+                owui_memory_id,
+                content,
+                tags,
+                memory_bank,
+                confidence,
+                mem0_user_id_override=mem0_user_id_override,
             )
             return created_id is not None
 
-        mem0_user_id = await self._resolve_mem0_user_id(user_id)
+        mem0_user_id = await self._resolve_mem0_user_id(
+            user_id, override=mem0_user_id_override
+        )
 
         payload = {
             "text": content,
@@ -1604,7 +1674,13 @@ class Mem0SyncManager:
             )
             await self._delete_mapping(user_id, owui_memory_id)
             created_id = await self.sync_memory_create(
-                user_id, owui_memory_id, content, tags, memory_bank, confidence
+                user_id,
+                owui_memory_id,
+                content,
+                tags,
+                memory_bank,
+                confidence,
+                mem0_user_id_override=mem0_user_id_override,
             )
             return created_id is not None
 
@@ -1648,6 +1724,13 @@ class MemoryPipeline:
         self.embedding_manager = embedding_manager
         self.error_manager = error_manager
         self.mem0_sync_manager = mem0_sync_manager
+
+    def _get_mem0_user_id_override(self, user_valves: Any = None) -> Optional[str]:
+        if user_valves is None:
+            return None
+        override = getattr(user_valves, "mem0_user_id_override", "")
+        override = str(override or "").strip()
+        return override or None
 
     def _get_memory_id(self, memory: Any) -> Optional[str]:
         memory_id = memory.id if hasattr(memory, "id") else memory.get("id")
@@ -2192,11 +2275,16 @@ class MemoryPipeline:
 
     # --- Memory Operations ---
     async def process_memory_operations(
-        self, operations: List[Dict[str, Any]], user_id: str, skip_deduplication: bool = False
+        self,
+        operations: List[Dict[str, Any]],
+        user_id: str,
+        skip_deduplication: bool = False,
+        user_valves: Any = None,
     ) -> List[Dict[str, Any]]:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
         # Fetch full user object for Router DI (MockRequest)
         user_obj = Users.get_user_by_id(user_id)
+        mem0_user_id_override = self._get_mem0_user_id_override(user_valves)
         success_ops = []
         for op in operations:
             try:
@@ -2313,6 +2401,7 @@ class MemoryPipeline:
                                     tags=tags,
                                     memory_bank=bank,
                                     confidence=confidence,
+                                    mem0_user_id_override=mem0_user_id_override,
                                 )
                             except Exception as mem0_err:
                                 logger.warning(
@@ -2403,6 +2492,7 @@ class MemoryPipeline:
                                         tags=tags,
                                         memory_bank=bank,
                                         confidence=confidence,
+                                        mem0_user_id_override=mem0_user_id_override,
                                     )
                                 except Exception as mem0_err:
                                     logger.warning(
@@ -3062,7 +3152,11 @@ class Filter:
         )
         mem0_user_id_template: str = Field(
             default="owui:{user_id}",
-            description="Template used to map an Open WebUI user id into a Mem0 user id. Must include {user_id} when Mem0 mirroring is enabled.",
+            description="Template used to map an Open WebUI user id into a Mem0 user id. May include {user_id} for per-user mapping, or be a fixed string such as 'jefe' to force all mirrored memories into one Mem0 user/entity.",
+        )
+        mem0_user_id_override: str = Field(
+            default="",
+            description="Optional global Mem0 user/entity id override shown in the main valve UI. When set, it takes precedence over cached Mem0 user mappings and over mem0_user_id_template, forcing mirrored memories to use that exact Mem0 user id.",
         )
 
         # Background Task Management Configuration
@@ -3556,9 +3650,9 @@ Your output must be valid JSON only. No additional text.""",
                     raise ValueError(
                         "Mem0 API key is required when enable_mem0_sync is enabled"
                     )
-                if "{user_id}" not in str(self.mem0_user_id_template):
+                if not str(self.mem0_user_id_template or "").strip():
                     raise ValueError(
-                        "mem0_user_id_template must include '{user_id}' when Mem0 mirroring is enabled"
+                        "mem0_user_id_template must not be empty when Mem0 mirroring is enabled"
                     )
             return self
 
@@ -3589,6 +3683,10 @@ Your output must be valid JSON only. No additional text.""",
         )
         show_status: bool = Field(
             default=True, description="Show memory processing status updates"
+        )
+        mem0_user_id_override: str = Field(
+            default="",
+            description="Optional per-user Mem0 user/entity id override. Leave empty to use the global mem0_user_id_template; set a value like 'jefe' to route only this user's mirrored memories to that exact Mem0 entity.",
         )
         timezone: str = Field(
             default="",
@@ -3937,7 +4035,9 @@ Your output must be valid JSON only. No additional text.""",
             success_ops = []
             if ops:
                 # Process Operations (Save/Delete)
-                success_ops = await pipeline.process_memory_operations(ops, user_id)
+                success_ops = await pipeline.process_memory_operations(
+                    ops, user_id, user_valves=user_valves
+                )
                 
             if len(success_ops) > 0:
                 logger.info(f"Memory operations: saved {len(success_ops)} new memories (skipped {len(ops) - len(success_ops)} duplicates)")
