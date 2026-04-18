@@ -1158,6 +1158,28 @@ class MemoryPipeline:
         memory_content = memory.content if hasattr(memory, "content") else memory.get("content")
         return parse_stored_memory(memory_content)
 
+    def _memory_created_at_sort_key(self, memory: Any) -> datetime:
+        created_at = (
+            getattr(memory, "created_at", None)
+            if hasattr(memory, "created_at")
+            else memory.get("created_at")
+        )
+
+        if isinstance(created_at, datetime):
+            return (
+                created_at
+                if created_at.tzinfo is not None
+                else created_at.replace(tzinfo=timezone.utc)
+            )
+
+        if isinstance(created_at, (int, float)):
+            try:
+                return datetime.fromtimestamp(created_at, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                pass
+
+        return datetime.min.replace(tzinfo=timezone.utc)
+
     def _enabled_memory_tags(self) -> Set[str]:
         enabled_tags = {"summary"}
         tag_flag_map = {
@@ -1956,7 +1978,7 @@ class MemoryPipeline:
                 # Sort by created_at (oldest first)
                 sorted_memories = sorted(
                     all_memories, 
-                    key=lambda m: m.created_at if hasattr(m, 'created_at') else 0
+                    key=self._memory_created_at_sort_key
                 )
                 memories_to_delete = sorted_memories[:num_to_delete]
                 logger.info(f"Using FIFO strategy: deleting {num_to_delete} oldest memories")
@@ -1984,7 +2006,7 @@ class MemoryPipeline:
                 logger.warning(f"Unknown pruning strategy: {self.valves.pruning_strategy}, defaulting to FIFO")
                 sorted_memories = sorted(
                     all_memories,
-                    key=lambda m: m.created_at if hasattr(m, 'created_at') else 0
+                    key=self._memory_created_at_sort_key
                 )
                 memories_to_delete = sorted_memories[:num_to_delete]
             
