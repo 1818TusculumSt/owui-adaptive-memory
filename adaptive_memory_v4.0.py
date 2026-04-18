@@ -18,6 +18,7 @@ from typing import (
 import logging
 import re
 import asyncio
+import inspect
 import pytz
 import difflib
 import time
@@ -579,6 +580,7 @@ class EmbeddingManager:
     def _ensure_provider(self):
         valves = self.get_valves()
         provider_signature = (
+            getattr(valves, "embedding_source", "auto"),
             valves.embedding_provider_type,
             valves.embedding_model_name,
             valves.embedding_api_url,
@@ -591,6 +593,9 @@ class EmbeddingManager:
                 )
             self._provider_signature = provider_signature
             self.cache = LRUCache()
+            if not self._should_use_plugin_embeddings():
+                self.provider = None
+                return
             if valves.embedding_provider_type == "local":
                 self.provider = LocalEmbeddingProvider(valves.embedding_model_name)
             elif valves.embedding_provider_type == "openai_compatible":
@@ -600,43 +605,149 @@ class EmbeddingManager:
                     valves.embedding_model_name,
                 )
 
-    async def get_embedding(self, text: str) -> Optional[np.ndarray]:
+    def _embedding_source_mode(self) -> str:
+        return getattr(self.get_valves(), "embedding_source", "auto")
+
+    def _should_use_open_webui_embeddings(self) -> bool:
+        return self._embedding_source_mode() in {"auto", "owui"}
+
+    def _should_use_plugin_embeddings(self) -> bool:
+        return self._embedding_source_mode() in {"auto", "plugin"}
+
+    def _metrics_provider_label(self, source: str) -> str:
+        if source == "open_webui":
+            return "open_webui"
+        return self.get_valves().embedding_provider_type
+
+    def _default_record_identity(self) -> Tuple[str, str]:
+        valves = self.get_valves()
+        if self._embedding_source_mode() == "owui":
+            return "open_webui", "open_webui"
+        return valves.embedding_model_name, valves.embedding_provider_type
+
+    def _get_open_webui_embedding_function(self) -> Optional[Callable[..., Any]]:
+        app_state = getattr(webui_app, "state", None)
+        return getattr(app_state, "EMBEDDING_FUNCTION", None)
+
+    async def _get_open_webui_embedding(
+        self, text: str, user: Any = None
+    ) -> Optional[np.ndarray]:
         if not text:
             return None
 
-        EMBEDDING_REQUESTS.labels(self.get_valves().embedding_provider_type).inc()
+        embedding_function = self._get_open_webui_embedding_function()
+        if embedding_function is None:
+            return None
+
+        try:
+            try:
+                result = embedding_function(text, user=user)
+            except TypeError:
+                result = embedding_function(text)
+
+            if inspect.isawaitable(result):
+                result = await result
+
+            if result is None:
+                return None
+
+            embedding = np.asarray(result, dtype=np.float32)
+            if embedding.ndim != 1 or embedding.size == 0:
+                logger.warning(
+                    "Open WebUI embedding function returned an invalid embedding shape"
+                )
+                return None
+
+            return embedding
+        except Exception as e:
+            logger.warning(f"Open WebUI embedding function failed: {e}")
+            return None
+
+    async def get_embedding(self, text: str, user: Any = None) -> Optional[np.ndarray]:
+        if not text:
+            return None
+
+        metric_source = (
+            "open_webui" if self._should_use_open_webui_embeddings() else "plugin"
+        )
+        EMBEDDING_REQUESTS.labels(self._metrics_provider_label(metric_source)).inc()
         start = time.perf_counter()
+
+        emb = None
+        if self._should_use_open_webui_embeddings():
+            emb = await self._get_open_webui_embedding(text, user=user)
+        if emb is not None:
+            EMBEDDING_LATENCY.labels(self._metrics_provider_label("open_webui")).observe(
+                time.perf_counter() - start
+            )
+            return emb
+
+        if not self._should_use_plugin_embeddings():
+            self.error_manager.increment("embedding_errors")
+            EMBEDDING_ERRORS.labels(self._metrics_provider_label("open_webui")).inc()
+            return None
 
         if not self.provider:
             self._ensure_provider()
 
         if not self.provider:
+            self.error_manager.increment("embedding_errors")
+            EMBEDDING_ERRORS.labels(self._metrics_provider_label("plugin")).inc()
             return None
 
         self._ensure_session()
         emb = await self.provider.get_embedding(text, session=self._session)
 
         if emb is not None:
-            EMBEDDING_LATENCY.labels(self.get_valves().embedding_provider_type).observe(
+            EMBEDDING_LATENCY.labels(self._metrics_provider_label("plugin")).observe(
                 time.perf_counter() - start
             )
         else:
             self.error_manager.increment("embedding_errors")
-            EMBEDDING_ERRORS.labels(self.get_valves().embedding_provider_type).inc()
+            EMBEDDING_ERRORS.labels(self._metrics_provider_label("plugin")).inc()
 
         return emb
 
     async def get_embeddings_batch(
-        self, texts: List[str]
+        self, texts: List[str], user: Any = None
     ) -> List[Optional[np.ndarray]]:
+        if not texts:
+            return []
+
+        open_webui_results = [None] * len(texts)
+        if self._should_use_open_webui_embeddings():
+            open_webui_results = await asyncio.gather(
+                *[self._get_open_webui_embedding(text, user=user) for text in texts]
+            )
+        if all(result is not None for result in open_webui_results):
+            return list(open_webui_results)
+
+        if not self._should_use_plugin_embeddings():
+            return list(open_webui_results)
+
         if not self.provider:
             self._ensure_provider()
 
         if not self.provider:
-            return [None] * len(texts)
-        
+            return list(open_webui_results)
+
         self._ensure_session()
-        return await self.provider.get_embeddings_batch(texts, session=self._session)
+        missing_indices = [
+            idx for idx, result in enumerate(open_webui_results) if result is None
+        ]
+        if not missing_indices:
+            return list(open_webui_results)
+
+        provider_results = await self.provider.get_embeddings_batch(
+            [texts[idx] for idx in missing_indices], session=self._session
+        )
+
+        combined_results = list(open_webui_results)
+        for idx, provider_embedding in zip(
+            missing_indices, provider_results, strict=True
+        ):
+            combined_results[idx] = provider_embedding
+        return combined_results
 
     def _get_legacy_cache_file(self, user_id: str) -> str:
         return os.path.join(self._legacy_cache_dir, f"{user_id}_embeddings.json")
@@ -683,10 +794,11 @@ class EmbeddingManager:
     ) -> Dict[str, Any]:
         embedding_array = np.asarray(embedding, dtype=np.float32)
         valves = self.get_valves()
+        default_model, default_provider = self._default_record_identity()
         return {
             "embedding_json": json.dumps(embedding_array.tolist()),
-            "model": model or valves.embedding_model_name,
-            "provider": provider or valves.embedding_provider_type,
+            "model": model or default_model,
+            "provider": provider or default_provider,
             "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
         }
 
@@ -721,10 +833,11 @@ class EmbeddingManager:
     ) -> None:
         memory_id_str = normalize_memory_id(memory_id)
         cache = self._load_legacy_cache_sync(user_id)
+        model, provider = self._default_record_identity()
         cache[memory_id_str] = {
             "embedding": np.asarray(embedding, dtype=np.float32).tolist(),
-            "model": self.get_valves().embedding_model_name,
-            "provider": self.get_valves().embedding_provider_type,
+            "model": model,
+            "provider": provider,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._save_legacy_cache_sync(user_id, cache)
@@ -736,8 +849,7 @@ class EmbeddingManager:
             return
         cache = self._load_legacy_cache_sync(user_id)
         timestamp = datetime.now(timezone.utc).isoformat()
-        model = self.get_valves().embedding_model_name
-        provider = self.get_valves().embedding_provider_type
+        model, provider = self._default_record_identity()
         for memory_id, embedding in zip(ids, embeddings, strict=True):
             if embedding is None:
                 continue
@@ -942,10 +1054,10 @@ class EmbeddingManager:
             return len(rows)
 
     def _is_record_compatible(self, record: Dict[str, Any]) -> bool:
-        valves = self.get_valves()
+        expected_model, expected_provider = self._default_record_identity()
         return (
-            record.get("model") == valves.embedding_model_name
-            and record.get("provider") == valves.embedding_provider_type
+            record.get("model") == expected_model
+            and record.get("provider") == expected_provider
         )
 
     async def store_embedding_persistent(self, user_id: str, memory_id: str, memory_text: str, embedding: np.ndarray) -> None:
@@ -1099,7 +1211,9 @@ class EmbeddingManager:
             finally:
                 self._cleanup_lock(user_id)
 
-    async def get_embedding_with_persistence(self, text: str, user_id: str, memory_id: str) -> Optional[np.ndarray]:
+    async def get_embedding_with_persistence(
+        self, text: str, user_id: str, memory_id: str, user: Any = None
+    ) -> Optional[np.ndarray]:
         """Get embedding with full caching hierarchy: memory -> persistent -> generate."""
         if not text:
             return None
@@ -1120,7 +1234,7 @@ class EmbeddingManager:
             return persistent_emb
 
         # 3. Generate new embedding
-        new_emb = await self.get_embedding(text)
+        new_emb = await self.get_embedding(text, user=user)
         if new_emb is not None:
             # Cache in memory
             await self.cache.set(memory_id_str, new_emb)
@@ -1157,6 +1271,77 @@ class MemoryPipeline:
     def _get_memory_record(self, memory: Any) -> StoredMemoryRecord:
         memory_content = memory.content if hasattr(memory, "content") else memory.get("content")
         return parse_stored_memory(memory_content)
+
+    def _get_user_object(self, user_id: str) -> Optional[Any]:
+        try:
+            return Users.get_user_by_id(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to fetch user object for {user_id}: {e}")
+            return None
+
+    def _find_memory_by_exact_content(
+        self, memories: List[Any], content: str, excluded_ids: Optional[Set[str]] = None
+    ) -> Optional[Any]:
+        excluded_ids = excluded_ids or set()
+        for memory in memories:
+            memory_id = self._get_memory_id(memory)
+            if memory_id and memory_id in excluded_ids:
+                continue
+            stored_content = (
+                memory.content if hasattr(memory, "content") else memory.get("content")
+            )
+            if str(stored_content or "") == content:
+                return memory
+        return None
+
+    async def _sync_memory_vector(
+        self, user_id: str, memory: Any, text_for_vector: str, user_obj: Any = None
+    ) -> bool:
+        if not VECTOR_DB_CLIENT:
+            return False
+
+        memory_id = self._get_memory_id(memory)
+        if not memory_id:
+            return False
+
+        vector_embedding = await self.embedding_manager.get_embedding(
+            text_for_vector, user=user_obj
+        )
+        if vector_embedding is None:
+            logger.warning(
+                f"Could not generate embedding for vector sync (memory ID: {memory_id})"
+            )
+            return False
+
+        metadata = {}
+        created_at = getattr(memory, "created_at", None)
+        updated_at = getattr(memory, "updated_at", None)
+        if created_at is not None:
+            metadata["created_at"] = created_at
+        if updated_at is not None:
+            metadata["updated_at"] = updated_at
+
+        try:
+            VECTOR_DB_CLIENT.upsert(
+                collection_name=f"user-memory-{user_id}",
+                items=[
+                    {
+                        "id": memory_id,
+                        "text": text_for_vector,
+                        "vector": (
+                            vector_embedding.tolist()
+                            if hasattr(vector_embedding, "tolist")
+                            else vector_embedding
+                        ),
+                        "metadata": metadata,
+                    }
+                ],
+            )
+            logger.info(f"Memory synced to vector DB (ID: {memory_id})")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to sync memory to vector DB (ID: {memory_id}): {e}")
+            return False
 
     def _memory_created_at_sort_key(self, memory: Any) -> datetime:
         created_at = (
@@ -1501,10 +1686,13 @@ class MemoryPipeline:
 
         RETRIEVAL_REQUESTS.inc()
         start_time = time.perf_counter()
+        user_obj = self._get_user_object(user_id)
 
         # 1. Vector Search
         try:
-            query_embedding = await self.embedding_manager.get_embedding(query)
+            query_embedding = await self.embedding_manager.get_embedding(
+                query, user=user_obj
+            )
             if query_embedding is None:
                 return []
         except Exception as e:
@@ -1554,7 +1742,7 @@ class MemoryPipeline:
             logger.info(f"Generating embeddings for {len(texts_to_embed)} memories (using cache for {len(all_memories) - len(texts_to_embed)})")
             # Batch generate
             new_embeddings = await self.embedding_manager.get_embeddings_batch(
-                texts_to_embed
+                texts_to_embed, user=user_obj
             )
             for i, emb in enumerate(new_embeddings):
                 if emb is not None:
@@ -1655,6 +1843,15 @@ class MemoryPipeline:
 
                     try:
                         mem_obj = None
+                        vector_sync_needed = False
+                        existing_memory_ids = {
+                            memory_id
+                            for memory_id in (
+                                self._get_memory_id(memory)
+                                for memory in Memories.get_memories_by_user_id(user_id)
+                            )
+                            if memory_id is not None
+                        }
                         try:
                             logger.info("Attempting to add memory via router add_memory (Vector-Aware)...")
 
@@ -1664,7 +1861,7 @@ class MemoryPipeline:
 
                                 async def mock_embedding_function(content: str, user=None):
                                     return await self.embedding_manager.get_embedding(
-                                        parse_stored_memory(content).content
+                                        content, user=user
                                     )
 
                                 req = (
@@ -1685,9 +1882,26 @@ class MemoryPipeline:
                             logger.warning(
                                 f"Router add_memory failed ({add_err}), falling back to insert_new_memory"
                             )
-                            mem_obj = Memories.insert_new_memory(user_id, final_content)
+                            current_memories = Memories.get_memories_by_user_id(user_id)
+                            mem_obj = self._find_memory_by_exact_content(
+                                current_memories,
+                                final_content,
+                                excluded_ids=existing_memory_ids,
+                            )
+                            if mem_obj is not None:
+                                vector_sync_needed = True
+                                logger.warning(
+                                    "Router add_memory inserted the memory before vector sync failed; reusing that row to avoid creating a duplicate"
+                                )
+                            else:
+                                mem_obj = Memories.insert_new_memory(user_id, final_content)
+                                vector_sync_needed = True
 
                         memory_id = getattr(mem_obj, "id", None)
+                        if vector_sync_needed and mem_obj is not None:
+                            await self._sync_memory_vector(
+                                user_id, mem_obj, final_content, user_obj=user_obj
+                            )
                         success_ops.append(normalized_op)
                         logger.info(
                             f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]"
@@ -1762,7 +1976,7 @@ class MemoryPipeline:
                         if updated_memory:
                             if new_embedding is None:
                                 new_embedding = await self.embedding_manager.get_embedding(
-                                    new_content
+                                    new_content, user=user_obj
                                 )
 
                             if new_embedding is not None:
@@ -1771,36 +1985,12 @@ class MemoryPipeline:
                                     user_id, memory_id, new_content, new_embedding
                                 )
 
-                                if VECTOR_DB_CLIENT:
-                                    try:
-                                        VECTOR_DB_CLIENT.upsert(
-                                            collection_name=f"user-memory-{user_id}",
-                                            items=[
-                                                {
-                                                    "id": memory_id,
-                                                    "text": final_content,
-                                                    "vector": (
-                                                        new_embedding.tolist()
-                                                        if hasattr(new_embedding, "tolist")
-                                                        else new_embedding
-                                                    ),
-                                                    "metadata": {
-                                                        "updated_at": (
-                                                            updated_memory.updated_at
-                                                            if hasattr(updated_memory, "updated_at")
-                                                            else None
-                                                        ),
-                                                    },
-                                                }
-                                            ],
-                                        )
-                                        logger.info(
-                                            f"Memory updated in vector DB (ID: {memory_id})"
-                                        )
-                                    except Exception as vec_err:
-                                        logger.warning(
-                                            f"Failed to update memory in vector DB: {vec_err}"
-                                        )
+                            await self._sync_memory_vector(
+                                user_id,
+                                updated_memory,
+                                final_content,
+                                user_obj=user_obj,
+                            )
 
                             success_ops.append(normalized_op)
                             logger.info(f"Memory updated (ID: {memory_id})")
@@ -1870,8 +2060,12 @@ class MemoryPipeline:
             if not all_memories:
                 return False, None
 
+            user_obj = self._get_user_object(user_id)
+
             if self.valves.use_embeddings_for_deduplication:
-                new_embedding = await self.embedding_manager.get_embedding(text)
+                new_embedding = await self.embedding_manager.get_embedding(
+                    text, user=user_obj
+                )
                 if new_embedding is None:
                     logger.warning("Could not generate embedding for duplicate check, falling back to text similarity")
                     is_dup = await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
@@ -1898,7 +2092,9 @@ class MemoryPipeline:
                         if existing_embedding is not None:
                             await self.embedding_manager.cache.set(memory_id, existing_embedding)
                         else:
-                            existing_embedding = await self.embedding_manager.get_embedding(raw_memory_content)
+                            existing_embedding = await self.embedding_manager.get_embedding(
+                                raw_memory_content, user=user_obj
+                            )
                             if existing_embedding is not None:
                                 await self.embedding_manager.cache.set(memory_id, existing_embedding)
                                 await self.embedding_manager.store_embedding_persistent(
@@ -2054,6 +2250,7 @@ class MemoryPipeline:
     ) -> Optional[str]:
         """Find clusters of memories and summarize them."""
         logger.info(f"Starting summarization for user {user_id}")
+        user_obj = self._get_user_object(user_id)
         
         # 1. Fetch memories
         try:
@@ -2119,7 +2316,9 @@ class MemoryPipeline:
 
         if uncached_contents:
             logger.info(f"Generating embeddings for {len(uncached_contents)} uncached memories (using cache for {len(memories) - len(uncached_contents)})")
-            new_embeddings = await self.embedding_manager.get_embeddings_batch(uncached_contents)
+            new_embeddings = await self.embedding_manager.get_embeddings_batch(
+                uncached_contents, user=user_obj
+            )
             
             for idx, new_emb in zip(uncached_indices, new_embeddings, strict=True):
                 if new_emb is not None:
@@ -2369,21 +2568,25 @@ class Filter:
         """Configuration valves for the filter"""
 
         # Embedding Model Configuration
+        embedding_source: Literal["auto", "owui", "plugin"] = Field(
+            default="auto",
+            description="Embedding source mode: 'auto' prefers Open WebUI's configured embedding function and falls back to the plugin provider, 'owui' uses only Open WebUI embeddings, and 'plugin' uses only the plugin-configured provider.",
+        )
         embedding_provider_type: Literal["local", "openai_compatible"] = Field(
             default="local",
-            description="Type of embedding provider ('local' for SentenceTransformer or 'openai_compatible' for API)",
+            description="Plugin-side embedding provider type used when embedding_source is 'auto' and Open WebUI embeddings are unavailable, or when embedding_source is 'plugin'.",
         )
         embedding_model_name: str = Field(
             default="all-MiniLM-L6-v2",
-            description="Name of the embedding model to use (e.g., 'all-MiniLM-L6-v2', 'text-embedding-3-small')",
+            description="Plugin-side embedding model name used for the fallback/internal provider when embedding_source allows plugin embeddings.",
         )
         embedding_api_url: Optional[str] = Field(
             default=None,
-            description="API endpoint URL for the embedding provider (required if type is 'openai_compatible')",
+            description="Plugin-side embedding API endpoint used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
         embedding_api_key: Optional[str] = Field(
             default=None,
-            description="API Key for the embedding provider (required if type is 'openai_compatible')",
+            description="Plugin-side embedding API key used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
 
         # Background Task Management Configuration
@@ -2880,7 +3083,10 @@ Your output must be valid JSON only. No additional text.""",
 
         @model_validator(mode="after")
         def check_embedding_config(self):
-            if self.embedding_provider_type == "openai_compatible":
+            if (
+                self.embedding_source in {"auto", "plugin"}
+                and self.embedding_provider_type == "openai_compatible"
+            ):
                 if not self.embedding_api_key:
                     raise ValueError(
                         "API Key required for openai_compatible embedding provider"
