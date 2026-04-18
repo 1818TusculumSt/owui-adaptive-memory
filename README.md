@@ -1,41 +1,57 @@
 # Adaptive Memory for Open WebUI
 
-Give your Open WebUI assistant persistent memory across conversations.
+Give Open WebUI persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, persistent embedding cache, and optional Mem0 mirroring.
 
-This function remembers useful things you tell it, brings back relevant memories in later chats, and can optionally mirror those memories to Mem0.
+## Overview
 
-## What It Does
+This function watches user messages, extracts durable facts and preferences, stores them in Open WebUI memory, and injects the most relevant memories back into later chats.
 
-Once enabled, the function works in the background to:
-- Save important facts, preferences, goals, and relationships from your conversations
-- Recall relevant memories when you start a new chat or continue an old one
-- Avoid saving obvious duplicates
-- Keep memory growth under control with pruning and summarization
-- Optionally mirror memory changes to Mem0
+It is designed to stay mostly automatic once configured:
+- Extract likely long-term memories from recent user messages
+- Save them into Open WebUI memory
+- Avoid obvious duplicates
+- Recall relevant memories with embeddings
+- Keep vector storage and embedding cache in sync
+- Prune or summarize older memories
+- Optionally mirror CRUD into Mem0
+- Reconcile deleted Mem0 records back into Open WebUI
 
-Example:
-- You say: "I prefer Python over JavaScript."
-- Later, when you ask for coding help, that preference can be recalled automatically.
-
-## How It Works
+## Current Behavior
 
 At a high level:
-1. You chat normally.
-2. The function looks at your recent user messages and asks an LLM to identify memories worth saving.
-3. Those memories are stored in Open WebUI's memory system.
-4. On future messages, the function finds the most relevant saved memories and injects them back into context.
+1. The user sends a message.
+2. `inlet()` loads the user's existing Open WebUI memories.
+3. If Mem0 sync is enabled, mapped Mem0 records are checked and locally deleted if the upstream Mem0 memory is gone.
+4. Relevant memories are selected with embeddings and injected into the prompt.
+5. After the assistant responds, `outlet()` asks the configured LLM to propose memory operations.
+6. Valid `NEW`, `UPDATE`, and `DELETE` operations are applied locally.
+7. Local CRUD is mirrored to Mem0 when enabled.
 
-Everything is designed to stay mostly automatic once configured.
+Open WebUI remains the primary local store. Mem0 is optional and best-effort.
+
+## Key Features
+
+- Semantic recall using embeddings
+- Persistent embedding cache in SQLite
+- In-memory LRU embedding cache
+- Duplicate detection with embeddings or text similarity fallback
+- Memory pruning with `fifo` or `least_relevant`
+- Background memory summarization
+- Background orphaned vector cleanup
+- Optional Mem0 mirroring for create, update, and delete
+- Best-effort Mem0 delete reconciliation back into Open WebUI
+- Per-user or global Mem0 user ID overrides
+- Router-aware memory creation path for vector sync compatibility
 
 ## Installation
 
-1. Upload `adaptive_memory_v4.0.py` in Open WebUI Functions.
-2. Open the function settings and configure the valves you want.
-3. Enable the function for the model or models you use.
+1. Upload `adaptive_memory_v4.0.py` to Open WebUI Functions.
+2. Enable the function for the model or models you want.
+3. Configure the valves you care about.
 
 ## Recommended Setup
 
-### For Most People
+### Default
 
 Use:
 - `embedding_source = auto`
@@ -43,97 +59,157 @@ Use:
 - `embedding_model_name = all-MiniLM-L6-v2`
 - your normal Ollama or OpenAI-compatible model for memory extraction
 
-This gives you a solid default setup with local embeddings when available.
+That gives you Open WebUI embeddings when available, with plugin embeddings as a fallback.
 
-### If You Want Mem0 Mirroring
+### Mem0 Mirroring
 
 Enable:
 - `enable_mem0_sync = true`
 
-Then configure:
+Then set:
 - `mem0_api_base_url`
 - `mem0_api_key`
 - `mem0_app_id`
 
-If you want all mirrored memories to go to one Mem0 user ID, set:
-- `mem0_user_id_override = jefe`
-
-## Important Settings
-
-### Memory Quality
-
-Useful valves:
-- `recent_messages_n`: how much recent user context to use during extraction
-- `related_memories_n`: how many relevant memories to inject
-- `relevance_threshold`: how strict retrieval should be
-- `deduplicate_memories`: whether to skip near-duplicates
-- `use_embeddings_for_deduplication`: usually best left on
-
-### Memory Size Control
-
-Useful valves:
-- `max_total_memories`: max memories per user before pruning begins
-- `pruning_strategy`: `fifo` or `least_relevant`
-- `enable_summarization_task`: whether to summarize older memories
-- `summarization_interval`: how often summarization runs
-
-### Chat Experience
-
-Useful valves:
-- `show_memories`: whether recalled memories are injected into prompt context
-- `show_status`: whether chat status messages are shown
-- `memory_format`: `bullet`, `paragraph`, or `numbered`
-
-### Mem0
-
-Useful valves:
-- `enable_mem0_sync`
+Optional:
 - `mem0_user_id_template`
 - `mem0_user_id_override`
-- `mem0_timeout_seconds`
+- per-user `mem0_user_id_override`
 
-## Mem0 User ID Behavior
+## Mem0 Sync Model
 
-If Mem0 mirroring is enabled, the function decides which Mem0 user ID to use in this order:
+When Mem0 sync is enabled, the function does four separate things:
+
+1. Local creates are mirrored to Mem0.
+2. Local updates are mirrored to Mem0.
+3. Local deletes are mirrored to Mem0.
+4. During later inbound requests, missing Mem0 records are reconciled back into Open WebUI by deleting the mapped local memory.
+
+That last piece matters: this is no longer just one-way mirroring. If a mapped memory is deleted upstream in Mem0, the local Open WebUI copy is cleaned up on a later reconciliation pass.
+
+Reconciliation is best-effort and intentionally conservative:
+- expected Mem0 `404` responses are treated as normal for reconciliation
+- unexpected HTTP failures do not delete local memories
+- stale mappings for already-missing local memories are pruned from `mem0_sync.sqlite`
+
+## Mem0 User ID Resolution
+
+When Mem0 mirroring is enabled, the Mem0 user/entity ID is chosen in this order:
+
 1. Per-user `mem0_user_id_override`
 2. Global `mem0_user_id_override`
 3. Previously stored Mem0 user mapping
 4. `mem0_user_id_template`
 
-In practice, this means:
-- If you set the global override to `jefe`, new mirrored memories will use `jefe`
-- A per-user override can still beat the global one
-- Older cached mappings no longer win over the global override
+Examples:
+- Set global override to `jefe` to send all mirrored memories to one Mem0 entity.
+- Set a per-user override to route only one Open WebUI user to a custom Mem0 entity.
 
-## What Stays In Open WebUI
+## Important Valves
 
-Open WebUI remains the local source of truth for the actual memories.
+### Memory Extraction and Recall
 
-This function adds:
-- embedding cache persistence
-- optional Mem0 sync state
-- retrieval, deduplication, summarization, and cleanup logic
+- `recent_messages_n`
+- `related_memories_n`
+- `relevance_threshold`
+- `vector_similarity_threshold`
+- `show_memories`
+- `memory_format`
 
-## Background Features
+### Deduplication
 
-The function currently supports:
+- `deduplicate_memories`
+- `use_embeddings_for_deduplication`
+- `embedding_similarity_threshold`
+- `similarity_threshold`
+- `enable_short_preference_shortcut`
+- `short_preference_no_dedupe_length`
+- `preference_keywords_no_dedupe`
+
+### Memory Quality Filters
+
+- `min_memory_length`
+- `min_confidence_threshold`
+- `filter_trivia`
+- `blacklist_topics`
+- `whitelist_keywords`
+- `allowed_memory_banks`
+- `default_memory_bank`
+
+### Size Control
+
+- `max_total_memories`
+- `pruning_strategy`
+- `enable_summarization_task`
+- `summarization_interval`
+- `summarization_min_cluster_size`
+- `summarization_similarity_threshold`
+- `summarization_max_cluster_size`
+- `summarization_min_memory_age_days`
+
+### Mem0
+
+- `enable_mem0_sync`
+- `mem0_api_base_url`
+- `mem0_api_key`
+- `mem0_app_id`
+- `mem0_timeout_seconds`
+- `mem0_user_id_template`
+- `mem0_user_id_override`
+
+### Background Tasks
+
+- `enable_summarization_task`
+- `enable_error_logging_task`
+- `enable_vector_cleanup_task`
+- `summarization_interval`
+- `error_logging_interval`
+- `vector_cleanup_interval`
+
+## Background Tasks That Actually Run
+
+Current active background loops:
 - Memory summarization
 - Error counter logging
 - Orphaned vector cleanup
+- Rogue task scavenging on startup
 
-It also has valves for some future-facing background settings, but not every valve in the schema currently has a matching running task in this file.
+There are a few task-related valves in the schema that look future-facing, but not every one currently has an implemented loop in this file.
 
-## Files It Maintains
+## Storage and Sidecar Files
 
-Besides Open WebUI's own memory records, the function may create private sidecar files under `DATA_DIR/cache`:
-- `embeddings.sqlite`
-- `mem0_sync.sqlite`
+Open WebUI still stores the actual memory rows.
 
-These are internal support files used for embedding persistence and Mem0 mapping state.
+This function may also maintain sidecar files under `DATA_DIR/cache`:
+- `embeddings.sqlite`: persistent embedding cache
+- `mem0_sync.sqlite`: Mem0 memory/user mapping state
+
+Legacy embedding JSON cache files may also appear if SQLite persistence fails and the code falls back.
+
+## Notes on Vectors and Embeddings
+
+- The function tries to keep Open WebUI's vector DB in sync with local memory CRUD.
+- Retrieval uses the stored memories plus embeddings managed by this function.
+- If embedding provider settings change, cached embeddings may become incompatible and will be regenerated over time.
+- A background vector cleanup task removes orphaned vectors when possible.
+
+## Notes on Summarization
+
+- Summarization only considers eligible non-summary memories.
+- Clusters are formed with embedding similarity.
+- A new summary memory is saved first.
+- Source memories are deleted only after the summary save succeeds.
+- Source memory deletion also cleans vectors, persistent embeddings, and Mem0 mirror state.
+
+## Notes on Logging
+
+Recent cleanup changed two logging behaviors:
+- expected Mem0 reconciliation `404`s are no longer treated as warning-level failures
+- duplicate emission from logger propagation has been disabled so each record should log once
 
 ## Requirements
 
-Needed:
+Required:
 - Open WebUI
 - `numpy`
 - `aiohttp`
@@ -144,12 +220,12 @@ Optional:
 - `sentence-transformers` for local embeddings
 - `prometheus-client` for metrics
 
-## Notes
+## Caveats
 
-- The function stores memories in Open WebUI's memory system.
-- It keeps Open WebUI's vector DB in sync when possible, but its own retrieval path is based on the stored memories plus embeddings it manages.
-- If you change embedding models or providers, previously cached embeddings may no longer match and will be regenerated over time.
-- Summarization only deletes source memories after the new summary memory is successfully saved.
+- Mem0 sync is best-effort, not transactional.
+- Reconciliation runs during inbound requests, not as a separate continuous Mem0 polling loop.
+- If Mem0 is unavailable, local memory remains intact.
+- Some logging and configuration fields are broader than the currently implemented feature set.
 
 ## Credit
 

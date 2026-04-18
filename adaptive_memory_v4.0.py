@@ -154,11 +154,12 @@ if not _raw_logger.handlers:
     )
     handler.setFormatter(formatter)
     _raw_logger.addHandler(handler)
-    _raw_logger.setLevel(logging.INFO)
+_raw_logger.setLevel(logging.INFO)
+_raw_logger.propagate = False
 
 class AMAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        return f"[AM v4.0.1] {msg}", kwargs
+        return f"[AM v4.0.2] {msg}", kwargs
 
 logger = AMAdapter(_raw_logger, {})
 
@@ -1253,6 +1254,9 @@ class Mem0SyncManager:
         self._db_lock = asyncio.Lock()
         self._cache_root = os.path.join(DATA_DIR, "cache")
         self._sqlite_file = os.path.join(self._cache_root, "mem0_sync.sqlite")
+        self._reconcile_locks: Dict[str, asyncio.Lock] = {}
+        self._last_reconcile_check: Dict[str, float] = {}
+        self._reconcile_cooldown_seconds = 30.0
 
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
@@ -1360,6 +1364,22 @@ class Mem0SyncManager:
             )
             conn.commit()
 
+    def _list_mappings_sync(self, user_id: str) -> List[Tuple[str, str]]:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            rows = conn.execute(
+                """
+                SELECT owui_memory_id, mem0_memory_id
+                FROM mem0_memory_mappings
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchall()
+            return [
+                (str(row["owui_memory_id"]), str(row["mem0_memory_id"]))
+                for row in rows
+            ]
+
     def _upsert_user_mapping_sync(self, user_id: str, mem0_user_id: str) -> None:
         with self._connect_db() as conn:
             self._ensure_db_schema(conn)
@@ -1408,6 +1428,10 @@ class Mem0SyncManager:
         async with self._db_lock:
             await asyncio.to_thread(self._delete_mapping_sync, user_id, owui_memory_id)
 
+    async def _list_mappings(self, user_id: str) -> List[Tuple[str, str]]:
+        async with self._db_lock:
+            return await asyncio.to_thread(self._list_mappings_sync, user_id)
+
     async def _store_user_mapping(self, user_id: str, mem0_user_id: str) -> None:
         async with self._db_lock:
             await asyncio.to_thread(
@@ -1417,6 +1441,13 @@ class Mem0SyncManager:
     async def _get_user_mapping(self, user_id: str) -> Optional[str]:
         async with self._db_lock:
             return await asyncio.to_thread(self._get_user_mapping_sync, user_id)
+
+    def _get_reconcile_lock(self, user_id: str) -> asyncio.Lock:
+        lock = self._reconcile_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._reconcile_locks[user_id] = lock
+        return lock
 
     def _render_mem0_user_id(self, user_id: str) -> str:
         template = str(
@@ -1501,12 +1532,17 @@ class Mem0SyncManager:
         }
 
     async def _request(
-        self, method: str, path: str, payload: Optional[Dict[str, Any]] = None
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]] = None,
+        expected_statuses: Optional[Set[int]] = None,
     ) -> Tuple[int, Any]:
         if not self._is_enabled():
             return 0, None
 
         self._ensure_session()
+        expected_statuses = expected_statuses or set()
         request_kwargs: Dict[str, Any] = {
             "headers": self._headers(),
             "timeout": self._timeout(),
@@ -1527,13 +1563,19 @@ class Mem0SyncManager:
 
                 if not (200 <= response.status < 300):
                     payload_summary = self._summarize_payload_for_logs(payload)
-                    logger.warning(
-                        f"Mem0 mirror {method} {path} failed with status {response.status}: "
-                        f"{truncate_text(text, 300)}"
-                    )
-                    logger.warning(
-                        f"Mem0 request summary for {method} {path}: {payload_summary}"
-                    )
+                    if response.status in expected_statuses:
+                        logger.debug(
+                            f"Mem0 mirror {method} {path} returned expected status {response.status}: "
+                            f"{truncate_text(text, 300)}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Mem0 mirror {method} {path} failed with status {response.status}: "
+                            f"{truncate_text(text, 300)}"
+                        )
+                        logger.warning(
+                            f"Mem0 request summary for {method} {path}: {payload_summary}"
+                        )
                     if (
                         method == "POST"
                         and path.rstrip("/") == "/v1/memories"
@@ -1565,6 +1607,94 @@ class Mem0SyncManager:
                 if isinstance(item, dict) and item.get("id"):
                     return str(item["id"])
         return None
+
+    async def _mem0_memory_exists(self, mem0_memory_id: str) -> Optional[bool]:
+        if not mem0_memory_id:
+            return None
+
+        paths_to_try = [
+            f"/v1/memories/{mem0_memory_id}",
+            f"/v1/memories/{mem0_memory_id}/",
+        ]
+        saw_not_found = False
+
+        for path in paths_to_try:
+            status, _ = await self._request(
+                "GET", path, expected_statuses={404}
+            )
+            if 200 <= status < 300:
+                return True
+            if status == 404:
+                saw_not_found = True
+                continue
+            if status in {0, 405}:
+                continue
+            logger.warning(
+                f"Mem0 existence check for memory {mem0_memory_id} returned status {status}; skipping delete reconciliation for now"
+            )
+            return None
+
+        if saw_not_found:
+            return False
+        return None
+
+    async def reconcile_deleted_memories(
+        self,
+        user_id: str,
+        local_memory_ids: Set[str],
+        delete_local_memory: Callable[[str], Awaitable[bool]],
+        force: bool = False,
+    ) -> Dict[str, int]:
+        result = {
+            "checked": 0,
+            "deleted": 0,
+            "stale_mappings": 0,
+            "skipped": 0,
+        }
+        if not self._is_enabled():
+            return result
+
+        lock = self._get_reconcile_lock(user_id)
+        async with lock:
+            now = time.monotonic()
+            last_check = self._last_reconcile_check.get(user_id, 0.0)
+            if not force and (now - last_check) < self._reconcile_cooldown_seconds:
+                result["skipped"] = 1
+                return result
+            self._last_reconcile_check[user_id] = now
+
+            mappings = await self._list_mappings(user_id)
+            if not mappings:
+                return result
+
+            for owui_memory_id, mem0_memory_id in mappings:
+                if owui_memory_id not in local_memory_ids:
+                    await self._delete_mapping(user_id, owui_memory_id)
+                    result["stale_mappings"] += 1
+                    continue
+
+                exists_in_mem0 = await self._mem0_memory_exists(mem0_memory_id)
+                if exists_in_mem0 is None:
+                    continue
+
+                result["checked"] += 1
+                if exists_in_mem0:
+                    continue
+
+                deleted = await delete_local_memory(owui_memory_id)
+                if deleted:
+                    local_memory_ids.discard(owui_memory_id)
+                    await self._delete_mapping(user_id, owui_memory_id)
+                    result["deleted"] += 1
+                    logger.info(
+                        f"Reconciled deleted Mem0 memory back into Open WebUI (Open WebUI ID: {owui_memory_id}, Mem0 ID: {mem0_memory_id})"
+                    )
+                else:
+                    logger.warning(
+                        f"Mem0 memory {mem0_memory_id} is gone but local cleanup failed for Open WebUI memory {owui_memory_id}"
+                    )
+
+            return result
 
     async def sync_memory_create(
         self,
@@ -1694,7 +1824,11 @@ class Mem0SyncManager:
         if not mem0_memory_id:
             return False
 
-        status, _ = await self._request("DELETE", f"/v1/memories/{mem0_memory_id}")
+        status, _ = await self._request(
+            "DELETE",
+            f"/v1/memories/{mem0_memory_id}",
+            expected_statuses={404},
+        )
         if 200 <= status < 300 or status == 404:
             await self._delete_mapping(user_id, owui_memory_id)
             logger.info(
@@ -1748,6 +1882,91 @@ class MemoryPipeline:
         except Exception as e:
             logger.warning(f"Failed to fetch user object for {user_id}: {e}")
             return None
+
+    async def _delete_local_memory(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        mirror_to_mem0: bool = True,
+        log_context: str = "Memory",
+    ) -> bool:
+        memory_id = normalize_memory_id(memory_id)
+        try:
+            Memories.delete_memory_by_id(memory_id)
+        except Exception as e:
+            logger.exception(f"{log_context}: Failed to delete memory {memory_id}: {e}")
+            return False
+
+        if VECTOR_DB_CLIENT:
+            try:
+                VECTOR_DB_CLIENT.delete(
+                    collection_name=f"user-memory-{user_id}",
+                    ids=[memory_id],
+                )
+                logger.debug(f"{log_context}: Deleted memory {memory_id} from vector DB")
+            except Exception as vec_err:
+                logger.warning(
+                    f"{log_context}: Failed to delete memory {memory_id} from vector DB: {vec_err}"
+                )
+
+        await self.embedding_manager.delete_embedding_persistent(user_id, memory_id)
+
+        if mirror_to_mem0 and self.mem0_sync_manager:
+            try:
+                await self.mem0_sync_manager.sync_memory_delete(user_id, memory_id)
+            except Exception as mem0_err:
+                logger.warning(
+                    f"{log_context}: Mem0 mirror delete failed for memory {memory_id}: {mem0_err}"
+                )
+
+        logger.info(f"{log_context}: Deleted memory {memory_id}")
+        return True
+
+    async def reconcile_mem0_deleted_memories(
+        self, user_id: str, all_memories: List[Any]
+    ) -> List[Any]:
+        if not self.mem0_sync_manager:
+            return all_memories
+
+        local_memory_ids = {
+            memory_id
+            for memory_id in (self._get_memory_id(memory) for memory in all_memories)
+            if memory_id is not None
+        }
+        reconciliation = await self.mem0_sync_manager.reconcile_deleted_memories(
+            user_id=user_id,
+            local_memory_ids=local_memory_ids,
+            delete_local_memory=lambda memory_id: self._delete_local_memory(
+                user_id,
+                memory_id,
+                mirror_to_mem0=False,
+                log_context="Mem0 reconcile",
+            ),
+        )
+        if reconciliation["deleted"] > 0:
+            try:
+                refreshed_memories = Memories.get_memories_by_user_id(user_id)
+                logger.info(
+                    f"Mem0 reconcile: removed {reconciliation['deleted']} stale local memories for user {user_id}"
+                )
+                return refreshed_memories
+            except Exception as e:
+                logger.warning(
+                    f"Mem0 reconcile: deleted local memories but failed to refresh memory list for user {user_id}: {e}"
+                )
+                remaining_ids = local_memory_ids
+                return [
+                    memory
+                    for memory in all_memories
+                    if self._get_memory_id(memory) in remaining_ids
+                ]
+
+        if reconciliation["stale_mappings"] > 0:
+            logger.debug(
+                f"Mem0 reconcile: pruned {reconciliation['stale_mappings']} stale mirror mappings for user {user_id}"
+            )
+        return all_memories
 
     def _find_memory_by_exact_content(
         self, memories: List[Any], content: str, excluded_ids: Optional[Set[str]] = None
@@ -2510,36 +2729,14 @@ class MemoryPipeline:
                 elif kind == "DELETE" and normalized_op.get("id"):
                     try:
                         memory_id = normalize_memory_id(normalized_op["id"])
-                        Memories.delete_memory_by_id(memory_id)
-
-                        if VECTOR_DB_CLIENT:
-                            try:
-                                VECTOR_DB_CLIENT.delete(
-                                    collection_name=f"user-memory-{user_id}",
-                                    ids=[memory_id],
-                                )
-                                logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
-                            except Exception as vec_err:
-                                logger.warning(
-                                    f"Failed to delete memory from vector DB: {vec_err}"
-                                )
-
-                        await self.embedding_manager.delete_embedding_persistent(
-                            user_id, memory_id
+                        deleted = await self._delete_local_memory(
+                            user_id,
+                            memory_id,
+                            mirror_to_mem0=True,
+                            log_context="Memory operation",
                         )
-
-                        if self.mem0_sync_manager:
-                            try:
-                                await self.mem0_sync_manager.sync_memory_delete(
-                                    user_id, memory_id
-                                )
-                            except Exception as mem0_err:
-                                logger.warning(
-                                    f"Mem0 mirror delete failed for memory {memory_id}: {mem0_err}"
-                                )
-
-                        success_ops.append(normalized_op)
-                        logger.info(f"Memory deleted (ID: {memory_id})")
+                        if deleted:
+                            success_ops.append(normalized_op)
                     except Exception as del_err:
                         logger.exception(f"Failed to delete memory: {del_err}")
 
@@ -2731,35 +2928,14 @@ class MemoryPipeline:
                     memory_id = self._get_memory_id(memory)
                     if not memory_id:
                         continue
-
-                    Memories.delete_memory_by_id(memory_id)
-
-                    if VECTOR_DB_CLIENT:
-                        try:
-                            VECTOR_DB_CLIENT.delete(
-                                collection_name=f"user-memory-{user_id}",
-                                ids=[memory_id]
-                            )
-                            logger.debug(f"Pruning: Deleted memory {memory_id} from vector DB")
-                        except Exception as vec_err:
-                            logger.warning(f"Pruning: Failed to delete memory {memory_id} from vector DB: {vec_err}")
-
-                    await self.embedding_manager.delete_embedding_persistent(
-                        user_id, memory_id
+                    deleted = await self._delete_local_memory(
+                        user_id,
+                        memory_id,
+                        mirror_to_mem0=True,
+                        log_context="Pruning",
                     )
-
-                    if self.mem0_sync_manager:
-                        try:
-                            await self.mem0_sync_manager.sync_memory_delete(
-                                user_id, memory_id
-                            )
-                        except Exception as mem0_err:
-                            logger.warning(
-                                f"Mem0 mirror delete failed during pruning for memory {memory_id}: {mem0_err}"
-                            )
-
-                    deleted_count += 1
-                    logger.debug(f"Pruning: Deleted memory {memory_id}")
+                    if deleted:
+                        deleted_count += 1
                     
                 except Exception as del_err:
                     logger.error(
@@ -2952,34 +3128,14 @@ class MemoryPipeline:
                                 memory_id = self._get_memory_id(m)
                                 if not memory_id:
                                     continue
-
-                                Memories.delete_memory_by_id(memory_id)
-
-                                if VECTOR_DB_CLIENT:
-                                    try:
-                                        VECTOR_DB_CLIENT.delete(
-                                            collection_name=f"user-memory-{user_id}",
-                                            ids=[memory_id]
-                                        )
-                                        logger.debug(f"Summarization: Deleted memory {memory_id} from vector DB")
-                                    except Exception as vec_err:
-                                        logger.warning(f"Summarization: Failed to delete memory {memory_id} from vector DB: {vec_err}")
-
-                                await self.embedding_manager.delete_embedding_persistent(
-                                    user_id, memory_id
+                                deleted = await self._delete_local_memory(
+                                    user_id,
+                                    memory_id,
+                                    mirror_to_mem0=True,
+                                    log_context="Summarization",
                                 )
-
-                                if self.mem0_sync_manager:
-                                    try:
-                                        await self.mem0_sync_manager.sync_memory_delete(
-                                            user_id, memory_id
-                                        )
-                                    except Exception as mem0_err:
-                                        logger.warning(
-                                            f"Mem0 mirror delete failed during summarization cleanup for memory {memory_id}: {mem0_err}"
-                                        )
-
-                                source_memories_deleted += 1
+                                if deleted:
+                                    source_memories_deleted += 1
                             except Exception as del_err:
                                 logger.error(
                                     f"Summarization: Failed to delete source memory {getattr(m, 'id', 'unknown')}: {del_err}"
@@ -3698,7 +3854,7 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter v4.0")
+        logger.info("Initializing Adaptive Memory Filter v4.0.2")
         self.valves = self.Valves()
         self.error_manager = ErrorManager()
         # Pass a lambda to always get the current valves state
@@ -3717,7 +3873,7 @@ Your output must be valid JSON only. No additional text.""",
         self._tasks_started = False
         self._valve_hash = None  # Track valve changes
 
-        logger.info("Adaptive Memory Filter v4.0 initialized")
+        logger.info("Adaptive Memory Filter v4.0.2 initialized")
     def _check_and_handle_valve_changes(self):
         """Detect if valves have changed and restart tasks if needed."""
         # Hash important valve settings that affect background tasks
@@ -3937,6 +4093,16 @@ Your output must be valid JSON only. No additional text.""",
         except Exception as e:
             logger.error(f"Failed to fetch memories: {e}")
             all_memories = []
+
+        if all_memories and self.mem0_sync_manager:
+            try:
+                all_memories = await pipeline.reconcile_mem0_deleted_memories(
+                    user_id, all_memories
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Mem0 reconcile failed for user {user_id}; continuing with local memories: {e}"
+                )
 
         # 2. Filter relevant memories
         relevant_memories = []
