@@ -1244,6 +1244,391 @@ class EmbeddingManager:
         return new_emb
 
 
+class Mem0SyncManager:
+    """Best-effort mirror of local memories into a Mem0 instance."""
+
+    def __init__(self, get_valves: Callable[[], Any]):
+        self.get_valves = get_valves
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._db_lock = asyncio.Lock()
+        self._cache_root = os.path.join(DATA_DIR, "cache")
+        self._sqlite_file = os.path.join(self._cache_root, "mem0_sync.sqlite")
+
+    async def cleanup(self):
+        """Clean up resources like the shared HTTP session."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    def _is_enabled(self) -> bool:
+        valves = self.get_valves()
+        return bool(
+            getattr(valves, "enable_mem0_sync", False)
+            and str(getattr(valves, "mem0_api_base_url", "") or "").strip()
+            and str(getattr(valves, "mem0_api_key", "") or "").strip()
+        )
+
+    def _ensure_session(self):
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession()
+
+    def _base_url(self) -> str:
+        return str(self.get_valves().mem0_api_base_url).rstrip("/")
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Token {self.get_valves().mem0_api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def _timeout(self) -> aiohttp.ClientTimeout:
+        return aiohttp.ClientTimeout(total=float(self.get_valves().mem0_timeout_seconds))
+
+    def _connect_db(self) -> sqlite3.Connection:
+        os.makedirs(self._cache_root, exist_ok=True)
+        conn = sqlite3.connect(self._sqlite_file, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _ensure_db_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mem0_memory_mappings (
+                user_id TEXT NOT NULL,
+                owui_memory_id TEXT NOT NULL,
+                mem0_memory_id TEXT NOT NULL,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, owui_memory_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mem0_user_mappings (
+                owui_user_id TEXT PRIMARY KEY,
+                mem0_user_id TEXT NOT NULL,
+                synced_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _upsert_mapping_sync(
+        self, user_id: str, owui_memory_id: str, mem0_memory_id: str
+    ) -> None:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO mem0_memory_mappings
+                    (user_id, owui_memory_id, mem0_memory_id, synced_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    normalize_memory_id(owui_memory_id),
+                    str(mem0_memory_id),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def _get_mapping_sync(self, user_id: str, owui_memory_id: str) -> Optional[str]:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            row = conn.execute(
+                """
+                SELECT mem0_memory_id
+                FROM mem0_memory_mappings
+                WHERE user_id = ? AND owui_memory_id = ?
+                """,
+                (user_id, normalize_memory_id(owui_memory_id)),
+            ).fetchone()
+            return str(row["mem0_memory_id"]) if row is not None else None
+
+    def _delete_mapping_sync(self, user_id: str, owui_memory_id: str) -> None:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            conn.execute(
+                """
+                DELETE FROM mem0_memory_mappings
+                WHERE user_id = ? AND owui_memory_id = ?
+                """,
+                (user_id, normalize_memory_id(owui_memory_id)),
+            )
+            conn.commit()
+
+    def _upsert_user_mapping_sync(self, user_id: str, mem0_user_id: str) -> None:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO mem0_user_mappings
+                    (owui_user_id, mem0_user_id, synced_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    user_id,
+                    str(mem0_user_id),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def _get_user_mapping_sync(self, user_id: str) -> Optional[str]:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            row = conn.execute(
+                """
+                SELECT mem0_user_id
+                FROM mem0_user_mappings
+                WHERE owui_user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            return str(row["mem0_user_id"]) if row is not None else None
+
+    async def _store_mapping(
+        self, user_id: str, owui_memory_id: str, mem0_memory_id: str
+    ) -> None:
+        async with self._db_lock:
+            await asyncio.to_thread(
+                self._upsert_mapping_sync, user_id, owui_memory_id, mem0_memory_id
+            )
+
+    async def _get_mapping(self, user_id: str, owui_memory_id: str) -> Optional[str]:
+        async with self._db_lock:
+            return await asyncio.to_thread(
+                self._get_mapping_sync, user_id, owui_memory_id
+            )
+
+    async def _delete_mapping(self, user_id: str, owui_memory_id: str) -> None:
+        async with self._db_lock:
+            await asyncio.to_thread(self._delete_mapping_sync, user_id, owui_memory_id)
+
+    async def _store_user_mapping(self, user_id: str, mem0_user_id: str) -> None:
+        async with self._db_lock:
+            await asyncio.to_thread(
+                self._upsert_user_mapping_sync, user_id, mem0_user_id
+            )
+
+    async def _get_user_mapping(self, user_id: str) -> Optional[str]:
+        async with self._db_lock:
+            return await asyncio.to_thread(self._get_user_mapping_sync, user_id)
+
+    def _render_mem0_user_id(self, user_id: str) -> str:
+        template = str(
+            getattr(self.get_valves(), "mem0_user_id_template", "owui:{user_id}")
+            or "owui:{user_id}"
+        )
+        try:
+            rendered = template.format(user_id=user_id)
+        except Exception as e:
+            logger.warning(
+                f"Invalid mem0_user_id_template '{template}', falling back to raw user_id: {e}"
+            )
+            rendered = str(user_id)
+
+        rendered = str(rendered).strip()
+        return rendered or str(user_id)
+
+    async def _resolve_mem0_user_id(self, user_id: str) -> str:
+        mem0_user_id = self._render_mem0_user_id(user_id)
+        existing_mapping = await self._get_user_mapping(user_id)
+        if existing_mapping != mem0_user_id:
+            await self._store_user_mapping(user_id, mem0_user_id)
+        return mem0_user_id
+
+    def _build_metadata(
+        self,
+        user_id: str,
+        mem0_user_id: str,
+        owui_memory_id: str,
+        tags: List[str],
+        memory_bank: str,
+        confidence: Optional[float],
+    ) -> Dict[str, Any]:
+        return {
+            "source": "adaptive_memory",
+            "owui_user_id": str(user_id),
+            "mem0_user_id": str(mem0_user_id),
+            "owui_memory_id": normalize_memory_id(owui_memory_id),
+            "tags": list(tags or []),
+            "memory_bank": str(memory_bank or "General"),
+            "confidence": self._normalize_confidence(confidence),
+        }
+
+    def _normalize_confidence(self, value: Any) -> float:
+        try:
+            confidence = float(1.0 if value is None else value)
+        except (TypeError, ValueError):
+            confidence = 1.0
+        return max(0.0, min(1.0, confidence))
+
+    async def _request(
+        self, method: str, path: str, payload: Optional[Dict[str, Any]] = None
+    ) -> Tuple[int, Any]:
+        if not self._is_enabled():
+            return 0, None
+
+        self._ensure_session()
+        request_kwargs: Dict[str, Any] = {
+            "headers": self._headers(),
+            "timeout": self._timeout(),
+        }
+        if payload is not None:
+            request_kwargs["json"] = payload
+
+        url = f"{self._base_url()}{path}"
+        try:
+            async with self._session.request(method, url, **request_kwargs) as response:
+                text = await response.text()
+                data: Any = None
+                if text.strip():
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        data = text
+
+                if not (200 <= response.status < 300):
+                    logger.warning(
+                        f"Mem0 mirror {method} {path} failed with status {response.status}: "
+                        f"{truncate_text(text, 300)}"
+                    )
+                return response.status, data
+        except Exception as e:
+            logger.warning(f"Mem0 mirror {method} {path} failed: {e}")
+            return 0, None
+
+    def _extract_mem0_memory_id(self, response_data: Any) -> Optional[str]:
+        if isinstance(response_data, dict):
+            if response_data.get("id"):
+                return str(response_data["id"])
+            results = response_data.get("results")
+            if isinstance(results, list):
+                return self._extract_mem0_memory_id(results)
+        elif isinstance(response_data, list):
+            for item in response_data:
+                if isinstance(item, dict) and item.get("id"):
+                    return str(item["id"])
+        return None
+
+    async def sync_memory_create(
+        self,
+        user_id: str,
+        owui_memory_id: str,
+        content: str,
+        tags: List[str],
+        memory_bank: str,
+        confidence: Optional[float],
+    ) -> Optional[str]:
+        if not self._is_enabled() or not content or not owui_memory_id:
+            return None
+
+        existing_mapping = await self._get_mapping(user_id, owui_memory_id)
+        if existing_mapping:
+            return existing_mapping
+
+        mem0_user_id = await self._resolve_mem0_user_id(user_id)
+
+        payload = {
+            "user_id": mem0_user_id,
+            "app_id": str(self.get_valves().mem0_app_id),
+            "messages": [{"role": "user", "content": content}],
+            "infer": False,
+            "async_mode": False,
+            "metadata": self._build_metadata(
+                user_id, mem0_user_id, owui_memory_id, tags, memory_bank, confidence
+            ),
+        }
+        status, response_data = await self._request("POST", "/v1/memories", payload)
+        if not (200 <= status < 300):
+            return None
+
+        mem0_memory_id = self._extract_mem0_memory_id(response_data)
+        if mem0_memory_id:
+            await self._store_mapping(user_id, owui_memory_id, mem0_memory_id)
+            logger.info(
+                f"Mirrored memory to Mem0 (Open WebUI ID: {owui_memory_id}, Mem0 ID: {mem0_memory_id})"
+            )
+        else:
+            logger.warning(
+                f"Mem0 mirror add succeeded but no memory ID was returned for Open WebUI memory {owui_memory_id}"
+            )
+        return mem0_memory_id
+
+    async def sync_memory_update(
+        self,
+        user_id: str,
+        owui_memory_id: str,
+        content: str,
+        tags: List[str],
+        memory_bank: str,
+        confidence: Optional[float],
+    ) -> bool:
+        if not self._is_enabled() or not content or not owui_memory_id:
+            return False
+
+        mem0_memory_id = await self._get_mapping(user_id, owui_memory_id)
+        if not mem0_memory_id:
+            logger.info(
+                f"Mem0 mapping missing for memory {owui_memory_id}; creating a fresh mirrored record"
+            )
+            created_id = await self.sync_memory_create(
+                user_id, owui_memory_id, content, tags, memory_bank, confidence
+            )
+            return created_id is not None
+
+        mem0_user_id = await self._resolve_mem0_user_id(user_id)
+
+        payload = {
+            "text": content,
+            "metadata": self._build_metadata(
+                user_id, mem0_user_id, owui_memory_id, tags, memory_bank, confidence
+            ),
+        }
+        status, _ = await self._request(
+            "PUT", f"/v1/memories/{mem0_memory_id}", payload
+        )
+        if 200 <= status < 300:
+            logger.info(
+                f"Updated mirrored Mem0 memory (Open WebUI ID: {owui_memory_id}, Mem0 ID: {mem0_memory_id})"
+            )
+            return True
+
+        if status == 404:
+            logger.warning(
+                f"Mem0 mirror mapping was stale for Open WebUI memory {owui_memory_id}; recreating mirror"
+            )
+            await self._delete_mapping(user_id, owui_memory_id)
+            created_id = await self.sync_memory_create(
+                user_id, owui_memory_id, content, tags, memory_bank, confidence
+            )
+            return created_id is not None
+
+        return False
+
+    async def sync_memory_delete(self, user_id: str, owui_memory_id: str) -> bool:
+        if not self._is_enabled() or not owui_memory_id:
+            return False
+
+        mem0_memory_id = await self._get_mapping(user_id, owui_memory_id)
+        if not mem0_memory_id:
+            return False
+
+        status, _ = await self._request("DELETE", f"/v1/memories/{mem0_memory_id}")
+        if 200 <= status < 300 or status == 404:
+            await self._delete_mapping(user_id, owui_memory_id)
+            logger.info(
+                f"Deleted mirrored Mem0 memory (Open WebUI ID: {owui_memory_id}, Mem0 ID: {mem0_memory_id})"
+            )
+            return True
+
+        return False
+
+
 # ------------------------------------------------------------------------------
 # Memory Pipeline
 # ------------------------------------------------------------------------------
@@ -1257,10 +1642,12 @@ class MemoryPipeline:
         valves: Any,
         embedding_manager: EmbeddingManager,
         error_manager: ErrorManager,
+        mem0_sync_manager: Optional[Mem0SyncManager] = None,
     ):
         self.valves = valves
         self.embedding_manager = embedding_manager
         self.error_manager = error_manager
+        self.mem0_sync_manager = mem0_sync_manager
 
     def _get_memory_id(self, memory: Any) -> Optional[str]:
         memory_id = memory.id if hasattr(memory, "id") else memory.get("id")
@@ -1897,7 +2284,7 @@ class MemoryPipeline:
                                 mem_obj = Memories.insert_new_memory(user_id, final_content)
                                 vector_sync_needed = True
 
-                        memory_id = getattr(mem_obj, "id", None)
+                        memory_id = self._get_memory_id(mem_obj)
                         if vector_sync_needed and mem_obj is not None:
                             await self._sync_memory_vector(
                                 user_id, mem_obj, final_content, user_obj=user_obj
@@ -1916,6 +2303,21 @@ class MemoryPipeline:
                             await self.embedding_manager.store_embedding_persistent(
                                 user_id, memory_key, content, dedup_embedding
                             )
+
+                        if self.mem0_sync_manager and memory_id:
+                            try:
+                                await self.mem0_sync_manager.sync_memory_create(
+                                    user_id=user_id,
+                                    owui_memory_id=memory_id,
+                                    content=content,
+                                    tags=tags,
+                                    memory_bank=bank,
+                                    confidence=confidence,
+                                )
+                            except Exception as mem0_err:
+                                logger.warning(
+                                    f"Mem0 mirror create failed for memory {memory_id}: {mem0_err}"
+                                )
                     except Exception as ins_err:
                         logger.error(f"Failed to insert memory: {ins_err}")
 
@@ -1992,6 +2394,21 @@ class MemoryPipeline:
                                 user_obj=user_obj,
                             )
 
+                            if self.mem0_sync_manager:
+                                try:
+                                    await self.mem0_sync_manager.sync_memory_update(
+                                        user_id=user_id,
+                                        owui_memory_id=memory_id,
+                                        content=new_content,
+                                        tags=tags,
+                                        memory_bank=bank,
+                                        confidence=confidence,
+                                    )
+                                except Exception as mem0_err:
+                                    logger.warning(
+                                        f"Mem0 mirror update failed for memory {memory_id}: {mem0_err}"
+                                    )
+
                             success_ops.append(normalized_op)
                             logger.info(f"Memory updated (ID: {memory_id})")
                         else:
@@ -2020,6 +2437,17 @@ class MemoryPipeline:
                         await self.embedding_manager.delete_embedding_persistent(
                             user_id, memory_id
                         )
+
+                        if self.mem0_sync_manager:
+                            try:
+                                await self.mem0_sync_manager.sync_memory_delete(
+                                    user_id, memory_id
+                                )
+                            except Exception as mem0_err:
+                                logger.warning(
+                                    f"Mem0 mirror delete failed for memory {memory_id}: {mem0_err}"
+                                )
+
                         success_ops.append(normalized_op)
                         logger.info(f"Memory deleted (ID: {memory_id})")
                     except Exception as del_err:
@@ -2229,6 +2657,17 @@ class MemoryPipeline:
                     await self.embedding_manager.delete_embedding_persistent(
                         user_id, memory_id
                     )
+
+                    if self.mem0_sync_manager:
+                        try:
+                            await self.mem0_sync_manager.sync_memory_delete(
+                                user_id, memory_id
+                            )
+                        except Exception as mem0_err:
+                            logger.warning(
+                                f"Mem0 mirror delete failed during pruning for memory {memory_id}: {mem0_err}"
+                            )
+
                     deleted_count += 1
                     logger.debug(f"Pruning: Deleted memory {memory_id}")
                     
@@ -2439,6 +2878,17 @@ class MemoryPipeline:
                                 await self.embedding_manager.delete_embedding_persistent(
                                     user_id, memory_id
                                 )
+
+                                if self.mem0_sync_manager:
+                                    try:
+                                        await self.mem0_sync_manager.sync_memory_delete(
+                                            user_id, memory_id
+                                        )
+                                    except Exception as mem0_err:
+                                        logger.warning(
+                                            f"Mem0 mirror delete failed during summarization cleanup for memory {memory_id}: {mem0_err}"
+                                        )
+
                                 source_memories_deleted += 1
                             except Exception as del_err:
                                 logger.error(
@@ -2587,6 +3037,32 @@ class Filter:
         embedding_api_key: Optional[str] = Field(
             default=None,
             description="Plugin-side embedding API key used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
+        )
+
+        # Optional Mem0 Mirror Configuration
+        enable_mem0_sync: bool = Field(
+            default=False,
+            description="Optionally mirror local memory CRUD operations to Mem0. Disabled by default so memories stay local unless explicitly enabled.",
+        )
+        mem0_api_base_url: str = Field(
+            default="https://api.mem0.ai",
+            description="Base URL for the Mem0 API when Mem0 mirroring is enabled.",
+        )
+        mem0_api_key: Optional[str] = Field(
+            default=None,
+            description="API key for Mem0. Required only when enable_mem0_sync is enabled.",
+        )
+        mem0_app_id: str = Field(
+            default="openwebui-adaptive-memory",
+            description="Mem0 app_id used to namespace memories mirrored from this plugin.",
+        )
+        mem0_timeout_seconds: int = Field(
+            default=30,
+            description="Timeout in seconds for Mem0 API requests.",
+        )
+        mem0_user_id_template: str = Field(
+            default="owui:{user_id}",
+            description="Template used to map an Open WebUI user id into a Mem0 user id. Must include {user_id} when Mem0 mirroring is enabled.",
         )
 
         # Background Task Management Configuration
@@ -3025,6 +3501,7 @@ Your output must be valid JSON only. No additional text.""",
             "summarization_min_cluster_size",
             "summarization_max_cluster_size",
             "summarization_min_memory_age_days",
+            "mem0_timeout_seconds",
         )
         def check_non_negative_int(cls, v, info):
             if not isinstance(v, int) or v < 0:
@@ -3072,6 +3549,19 @@ Your output must be valid JSON only. No additional text.""",
                 )
             return self
 
+        @model_validator(mode="after")
+        def check_mem0_config(self):
+            if self.enable_mem0_sync:
+                if not self.mem0_api_key:
+                    raise ValueError(
+                        "Mem0 API key is required when enable_mem0_sync is enabled"
+                    )
+                if "{user_id}" not in str(self.mem0_user_id_template):
+                    raise ValueError(
+                        "mem0_user_id_template must include '{user_id}' when Mem0 mirroring is enabled"
+                    )
+            return self
+
         @field_validator("allowed_memory_banks", check_fields=False)
         def check_allowed_memory_banks(cls, v):
             if not isinstance(v, list) or not v or v == [""]:
@@ -3117,6 +3607,7 @@ Your output must be valid JSON only. No additional text.""",
         self.embedding_manager = EmbeddingManager(
             lambda: self.valves, self.error_manager
         )
+        self.mem0_sync_manager = Mem0SyncManager(lambda: self.valves)
         self.task_manager = TaskManager(self)
 
         # Initialize internal state
@@ -3177,6 +3668,7 @@ Your output must be valid JSON only. No additional text.""",
     async def cleanup(self):
         await self.task_manager.stop_tasks()
         await self.embedding_manager.cleanup()
+        await self.mem0_sync_manager.cleanup()
 
     def _load_user_valves(self, __user__: Optional[Dict[str, Any]]) -> "Filter.UserValves":
         raw_valves = (__user__ or {}).get("valves", {})
@@ -3334,7 +3826,10 @@ Your output must be valid JSON only. No additional text.""",
 
         # Pipeline
         pipeline = MemoryPipeline(
-            self.valves, self.embedding_manager, self.error_manager
+            self.valves,
+            self.embedding_manager,
+            self.error_manager,
+            self.mem0_sync_manager,
         )
 
         # 1. Retrieve all memories
@@ -3411,7 +3906,10 @@ Your output must be valid JSON only. No additional text.""",
 
         # Pipeline
         pipeline = MemoryPipeline(
-            self.valves, self.embedding_manager, self.error_manager
+            self.valves,
+            self.embedding_manager,
+            self.error_manager,
+            self.mem0_sync_manager,
         )
 
         # Identify Memories
@@ -3484,7 +3982,10 @@ Your output must be valid JSON only. No additional text.""",
                 if self.valves.enable_summarization_task and self.seen_users:
                     logger.info("Background summarization: starting scan...")
                     pipeline = MemoryPipeline(
-                        self.valves, self.embedding_manager, self.error_manager
+                        self.valves,
+                        self.embedding_manager,
+                        self.error_manager,
+                        self.mem0_sync_manager,
                     )
 
                     # Copy set to avoid size change during iteration
