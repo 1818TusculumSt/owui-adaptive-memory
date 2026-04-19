@@ -13,7 +13,7 @@ It is designed to stay mostly automatic once configured:
 - Recall relevant memories with embeddings
 - Keep vector storage and embedding cache in sync
 - Prune or summarize older memories
-- Optionally mirror CRUD into Mem0
+- Optionally queue CRUD for scheduled Mem0 mirroring
 - Reconcile deleted Mem0 records back into Open WebUI
 
 ## Current Behavior
@@ -25,7 +25,7 @@ At a high level:
 4. Relevant memories are selected with embeddings and injected into the prompt.
 5. After the assistant responds, `outlet()` asks the configured LLM to propose memory operations.
 6. Valid `NEW`, `UPDATE`, and `DELETE` operations are applied locally.
-7. Local CRUD is mirrored to Mem0 when enabled.
+7. When Mem0 is enabled, local CRUD is either mirrored inline or queued for the next scheduled Mem0 sync cycle, depending on `mem0_sync_strategy`.
 
 Open WebUI remains the primary local store. Mem0 is optional and best-effort.
 
@@ -39,6 +39,7 @@ Open WebUI remains the primary local store. Mem0 is optional and best-effort.
 - Background memory summarization
 - Background orphaned vector cleanup
 - Optional Mem0 mirroring for create, update, and delete
+- Scheduled background Mem0 batch syncing with persistent queueing
 - Best-effort Mem0 delete reconciliation back into Open WebUI
 - Per-user or global Mem0 user ID overrides
 - Router-aware memory creation path for vector sync compatibility
@@ -80,10 +81,12 @@ Optional:
 
 When Mem0 sync is enabled, the function does four separate things:
 
-1. Local creates are mirrored to Mem0.
-2. Local updates are mirrored to Mem0.
-3. Local deletes are mirrored to Mem0.
+1. Local creates, updates, and deletes are always applied in Open WebUI first.
+2. If `mem0_sync_strategy = background`, Mem0 work is written into a persistent SQLite queue and processed later on the configured interval.
+3. If `mem0_sync_strategy = inline`, Mem0 work is attempted immediately during the request path.
 4. During later inbound requests, missing Mem0 records are reconciled back into Open WebUI by deleting the mapped local memory.
+
+In background mode, queued jobs are coalesced by `(user_id, memory_id)`, so repeated updates collapse into the latest state before the next Mem0 sync cycle runs.
 
 That last piece matters: this is no longer just one-way mirroring. If a mapped memory is deleted upstream in Mem0, the local Open WebUI copy is cleaned up on a later reconciliation pass.
 
@@ -91,6 +94,14 @@ Reconciliation is best-effort and intentionally conservative:
 - expected Mem0 `404` responses are treated as normal for reconciliation
 - unexpected HTTP failures do not delete local memories
 - stale mappings for already-missing local memories are pruned from `mem0_sync.sqlite`
+
+### Recommended Mem0 Mode
+
+For most setups, use:
+- `mem0_sync_strategy = background`
+- `mem0_sync_batch_interval_seconds = 7200`
+
+That keeps Mem0 latency out of the chat path and makes syncing behave more like the summarization task.
 
 ## Mem0 User ID Resolution
 
@@ -154,6 +165,10 @@ Examples:
 - `mem0_api_key`
 - `mem0_app_id`
 - `mem0_timeout_seconds`
+- `mem0_sync_strategy`
+- `mem0_sync_batch_size`
+- `mem0_sync_batch_interval_seconds`
+- `mem0_sync_retry_delay_seconds`
 - `mem0_reconcile_cooldown_seconds`
 - `mem0_user_id_template`
 - `mem0_user_id_override`
@@ -171,6 +186,7 @@ Examples:
 
 Current active background loops:
 - Memory summarization
+- Mem0 background sync
 - Error counter logging
 - Orphaned vector cleanup
 - Rogue task scavenging on startup
@@ -183,7 +199,7 @@ Open WebUI still stores the actual memory rows.
 
 This function may also maintain sidecar files under `DATA_DIR/cache`:
 - `embeddings.sqlite`: persistent embedding cache
-- `mem0_sync.sqlite`: Mem0 memory/user mapping state
+- `mem0_sync.sqlite`: Mem0 memory mappings, user mappings, and queued background sync jobs
 
 Legacy embedding JSON cache files may also appear if SQLite persistence fails and the code falls back.
 
@@ -224,6 +240,7 @@ Optional:
 ## Caveats
 
 - Mem0 sync is best-effort, not transactional.
+- In `background` mode, Mem0 can lag behind local memory by up to `mem0_sync_batch_interval_seconds`.
 - Reconciliation runs during inbound requests, not as a separate continuous Mem0 polling loop.
 - If Mem0 is unavailable, local memory remains intact.
 - Some logging and configuration fields are broader than the currently implemented feature set.

@@ -1,7 +1,7 @@
 import json
 import traceback
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
     Awaitable,
@@ -1270,6 +1270,38 @@ class Mem0SyncManager:
             and str(getattr(valves, "mem0_api_key", "") or "").strip()
         )
 
+    def should_use_background_sync(self) -> bool:
+        strategy = str(
+            getattr(self.get_valves(), "mem0_sync_strategy", "background")
+            or "background"
+        ).strip()
+        return self._is_enabled() and strategy == "background"
+
+    def _get_sync_batch_size(self) -> int:
+        try:
+            batch_size = int(getattr(self.get_valves(), "mem0_sync_batch_size", 10))
+        except (TypeError, ValueError):
+            batch_size = 10
+        return max(1, batch_size)
+
+    def _get_sync_batch_interval_seconds(self) -> float:
+        try:
+            interval = float(
+                getattr(self.get_valves(), "mem0_sync_batch_interval_seconds", 7200.0)
+            )
+        except (TypeError, ValueError):
+            interval = 7200.0
+        return max(0.1, interval)
+
+    def _get_sync_retry_delay_seconds(self) -> float:
+        try:
+            retry_delay = float(
+                getattr(self.get_valves(), "mem0_sync_retry_delay_seconds", 15.0)
+            )
+        except (TypeError, ValueError):
+            retry_delay = 15.0
+        return max(1.0, retry_delay)
+
     def _ensure_session(self):
         if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -1314,6 +1346,28 @@ class Mem0SyncManager:
                 mem0_user_id TEXT NOT NULL,
                 synced_at TEXT NOT NULL
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mem0_sync_jobs (
+                user_id TEXT NOT NULL,
+                owui_memory_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload TEXT,
+                queued_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                available_at TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                PRIMARY KEY (user_id, owui_memory_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mem0_sync_jobs_available_at
+            ON mem0_sync_jobs (available_at, queued_at)
             """
         )
 
@@ -1408,6 +1462,146 @@ class Mem0SyncManager:
             ).fetchone()
             return str(row["mem0_user_id"]) if row is not None else None
 
+    def _enqueue_job_sync(
+        self,
+        user_id: str,
+        owui_memory_id: str,
+        operation: str,
+        payload: Optional[Dict[str, Any]],
+        available_at: datetime,
+    ) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        available_at_iso = available_at.astimezone(timezone.utc).isoformat()
+        payload_json = json.dumps(payload) if payload is not None else None
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO mem0_sync_jobs (
+                    user_id,
+                    owui_memory_id,
+                    operation,
+                    payload,
+                    queued_at,
+                    updated_at,
+                    available_at,
+                    attempt_count,
+                    last_error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
+                ON CONFLICT(user_id, owui_memory_id) DO UPDATE SET
+                    operation = excluded.operation,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at,
+                    available_at = excluded.available_at,
+                    attempt_count = 0,
+                    last_error = NULL
+                """,
+                (
+                    user_id,
+                    normalize_memory_id(owui_memory_id),
+                    str(operation).upper(),
+                    payload_json,
+                    now_iso,
+                    now_iso,
+                    available_at_iso,
+                ),
+            )
+            conn.commit()
+
+    def _fetch_ready_jobs_sync(self, limit: int) -> List[Dict[str, Any]]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            rows = conn.execute(
+                """
+                SELECT
+                    user_id,
+                    owui_memory_id,
+                    operation,
+                    payload,
+                    queued_at,
+                    updated_at,
+                    available_at,
+                    attempt_count,
+                    last_error
+                FROM mem0_sync_jobs
+                WHERE available_at <= ?
+                ORDER BY queued_at ASC
+                LIMIT ?
+                """,
+                (now_iso, int(limit)),
+            ).fetchall()
+
+        jobs: List[Dict[str, Any]] = []
+        for row in rows:
+            payload_value = row["payload"]
+            parsed_payload: Optional[Dict[str, Any]] = None
+            if payload_value:
+                try:
+                    loaded_payload = json.loads(str(payload_value))
+                    if isinstance(loaded_payload, dict):
+                        parsed_payload = loaded_payload
+                except json.JSONDecodeError:
+                    parsed_payload = None
+
+            jobs.append(
+                {
+                    "user_id": str(row["user_id"]),
+                    "owui_memory_id": str(row["owui_memory_id"]),
+                    "operation": str(row["operation"]),
+                    "payload": parsed_payload,
+                    "queued_at": str(row["queued_at"]),
+                    "updated_at": str(row["updated_at"]),
+                    "available_at": str(row["available_at"]),
+                    "attempt_count": int(row["attempt_count"] or 0),
+                    "last_error": row["last_error"],
+                }
+            )
+        return jobs
+
+    def _delete_job_sync(self, user_id: str, owui_memory_id: str) -> None:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            conn.execute(
+                """
+                DELETE FROM mem0_sync_jobs
+                WHERE user_id = ? AND owui_memory_id = ?
+                """,
+                (user_id, normalize_memory_id(owui_memory_id)),
+            )
+            conn.commit()
+
+    def _reschedule_job_sync(
+        self,
+        user_id: str,
+        owui_memory_id: str,
+        attempt_count: int,
+        available_at: datetime,
+        last_error: str,
+    ) -> None:
+        with self._connect_db() as conn:
+            self._ensure_db_schema(conn)
+            conn.execute(
+                """
+                UPDATE mem0_sync_jobs
+                SET attempt_count = ?,
+                    available_at = ?,
+                    updated_at = ?,
+                    last_error = ?
+                WHERE user_id = ? AND owui_memory_id = ?
+                """,
+                (
+                    int(attempt_count),
+                    available_at.astimezone(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                    truncate_text(last_error, 500),
+                    user_id,
+                    normalize_memory_id(owui_memory_id),
+                ),
+            )
+            conn.commit()
+
     async def _store_mapping(
         self, user_id: str, owui_memory_id: str, mem0_memory_id: str
     ) -> None:
@@ -1439,6 +1633,52 @@ class Mem0SyncManager:
     async def _get_user_mapping(self, user_id: str) -> Optional[str]:
         async with self._db_lock:
             return await asyncio.to_thread(self._get_user_mapping_sync, user_id)
+
+    async def _enqueue_job(
+        self,
+        user_id: str,
+        owui_memory_id: str,
+        operation: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        available_at: Optional[datetime] = None,
+    ) -> None:
+        available_at = available_at or datetime.now(timezone.utc)
+        async with self._db_lock:
+            await asyncio.to_thread(
+                self._enqueue_job_sync,
+                user_id,
+                owui_memory_id,
+                operation,
+                payload,
+                available_at,
+            )
+
+    async def _fetch_ready_jobs(self, limit: int) -> List[Dict[str, Any]]:
+        async with self._db_lock:
+            return await asyncio.to_thread(self._fetch_ready_jobs_sync, limit)
+
+    async def _delete_job(self, user_id: str, owui_memory_id: str) -> None:
+        async with self._db_lock:
+            await asyncio.to_thread(self._delete_job_sync, user_id, owui_memory_id)
+
+    async def _reschedule_job(
+        self,
+        user_id: str,
+        owui_memory_id: str,
+        attempt_count: int,
+        available_at: datetime,
+        last_error: str,
+    ) -> None:
+        async with self._db_lock:
+            await asyncio.to_thread(
+                self._reschedule_job_sync,
+                user_id,
+                owui_memory_id,
+                attempt_count,
+                available_at,
+                last_error,
+            )
 
     def _get_reconcile_lock(self, user_id: str) -> asyncio.Lock:
         lock = self._reconcile_locks.get(user_id)
@@ -1861,6 +2101,187 @@ class Mem0SyncManager:
 
         return False
 
+    async def enqueue_memory_upsert(
+        self,
+        user_id: str,
+        owui_memory_id: str,
+        content: str,
+        tags: List[str],
+        memory_bank: str,
+        confidence: Optional[float],
+        mem0_user_id_override: Optional[str] = None,
+    ) -> bool:
+        if not self._is_enabled() or not content or not owui_memory_id:
+            return False
+
+        payload = {
+            "content": str(content),
+            "tags": list(tags or []),
+            "memory_bank": str(memory_bank or "General"),
+            "confidence": self._normalize_confidence(confidence),
+            "mem0_user_id_override": str(mem0_user_id_override or "").strip(),
+        }
+        await self._enqueue_job(
+            user_id=user_id,
+            owui_memory_id=owui_memory_id,
+            operation="UPSERT",
+            payload=payload,
+        )
+        logger.debug(
+            f"Queued Mem0 UPSERT for Open WebUI memory {normalize_memory_id(owui_memory_id)}"
+        )
+        return True
+
+    async def enqueue_memory_delete(self, user_id: str, owui_memory_id: str) -> bool:
+        if not self._is_enabled() or not owui_memory_id:
+            return False
+
+        await self._enqueue_job(
+            user_id=user_id,
+            owui_memory_id=owui_memory_id,
+            operation="DELETE",
+            payload=None,
+        )
+        logger.debug(
+            f"Queued Mem0 DELETE for Open WebUI memory {normalize_memory_id(owui_memory_id)}"
+        )
+        return True
+
+    async def _process_upsert_job(self, job: Dict[str, Any]) -> bool:
+        payload = job.get("payload")
+        if not isinstance(payload, dict):
+            logger.warning(
+                f"Mem0 queued UPSERT for memory {job.get('owui_memory_id')} has no usable payload; dropping job"
+            )
+            return True
+
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            logger.warning(
+                f"Mem0 queued UPSERT for memory {job.get('owui_memory_id')} has empty content; dropping job"
+            )
+            return True
+
+        return await self.sync_memory_update(
+            user_id=str(job["user_id"]),
+            owui_memory_id=str(job["owui_memory_id"]),
+            content=content,
+            tags=list(payload.get("tags") or []),
+            memory_bank=str(payload.get("memory_bank") or "General"),
+            confidence=payload.get("confidence"),
+            mem0_user_id_override=str(
+                payload.get("mem0_user_id_override") or ""
+            ).strip()
+            or None,
+        )
+
+    async def _process_delete_job(self, job: Dict[str, Any]) -> bool:
+        user_id = str(job["user_id"])
+        owui_memory_id = str(job["owui_memory_id"])
+        existing_mapping = await self._get_mapping(user_id, owui_memory_id)
+        if not existing_mapping:
+            logger.debug(
+                f"Skipping queued Mem0 DELETE for {owui_memory_id}; no mirror mapping exists"
+            )
+            return True
+        return await self.sync_memory_delete(user_id, owui_memory_id)
+
+    async def process_sync_queue_batch(self) -> Dict[str, int]:
+        result = {
+            "fetched": 0,
+            "processed": 0,
+            "succeeded": 0,
+            "retried": 0,
+        }
+        if not self._is_enabled():
+            return result
+
+        jobs = await self._fetch_ready_jobs(self._get_sync_batch_size())
+        result["fetched"] = len(jobs)
+        if not jobs:
+            return result
+
+        for job in jobs:
+            operation = str(job.get("operation") or "").upper()
+            job_error = "Unknown error"
+            success = False
+            result["processed"] += 1
+            try:
+                if operation == "UPSERT":
+                    success = await self._process_upsert_job(job)
+                elif operation == "DELETE":
+                    success = await self._process_delete_job(job)
+                else:
+                    logger.warning(
+                        f"Mem0 queued job for memory {job.get('owui_memory_id')} has unsupported operation '{operation}'; dropping job"
+                    )
+                    success = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                job_error = str(e)
+                logger.warning(
+                    f"Mem0 queued job {operation} failed for memory {job.get('owui_memory_id')}: {e}"
+                )
+
+            if success:
+                await self._delete_job(
+                    str(job["user_id"]), str(job["owui_memory_id"])
+                )
+                result["succeeded"] += 1
+                continue
+
+            retry_at = datetime.now(timezone.utc) + timedelta(
+                seconds=self._get_sync_retry_delay_seconds()
+            )
+            await self._reschedule_job(
+                str(job["user_id"]),
+                str(job["owui_memory_id"]),
+                int(job.get("attempt_count", 0)) + 1,
+                retry_at,
+                job_error,
+            )
+            result["retried"] += 1
+
+        return result
+
+    async def run_sync_loop(self) -> None:
+        logger.info(
+            f"Mem0 background sync loop started with interval: {self._get_sync_batch_interval_seconds()} seconds"
+        )
+        try:
+            while True:
+                await asyncio.sleep(self._get_sync_batch_interval_seconds())
+                processed = 0
+                succeeded = 0
+                retried = 0
+                batches = 0
+
+                while True:
+                    result = await self.process_sync_queue_batch()
+                    if result["fetched"] == 0:
+                        break
+
+                    batches += 1
+                    processed += result["processed"]
+                    succeeded += result["succeeded"]
+                    retried += result["retried"]
+
+                    if result["fetched"] < self._get_sync_batch_size():
+                        break
+
+                if processed > 0 or retried > 0:
+                    logger.info(
+                        "Mem0 background sync cycle complete: "
+                        f"processed={processed}, "
+                        f"succeeded={succeeded}, "
+                        f"retried={retried}, "
+                        f"batches={batches}"
+                    )
+        except asyncio.CancelledError:
+            logger.info("Mem0 background sync loop stopped")
+            raise
+
 
 # ------------------------------------------------------------------------------
 # Memory Pipeline
@@ -1906,6 +2327,65 @@ class MemoryPipeline:
             logger.warning(f"Failed to fetch user object for {user_id}: {e}")
             return None
 
+    async def _mirror_memory_upsert(
+        self,
+        user_id: str,
+        memory_id: str,
+        content: str,
+        tags: List[str],
+        memory_bank: str,
+        confidence: Optional[float],
+        mem0_user_id_override: Optional[str] = None,
+        log_context: str = "Memory",
+    ) -> None:
+        if not self.mem0_sync_manager or not memory_id or not content:
+            return
+
+        if self.mem0_sync_manager.should_use_background_sync():
+            queued = await self.mem0_sync_manager.enqueue_memory_upsert(
+                user_id=user_id,
+                owui_memory_id=memory_id,
+                content=content,
+                tags=tags,
+                memory_bank=memory_bank,
+                confidence=confidence,
+                mem0_user_id_override=mem0_user_id_override,
+            )
+            if queued:
+                return
+
+        await self.mem0_sync_manager.sync_memory_update(
+            user_id=user_id,
+            owui_memory_id=memory_id,
+            content=content,
+            tags=tags,
+            memory_bank=memory_bank,
+            confidence=confidence,
+            mem0_user_id_override=mem0_user_id_override,
+        )
+
+    async def _mirror_memory_delete(
+        self,
+        user_id: str,
+        memory_id: str,
+        log_context: str = "Memory",
+    ) -> None:
+        if not self.mem0_sync_manager or not memory_id:
+            return
+
+        if self.mem0_sync_manager.should_use_background_sync():
+            queued = await self.mem0_sync_manager.enqueue_memory_delete(
+                user_id, memory_id
+            )
+            if queued:
+                return
+
+        deleted = await self.mem0_sync_manager.sync_memory_delete(user_id, memory_id)
+        if not deleted:
+            logger.debug(
+                f"{log_context}: No Mem0 mapping found while deleting memory {memory_id}"
+            )
+
     async def _delete_local_memory(
         self,
         user_id: str,
@@ -1937,7 +2417,11 @@ class MemoryPipeline:
 
         if mirror_to_mem0 and self.mem0_sync_manager:
             try:
-                await self.mem0_sync_manager.sync_memory_delete(user_id, memory_id)
+                await self._mirror_memory_delete(
+                    user_id,
+                    memory_id,
+                    log_context=log_context,
+                )
             except Exception as mem0_err:
                 logger.warning(
                     f"{log_context}: Mem0 mirror delete failed for memory {memory_id}: {mem0_err}"
@@ -2672,9 +3156,9 @@ class MemoryPipeline:
 
                         if self.mem0_sync_manager and memory_id:
                             try:
-                                await self.mem0_sync_manager.sync_memory_create(
+                                await self._mirror_memory_upsert(
                                     user_id=user_id,
-                                    owui_memory_id=memory_id,
+                                    memory_id=memory_id,
                                     content=content,
                                     tags=tags,
                                     memory_bank=bank,
@@ -2763,9 +3247,9 @@ class MemoryPipeline:
 
                             if self.mem0_sync_manager:
                                 try:
-                                    await self.mem0_sync_manager.sync_memory_update(
+                                    await self._mirror_memory_upsert(
                                         user_id=user_id,
-                                        owui_memory_id=memory_id,
+                                        memory_id=memory_id,
                                         content=new_content,
                                         tags=tags,
                                         memory_bank=bank,
@@ -3251,6 +3735,11 @@ class TaskManager:
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
 
+        if valves.enable_mem0_sync:
+            task = asyncio.create_task(self.filter.mem0_sync_manager.run_sync_loop())
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
         if valves.enable_error_logging_task:
             task = asyncio.create_task(self.filter._log_error_counters_loop())
             self.tasks.add(task)
@@ -3367,6 +3856,22 @@ class Filter:
         mem0_reconcile_cooldown_seconds: float = Field(
             default=30.0,
             description="Minimum seconds between Mem0 delete-reconciliation checks for the same user during inbound requests.",
+        )
+        mem0_sync_strategy: Literal["background", "inline"] = Field(
+            default="background",
+            description="How Mem0 mirroring runs: 'background' queues CRUD changes for batched async syncing, while 'inline' performs Mem0 requests during the request path.",
+        )
+        mem0_sync_batch_size: int = Field(
+            default=10,
+            description="Maximum number of queued Mem0 jobs to process in one background batch.",
+        )
+        mem0_sync_batch_interval_seconds: float = Field(
+            default=7200.0,
+            description="Interval in seconds between scheduled Mem0 background sync runs.",
+        )
+        mem0_sync_retry_delay_seconds: float = Field(
+            default=15.0,
+            description="Delay before retrying a failed queued Mem0 sync job.",
         )
         mem0_user_id_template: str = Field(
             default="owui:{user_id}",
@@ -3814,6 +4319,7 @@ Your output must be valid JSON only. No additional text.""",
             "summarization_max_cluster_size",
             "summarization_min_memory_age_days",
             "mem0_timeout_seconds",
+            "mem0_sync_batch_size",
         )
         def check_non_negative_int(cls, v, info):
             if not isinstance(v, int) or v < 0:
@@ -3847,6 +4353,14 @@ Your output must be valid JSON only. No additional text.""",
 
         @field_validator("mem0_reconcile_cooldown_seconds")
         def check_non_negative_mem0_cooldown(cls, v, info):
+            if not isinstance(v, (int, float)) or v < 0.0:
+                raise ValueError(f"{info.field_name} must be a non-negative float")
+            return float(v)
+
+        @field_validator(
+            "mem0_sync_batch_interval_seconds", "mem0_sync_retry_delay_seconds"
+        )
+        def check_non_negative_mem0_sync_float(cls, v, info):
             if not isinstance(v, (int, float)) or v < 0.0:
                 raise ValueError(f"{info.field_name} must be a non-negative float")
             return float(v)
@@ -3948,7 +4462,10 @@ Your output must be valid JSON only. No additional text.""",
         valve_str = (
             f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_"
             f"{self.valves.enable_error_logging_task}_{self.valves.error_logging_interval}_"
-            f"{self.valves.enable_vector_cleanup_task}_{self.valves.vector_cleanup_interval}"
+            f"{self.valves.enable_vector_cleanup_task}_{self.valves.vector_cleanup_interval}_"
+            f"{self.valves.enable_mem0_sync}_{self.valves.mem0_sync_strategy}_"
+            f"{self.valves.mem0_sync_batch_size}_{self.valves.mem0_sync_batch_interval_seconds}_"
+            f"{self.valves.mem0_sync_retry_delay_seconds}"
         )
         new_hash = hashlib.md5(valve_str.encode()).hexdigest()
         
