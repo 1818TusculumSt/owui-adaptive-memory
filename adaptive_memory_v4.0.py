@@ -1,5 +1,4 @@
 import json
-import copy
 import traceback
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -24,8 +23,6 @@ import difflib
 import time
 import os
 import hashlib
-import random
-import weakref
 import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -34,20 +31,20 @@ from dataclasses import dataclass, field
 # Metrics & Monitoring Imports
 # ----------------------------
 try:
-    from prometheus_client import Counter, Histogram  # type: ignore
+    from prometheus_client import Counter, Histogram  # type: ignore[import-not-found]
 except ImportError:
     # Fallback: define dummy Counter/Histogram if prometheus_client not installed
     class _NoOpMetric:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_args, **_kwargs):
             pass
 
-        def labels(self, *args, **kwargs):
+        def labels(self, *_args, **_kwargs):
             return self
 
-        def inc(self, *args, **kwargs):
+        def inc(self, *_args, **_kwargs):
             pass
 
-        def observe(self, *args, **kwargs):
+        def observe(self, *_args, **_kwargs):
             pass
 
     Counter = Histogram = _NoOpMetric
@@ -85,36 +82,35 @@ RETRIEVAL_LATENCY = Histogram(
 
 # Embedding model imports
 try:
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
 except ImportError:
     SentenceTransformer = None
 
 import numpy as np
 import aiohttp
-from aiohttp import ClientError
 from pydantic import BaseModel, Field, model_validator, field_validator
 
 # OpenWebUI Imports
 try:
-    from open_webui.config import DATA_DIR
+    from open_webui.config import DATA_DIR  # type: ignore[import-not-found]
 except ImportError:
     from pathlib import Path
     DATA_DIR = Path("/app/backend/data")
 
-from open_webui.models.memories import Memories
-from open_webui.models.users import Users
-from open_webui.main import app as webui_app
+from open_webui.models.memories import Memories  # type: ignore[import-not-found]
+from open_webui.models.users import Users  # type: ignore[import-not-found]
+from open_webui.main import app as webui_app  # type: ignore[import-not-found]
 
 # --- Router & Mock Imports for Vector Indexing ---
 try:
-    from open_webui.routers.memories import add_memory, AddMemoryForm
+    from open_webui.routers.memories import add_memory, AddMemoryForm  # type: ignore[import-not-found]
 except ImportError:
     add_memory = None
     AddMemoryForm = None
 
 # --- Vector Database Client for Synchronization ---
 try:
-    from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+    from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT  # type: ignore[import-not-found]
 except ImportError:
     VECTOR_DB_CLIENT = None
     # Note: Custom logger not yet defined, will log via standard logging
@@ -405,13 +401,15 @@ class LRUCache:
 class EmbeddingProvider(ABC):
     @abstractmethod
     async def get_embedding(self, text: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[np.ndarray]:
-        pass
+        del text, session
+        raise NotImplementedError
 
     @abstractmethod
     async def get_embeddings_batch(
         self, texts: List[str], session: Optional[aiohttp.ClientSession] = None
     ) -> List[Optional[np.ndarray]]:
-        pass
+        del texts, session
+        raise NotImplementedError
 
 
 class LocalEmbeddingProvider(EmbeddingProvider):
@@ -426,6 +424,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                 logger.exception(f"Failed to load local SentenceTransformer model: {e}")
 
     async def get_embedding(self, text: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[np.ndarray]:
+        del session
         if not self.model:
             return None
         try:
@@ -442,6 +441,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     async def get_embeddings_batch(
         self, texts: List[str], session: Optional[aiohttp.ClientSession] = None
     ) -> List[Optional[np.ndarray]]:
+        del session
         if not self.model or not texts:
             return [None] * len(texts)
         try:
@@ -794,7 +794,6 @@ class EmbeddingManager:
         timestamp: Optional[str] = None,
     ) -> Dict[str, Any]:
         embedding_array = np.asarray(embedding, dtype=np.float32)
-        valves = self.get_valves()
         default_model, default_provider = self._default_record_identity()
         return {
             "embedding_json": json.dumps(embedding_array.tolist()),
@@ -1061,9 +1060,8 @@ class EmbeddingManager:
             and record.get("provider") == expected_provider
         )
 
-    async def store_embedding_persistent(self, user_id: str, memory_id: str, memory_text: str, embedding: np.ndarray) -> None:
+    async def store_embedding_persistent(self, user_id: str, memory_id: str, _memory_text: str, embedding: np.ndarray) -> None:
         """Store memory embedding in the plugin's persistent sidecar cache."""
-        del memory_text
 
         async with self._get_lock(user_id):
             try:
@@ -1094,9 +1092,8 @@ class EmbeddingManager:
             finally:
                 self._cleanup_lock(user_id)
 
-    async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], texts: List[str], embeddings: List[np.ndarray]) -> None:
+    async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], _texts: List[str], embeddings: List[np.ndarray]) -> None:
         """Store multiple embeddings in the plugin's persistent sidecar cache."""
-        del texts
         if not ids:
             return
 
@@ -2058,12 +2055,9 @@ class MemoryPipeline:
             logger.warning(f"Failed to sync memory to vector DB (ID: {memory_id}): {e}")
             return False
 
-    def _memory_created_at_sort_key(self, memory: Any) -> datetime:
-        created_at = (
-            getattr(memory, "created_at", None)
-            if hasattr(memory, "created_at")
-            else memory.get("created_at")
-        )
+    def _coerce_created_at(self, created_at: Any) -> Optional[datetime]:
+        if created_at is None:
+            return None
 
         if isinstance(created_at, datetime):
             return (
@@ -2073,10 +2067,49 @@ class MemoryPipeline:
             )
 
         if isinstance(created_at, (int, float)):
+            timestamp = float(created_at)
+            candidate_timestamps = [timestamp]
+            if abs(timestamp) > 1e11:
+                candidate_timestamps.insert(0, timestamp / 1000.0)
+
+            for candidate in candidate_timestamps:
+                try:
+                    return datetime.fromtimestamp(candidate, tz=timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    continue
+
+            return None
+
+        if isinstance(created_at, str):
+            normalized = created_at.strip()
+            if not normalized:
+                return None
+
             try:
-                return datetime.fromtimestamp(created_at, tz=timezone.utc)
-            except (OverflowError, OSError, ValueError):
-                pass
+                parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+                return (
+                    parsed
+                    if parsed.tzinfo is not None
+                    else parsed.replace(tzinfo=timezone.utc)
+                )
+            except ValueError:
+                try:
+                    return self._coerce_created_at(float(normalized))
+                except ValueError:
+                    return None
+
+        return None
+
+    def _memory_created_at_sort_key(self, memory: Any) -> datetime:
+        created_at = (
+            getattr(memory, "created_at", None)
+            if hasattr(memory, "created_at")
+            else memory.get("created_at")
+        )
+
+        normalized_created_at = self._coerce_created_at(created_at)
+        if normalized_created_at is not None:
+            return normalized_created_at
 
         return datetime.min.replace(tzinfo=timezone.utc)
 
@@ -2924,11 +2957,11 @@ class MemoryPipeline:
                 scored_memories = []
                 for m in all_memories:
                     confidence = self._get_memory_record(m).confidence or 1.0
-                    if hasattr(m, 'created_at') and m.created_at:
-                        try:
-                            age_days = (datetime.now(timezone.utc) - m.created_at).days
-                        except TypeError:
-                            age_days = 9999
+                    normalized_created_at = self._coerce_created_at(
+                        getattr(m, "created_at", None) if hasattr(m, "created_at") else None
+                    )
+                    if normalized_created_at is not None:
+                        age_days = (datetime.now(timezone.utc) - normalized_created_at).days
                     else:
                         age_days = 9999
 
@@ -3001,11 +3034,10 @@ class MemoryPipeline:
 
                 created_at = getattr(memory, "created_at", None)
                 if self.valves.summarization_min_memory_age_days > 0:
-                    if not created_at:
+                    normalized_created_at = self._coerce_created_at(created_at)
+                    if normalized_created_at is None:
                         continue
-                    if getattr(created_at, "tzinfo", None) is None:
-                        created_at = created_at.replace(tzinfo=timezone.utc)
-                    age_days = (now - created_at).days
+                    age_days = (now - normalized_created_at).days
                     if age_days < self.valves.summarization_min_memory_age_days:
                         continue
 
@@ -3199,7 +3231,7 @@ class TaskManager:
     def start_tasks(self) -> bool:
         """Attempt to start background tasks. Returns True if successful."""
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             logger.warning(
                 "TaskManager: No running event loop found. Tasks will be retried on next request."
@@ -4023,7 +4055,6 @@ Your output must be valid JSON only. No additional text.""",
     async def _query_llm(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         """Unified LLM query method with retries and metrics."""
         valves = self.valves
-        last_error = None
         
         for attempt in range(valves.max_retries + 1):
             try:
@@ -4066,7 +4097,6 @@ Your output must be valid JSON only. No additional text.""",
                             return None
                             
             except Exception as e:
-                last_error = e
                 if attempt < valves.max_retries:
                     logger.warning(f"LLM query attempt {attempt + 1}/{valves.max_retries + 1} failed, retrying in {valves.retry_delay}s: {e}")
                     await asyncio.sleep(valves.retry_delay)
