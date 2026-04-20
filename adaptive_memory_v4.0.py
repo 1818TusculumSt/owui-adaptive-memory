@@ -1253,9 +1253,19 @@ class Mem0SyncManager:
         self._sqlite_file = os.path.join(self._cache_root, "mem0_sync.sqlite")
         self._reconcile_locks: Dict[str, asyncio.Lock] = {}
         self._last_reconcile_check: Dict[str, float] = {}
+        self._reconcile_tasks: Dict[str, asyncio.Task] = {}
 
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
+        reconcile_tasks = [
+            task for task in self._reconcile_tasks.values() if not task.done()
+        ]
+        for task in reconcile_tasks:
+            task.cancel()
+        if reconcile_tasks:
+            await asyncio.gather(*reconcile_tasks, return_exceptions=True)
+        self._reconcile_tasks.clear()
+
         if self._session:
             await self._session.close()
             self._session = None
@@ -1276,6 +1286,9 @@ class Mem0SyncManager:
             or "background"
         ).strip()
         return self._is_enabled() and strategy == "background"
+
+    def should_reconcile_in_request_path(self) -> bool:
+        return self._is_enabled() and not self.should_use_background_sync()
 
     def _get_sync_batch_size(self) -> int:
         try:
@@ -1699,6 +1712,26 @@ class Mem0SyncManager:
             del self._reconcile_locks[user_id]
             self._last_reconcile_check.pop(user_id, None)
 
+    def _cleanup_finished_reconcile_task(
+        self, user_id: str, task: Optional[asyncio.Task] = None
+    ) -> None:
+        current_task = self._reconcile_tasks.get(user_id)
+        if current_task is None:
+            return
+        if task is not None and current_task is not task:
+            return
+        if current_task.done() and not current_task.cancelled():
+            try:
+                exc = current_task.exception()
+            except (asyncio.InvalidStateError, asyncio.CancelledError):
+                exc = None
+            if exc is not None:
+                logger.warning(
+                    f"Background Mem0 reconcile failed for user {user_id}: {exc}"
+                )
+        if current_task.done():
+            self._reconcile_tasks.pop(user_id, None)
+
     def _get_reconcile_cooldown_seconds(self) -> float:
         try:
             cooldown = float(
@@ -1958,6 +1991,36 @@ class Mem0SyncManager:
                 return result
         finally:
             self._cleanup_reconcile_state(user_id)
+
+    def schedule_reconcile_deleted_memories(
+        self,
+        user_id: str,
+        local_memory_ids: Set[str],
+        delete_local_memory: Callable[[str], Awaitable[bool]],
+        force: bool = False,
+    ) -> bool:
+        if not self._is_enabled():
+            return False
+
+        existing_task = self._reconcile_tasks.get(user_id)
+        if existing_task and not existing_task.done():
+            return False
+
+        task = asyncio.create_task(
+            self.reconcile_deleted_memories(
+                user_id=user_id,
+                local_memory_ids=set(local_memory_ids),
+                delete_local_memory=delete_local_memory,
+                force=force,
+            )
+        )
+        self._reconcile_tasks[user_id] = task
+        task.add_done_callback(
+            lambda finished_task, uid=user_id: self._cleanup_finished_reconcile_task(
+                uid, finished_task
+            )
+        )
+        return True
 
     async def sync_memory_create(
         self,
@@ -2441,6 +2504,23 @@ class MemoryPipeline:
             for memory_id in (self._get_memory_id(memory) for memory in all_memories)
             if memory_id is not None
         }
+        if not self.mem0_sync_manager.should_reconcile_in_request_path():
+            scheduled = self.mem0_sync_manager.schedule_reconcile_deleted_memories(
+                user_id=user_id,
+                local_memory_ids=local_memory_ids,
+                delete_local_memory=lambda memory_id: self._delete_local_memory(
+                    user_id,
+                    memory_id,
+                    mirror_to_mem0=False,
+                    log_context="Mem0 reconcile",
+                ),
+            )
+            if scheduled:
+                logger.debug(
+                    f"Mem0 reconcile scheduled in background for user {user_id}"
+                )
+            return all_memories
+
         reconciliation = await self.mem0_sync_manager.reconcile_deleted_memories(
             user_id=user_id,
             local_memory_ids=local_memory_ids,
