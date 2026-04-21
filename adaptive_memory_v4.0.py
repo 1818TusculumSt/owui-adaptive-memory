@@ -349,6 +349,25 @@ async def get_user_by_id_compat(user_id: str) -> Optional[Any]:
     return await _call_owui_method(Users.get_user_by_id, user_id)
 
 
+def extract_memory_id(memory: Any) -> Optional[str]:
+    if memory is None:
+        return None
+
+    if hasattr(memory, "id"):
+        memory_id = getattr(memory, "id")
+    elif hasattr(memory, "get"):
+        try:
+            memory_id = memory.get("id")
+        except Exception:
+            return None
+    else:
+        return None
+
+    if memory_id is None:
+        return None
+    return normalize_memory_id(memory_id)
+
+
 async def get_memories_by_user_id_compat(user_id: str) -> List[Any]:
     memories = await _call_owui_method(Memories.get_memories_by_user_id, user_id)
     if memories is None:
@@ -370,6 +389,31 @@ async def update_memory_by_id_and_user_id_compat(
 
 async def delete_memory_by_id_compat(memory_id: str) -> Any:
     return await _call_owui_method(Memories.delete_memory_by_id, memory_id)
+
+
+async def delete_memory_by_id_and_user_id_compat(memory_id: str, user_id: str) -> bool:
+    memory_id = normalize_memory_id(memory_id)
+    if not memory_id or not user_id:
+        return False
+
+    existing_memories = await get_memories_by_user_id_compat(user_id)
+    existing_ids = {
+        existing_id
+        for existing_id in (extract_memory_id(memory) for memory in existing_memories)
+        if existing_id is not None
+    }
+    if memory_id not in existing_ids:
+        return False
+
+    await delete_memory_by_id_compat(memory_id)
+
+    refreshed_memories = await get_memories_by_user_id_compat(user_id)
+    refreshed_ids = {
+        refreshed_id
+        for refreshed_id in (extract_memory_id(memory) for memory in refreshed_memories)
+        if refreshed_id is not None
+    }
+    return memory_id not in refreshed_ids
 
 
 class LRUCache:
@@ -2462,10 +2506,7 @@ class MemoryPipeline:
         return override or None
 
     def _get_memory_id(self, memory: Any) -> Optional[str]:
-        memory_id = memory.id if hasattr(memory, "id") else memory.get("id")
-        if memory_id is None:
-            return None
-        return normalize_memory_id(memory_id)
+        return extract_memory_id(memory)
 
     def _get_memory_record(self, memory: Any) -> StoredMemoryRecord:
         memory_content = memory.content if hasattr(memory, "content") else memory.get("content")
@@ -2554,9 +2595,14 @@ class MemoryPipeline:
     ) -> bool:
         memory_id = normalize_memory_id(memory_id)
         try:
-            await delete_memory_by_id_compat(memory_id)
+            deleted = await delete_memory_by_id_and_user_id_compat(memory_id, user_id)
         except Exception as e:
             logger.exception(f"{log_context}: Failed to delete memory {memory_id}: {e}")
+            return False
+        if not deleted:
+            logger.warning(
+                f"{log_context}: Memory {memory_id} was not deleted because it was missing, belonged to another user, or the delete did not complete"
+            )
             return False
 
         if VECTOR_DB_CLIENT:
@@ -3309,7 +3355,11 @@ class MemoryPipeline:
                                 vector_sync_needed = True
 
                         memory_id = self._get_memory_id(mem_obj)
-                        if vector_sync_needed and mem_obj is not None:
+                        if mem_obj is None:
+                            raise ValueError("Memory insert returned no record")
+                        if memory_id is None:
+                            raise ValueError("Memory insert returned a record without an ID")
+                        if vector_sync_needed:
                             await self._sync_memory_vector(
                                 user_id, mem_obj, final_content, user_obj=user_obj
                             )
@@ -5078,7 +5128,11 @@ Your output must be valid JSON only. No additional text.""",
         try:
             # Get all memory IDs from database
             db_memories = await get_memories_by_user_id_compat(user_id)
-            valid_ids = {normalize_memory_id(m.id) for m in db_memories}
+            valid_ids = {
+                memory_id
+                for memory_id in (extract_memory_id(memory) for memory in db_memories)
+                if memory_id is not None
+            }
             
             collection_name = f"user-memory-{user_id}"
             
