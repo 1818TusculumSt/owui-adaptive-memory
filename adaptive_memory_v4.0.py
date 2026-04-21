@@ -1757,19 +1757,70 @@ class Mem0SyncManager:
         rendered = str(rendered).strip()
         return rendered or str(user_id)
 
+    def _resolve_global_mem0_override(
+        self, user_id: str
+    ) -> Tuple[Optional[str], Set[str]]:
+        raw_override = str(
+            getattr(self.get_valves(), "mem0_user_id_override", "") or ""
+        ).strip()
+        if not raw_override:
+            return None, set()
+
+        entries = [
+            entry.strip()
+            for entry in re.split(r"[\r\n,;]+", raw_override)
+            if entry and entry.strip()
+        ]
+        if not entries:
+            return None, set()
+
+        ignored_literal_overrides: Set[str] = set()
+        for entry in entries:
+            if ":" not in entry:
+                ignored_literal_overrides.add(entry)
+                logger.warning(
+                    f"Ignoring legacy mem0_user_id_override value '{entry}'. This valve now only accepts per-user mappings in the form 'owui_user_id:mem0_user_id'."
+                )
+                continue
+
+            source_user_id, mapped_mem0_user_id = entry.split(":", 1)
+            source_user_id = str(source_user_id).strip()
+            mapped_mem0_user_id = str(mapped_mem0_user_id).strip()
+            if not source_user_id or not mapped_mem0_user_id:
+                logger.warning(
+                    f"Ignoring invalid mem0_user_id_override entry '{entry}'; expected 'owui_user_id:mem0_user_id'"
+                )
+                continue
+
+            try:
+                is_known_user = bool(Users.get_user_by_id(source_user_id))
+            except Exception as e:
+                logger.warning(
+                    f"Failed to validate mem0_user_id_override entry '{entry}' against Open WebUI users: {e}"
+                )
+                is_known_user = False
+
+            if not is_known_user:
+                continue
+
+            if source_user_id == str(user_id):
+                return mapped_mem0_user_id, ignored_literal_overrides
+
+        return None, ignored_literal_overrides
+
     async def _resolve_mem0_user_id(
         self, user_id: str, override: Optional[str] = None
     ) -> str:
         override_value = str(override or "").strip()
-        global_override = str(
-            getattr(self.get_valves(), "mem0_user_id_override", "") or ""
-        ).strip()
+        global_override, ignored_literal_overrides = self._resolve_global_mem0_override(
+            user_id
+        )
         existing_mapping = await self._get_user_mapping(user_id)
         if override_value:
             mem0_user_id = override_value
         elif global_override:
             mem0_user_id = global_override
-        elif existing_mapping:
+        elif existing_mapping and existing_mapping not in ignored_literal_overrides:
             mem0_user_id = existing_mapping
         else:
             mem0_user_id = self._render_mem0_user_id(user_id)
@@ -2389,6 +2440,13 @@ class MemoryPipeline:
         except Exception as e:
             logger.warning(f"Failed to fetch user object for {user_id}: {e}")
             return None
+
+    def _log_memory_save_user_id(self, user_id: str, memory_id: Optional[str]) -> None:
+        if not getattr(self.valves, "log_user_id_on_memory_save", False):
+            return
+        logger.info(
+            f"Memory save user_id={user_id} memory_id={normalize_memory_id(memory_id) if memory_id is not None else 'unknown'}"
+        )
 
     async def _mirror_memory_upsert(
         self,
@@ -3223,6 +3281,7 @@ class MemoryPipeline:
                         logger.info(
                             f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]"
                         )
+                        self._log_memory_save_user_id(user_id, memory_id)
 
                         if dedup_embedding is not None and memory_id:
                             memory_key = normalize_memory_id(memory_id)
@@ -3343,6 +3402,7 @@ class MemoryPipeline:
 
                             success_ops.append(normalized_op)
                             logger.info(f"Memory updated (ID: {memory_id})")
+                            self._log_memory_save_user_id(user_id, memory_id)
                         else:
                             logger.warning(f"Memory not found for update (ID: {memory_id})")
 
@@ -3959,7 +4019,7 @@ class Filter:
         )
         mem0_user_id_override: str = Field(
             default="",
-            description="Optional global Mem0 user/entity id override shown in the main valve UI. When set, it takes precedence over cached Mem0 user mappings and over mem0_user_id_template, forcing mirrored memories to use that exact Mem0 user id.",
+            description="Optional per-user Mem0 mapping table shown in the main valve UI. Use targeted mappings like 'owui_user_id:jefe' (comma, semicolon, or newline separated) to route specific Open WebUI users to specific Mem0 users. Plain values like 'jefe' are ignored.",
         )
 
         # Background Task Management Configuration
@@ -4198,6 +4258,10 @@ Analyze the following related memories and provide a concise summary.""",
         )
         show_memories: bool = Field(
             default=True, description="Show relevant memories in context"
+        )
+        log_user_id_on_memory_save: bool = Field(
+            default=False,
+            description="Log only the Open WebUI user_id and memory_id whenever a memory save or update succeeds. Useful for admin debugging.",
         )
         memory_format: Literal["bullet", "paragraph", "numbered"] = Field(
             default="bullet", description="Format for displaying memories in context"

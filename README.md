@@ -108,13 +108,16 @@ That keeps Mem0 latency out of the chat path and makes syncing behave more like 
 When Mem0 mirroring is enabled, the Mem0 user/entity ID is chosen in this order:
 
 1. Per-user `mem0_user_id_override`
-2. Global `mem0_user_id_override`
+2. Matching targeted entry in global `mem0_user_id_override`
 3. Previously stored Mem0 user mapping
 4. `mem0_user_id_template`
 
 Examples:
-- Set global override to `jefe` to send all mirrored memories to one Mem0 entity.
+- Set global override to `xxxxxxxx:jefe` to route only Open WebUI user `xxxxxxxx` to Mem0 user `jefe`.
+- Set multiple targeted mappings with commas, semicolons, or new lines, for example `user_a:jefe, user_b:ana`.
 - Set a per-user override to route only one Open WebUI user to a custom Mem0 entity.
+
+Plain global values like `jefe` are ignored. This valve is now only for explicit per-user mappings, so unmatched users fall back to their stored mapping or the normal template flow.
 
 ## Important Valves
 
@@ -172,6 +175,7 @@ Examples:
 - `mem0_reconcile_cooldown_seconds`
 - `mem0_user_id_template`
 - `mem0_user_id_override`
+- `log_user_id_on_memory_save`
 
 ### Background Tasks
 
