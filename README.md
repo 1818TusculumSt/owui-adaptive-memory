@@ -75,6 +75,7 @@ Then set:
 Optional:
 - `mem0_user_id_template`
 - `mem0_user_id_override`
+- `mem0_infer_on_create`
 - per-user `mem0_user_id_override`
 
 ## Mem0 Sync Model
@@ -89,6 +90,8 @@ When Mem0 sync is enabled, the function does four separate things:
 In background mode, queued jobs are coalesced by `(user_id, memory_id)`, so repeated updates collapse into the latest state before the next Mem0 sync cycle runs.
 
 That last piece matters: this is no longer just one-way mirroring. If a mapped memory is deleted upstream in Mem0, the local Open WebUI copy is cleaned up on a later reconciliation pass.
+
+`mem0_infer_on_create` is disabled by default. When you turn it on, mirrored create requests let Mem0 infer facts from the provided message, which can improve Mem0-side deduplication and conflict resolution. This only affects create ingestion; direct update/delete calls still use explicit memory IDs.
 
 Reconciliation is best-effort and intentionally conservative:
 - expected Mem0 `404` responses are treated as normal for reconciliation
@@ -175,6 +178,7 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `mem0_reconcile_cooldown_seconds`
 - `mem0_user_id_template`
 - `mem0_user_id_override`
+- `mem0_infer_on_create`
 - `log_user_id_on_memory_save`
 
 ### Background Tasks

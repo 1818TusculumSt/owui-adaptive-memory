@@ -2098,7 +2098,7 @@ class Mem0SyncManager:
             "user_id": mem0_user_id,
             "app_id": str(self.get_valves().mem0_app_id),
             "messages": [{"role": "user", "content": content}],
-            "infer": False,
+            "infer": bool(getattr(self.get_valves(), "mem0_infer_on_create", True)),
             "async_mode": False,
             "metadata": self._build_metadata(
                 user_id, mem0_user_id, owui_memory_id, tags, memory_bank, confidence
@@ -3142,9 +3142,6 @@ class MemoryPipeline:
         RETRIEVAL_LATENCY.observe(time.perf_counter() - start_time)
         return top_memories
 
-        # Optional: LLM Reranking (Skipped for brevity/Streamline, relying on vector)
-        # return top_memories
-
     def _cosine_similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
         if v1.shape != v2.shape:
             logger.debug(f"Cosine similarity dimension mismatch: {v1.shape} vs {v2.shape}")
@@ -4020,6 +4017,10 @@ class Filter:
         mem0_user_id_override: str = Field(
             default="",
             description="Optional per-user Mem0 mapping table shown in the main valve UI. Use targeted mappings like 'owui_user_id:jefe' (comma, semicolon, or newline separated) to route specific Open WebUI users to specific Mem0 users. Plain values like 'jefe' are ignored.",
+        )
+        mem0_infer_on_create: bool = Field(
+            default=False,
+            description="When true, mirrored Mem0 create requests use infer=true so Mem0 can extract, deduplicate, and resolve conflicts from the provided message. Disabled by default; when false, mirrored text is stored more literally with infer=false.",
         )
 
         # Background Task Management Configuration
