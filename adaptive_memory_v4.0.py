@@ -335,6 +335,43 @@ def truncate_text(text: str, max_length: int) -> str:
     return stripped[: max_length - 3].rstrip() + "..."
 
 
+async def _resolve_owui_result(result: Any) -> Any:
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _call_owui_method(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    return await _resolve_owui_result(method(*args, **kwargs))
+
+
+async def get_user_by_id_compat(user_id: str) -> Optional[Any]:
+    return await _call_owui_method(Users.get_user_by_id, user_id)
+
+
+async def get_memories_by_user_id_compat(user_id: str) -> List[Any]:
+    memories = await _call_owui_method(Memories.get_memories_by_user_id, user_id)
+    if memories is None:
+        return []
+    return list(memories)
+
+
+async def insert_new_memory_compat(user_id: str, content: str) -> Any:
+    return await _call_owui_method(Memories.insert_new_memory, user_id, content)
+
+
+async def update_memory_by_id_and_user_id_compat(
+    memory_id: str, user_id: str, content: str
+) -> Any:
+    return await _call_owui_method(
+        Memories.update_memory_by_id_and_user_id, memory_id, user_id, content
+    )
+
+
+async def delete_memory_by_id_compat(memory_id: str) -> Any:
+    return await _call_owui_method(Memories.delete_memory_by_id, memory_id)
+
+
 class LRUCache:
     """A simple LRU (Least Recently Used) cache with bounded size.
     
@@ -1757,7 +1794,7 @@ class Mem0SyncManager:
         rendered = str(rendered).strip()
         return rendered or str(user_id)
 
-    def _resolve_global_mem0_override(
+    async def _resolve_global_mem0_override(
         self, user_id: str
     ) -> Tuple[Optional[str], Set[str]]:
         raw_override = str(
@@ -1793,7 +1830,7 @@ class Mem0SyncManager:
                 continue
 
             try:
-                is_known_user = bool(Users.get_user_by_id(source_user_id))
+                is_known_user = bool(await get_user_by_id_compat(source_user_id))
             except Exception as e:
                 logger.warning(
                     f"Failed to validate mem0_user_id_override entry '{entry}' against Open WebUI users: {e}"
@@ -1812,7 +1849,7 @@ class Mem0SyncManager:
         self, user_id: str, override: Optional[str] = None
     ) -> str:
         override_value = str(override or "").strip()
-        global_override, ignored_literal_overrides = self._resolve_global_mem0_override(
+        global_override, ignored_literal_overrides = await self._resolve_global_mem0_override(
             user_id
         )
         existing_mapping = await self._get_user_mapping(user_id)
@@ -2434,9 +2471,9 @@ class MemoryPipeline:
         memory_content = memory.content if hasattr(memory, "content") else memory.get("content")
         return parse_stored_memory(memory_content)
 
-    def _get_user_object(self, user_id: str) -> Optional[Any]:
+    async def _get_user_object(self, user_id: str) -> Optional[Any]:
         try:
-            return Users.get_user_by_id(user_id)
+            return await get_user_by_id_compat(user_id)
         except Exception as e:
             logger.warning(f"Failed to fetch user object for {user_id}: {e}")
             return None
@@ -2517,7 +2554,7 @@ class MemoryPipeline:
     ) -> bool:
         memory_id = normalize_memory_id(memory_id)
         try:
-            Memories.delete_memory_by_id(memory_id)
+            await delete_memory_by_id_compat(memory_id)
         except Exception as e:
             logger.exception(f"{log_context}: Failed to delete memory {memory_id}: {e}")
             return False
@@ -2591,7 +2628,7 @@ class MemoryPipeline:
         )
         if reconciliation["deleted"] > 0:
             try:
-                refreshed_memories = Memories.get_memories_by_user_id(user_id)
+                refreshed_memories = await get_memories_by_user_id_compat(user_id)
                 logger.info(
                     f"Mem0 reconcile: removed {reconciliation['deleted']} stale local memories for user {user_id}"
                 )
@@ -3056,7 +3093,7 @@ class MemoryPipeline:
 
         RETRIEVAL_REQUESTS.inc()
         start_time = time.perf_counter()
-        user_obj = self._get_user_object(user_id)
+        user_obj = await self._get_user_object(user_id)
 
         # 1. Vector Search
         try:
@@ -3180,7 +3217,7 @@ class MemoryPipeline:
     ) -> List[Dict[str, Any]]:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
         # Fetch full user object for Router DI (MockRequest)
-        user_obj = Users.get_user_by_id(user_id)
+        user_obj = await get_user_by_id_compat(user_id)
         mem0_user_id_override = self._get_mem0_user_id_override(user_valves)
         success_ops = []
         for op in operations:
@@ -3220,7 +3257,7 @@ class MemoryPipeline:
                             memory_id
                             for memory_id in (
                                 self._get_memory_id(memory)
-                                for memory in Memories.get_memories_by_user_id(user_id)
+                                for memory in await get_memories_by_user_id_compat(user_id)
                             )
                             if memory_id is not None
                         }
@@ -3254,7 +3291,7 @@ class MemoryPipeline:
                             logger.warning(
                                 f"Router add_memory failed ({add_err}), falling back to insert_new_memory"
                             )
-                            current_memories = Memories.get_memories_by_user_id(user_id)
+                            current_memories = await get_memories_by_user_id_compat(user_id)
                             mem_obj = self._find_memory_by_exact_content(
                                 current_memories,
                                 final_content,
@@ -3266,7 +3303,9 @@ class MemoryPipeline:
                                     "Router add_memory inserted the memory before vector sync failed; reusing that row to avoid creating a duplicate"
                                 )
                             else:
-                                mem_obj = Memories.insert_new_memory(user_id, final_content)
+                                mem_obj = await insert_new_memory_compat(
+                                    user_id, final_content
+                                )
                                 vector_sync_needed = True
 
                         memory_id = self._get_memory_id(mem_obj)
@@ -3312,7 +3351,7 @@ class MemoryPipeline:
                     try:
                         memory_id = normalize_memory_id(normalized_op["id"])
                         new_content = content
-                        existing_memories = Memories.get_memories_by_user_id(user_id)
+                        existing_memories = await get_memories_by_user_id_compat(user_id)
                         existing_memory = next(
                             (
                                 memory
@@ -3358,7 +3397,7 @@ class MemoryPipeline:
                         final_content = format_memory_content(
                             new_content, tags, bank, confidence
                         )
-                        updated_memory = Memories.update_memory_by_id_and_user_id(
+                        updated_memory = await update_memory_by_id_and_user_id_compat(
                             memory_id, user_id, final_content
                         )
 
@@ -3450,12 +3489,12 @@ class MemoryPipeline:
             if all_memories_override is not None:
                 all_memories = all_memories_override
             else:
-                all_memories = Memories.get_memories_by_user_id(user_id)
+                all_memories = await get_memories_by_user_id_compat(user_id)
                 
             if not all_memories:
                 return False, None
 
-            user_obj = self._get_user_object(user_id)
+            user_obj = await self._get_user_object(user_id)
 
             if self.valves.use_embeddings_for_deduplication:
                 new_embedding = await self.embedding_manager.get_embedding(
@@ -3548,7 +3587,7 @@ class MemoryPipeline:
         """
         try:
             # Get all memories for the user
-            all_memories = Memories.get_memories_by_user_id(user_id)
+            all_memories = await get_memories_by_user_id_compat(user_id)
             
             if not all_memories:
                 return 0
@@ -3635,11 +3674,11 @@ class MemoryPipeline:
     ) -> Optional[str]:
         """Find clusters of memories and summarize them."""
         logger.info(f"Starting summarization for user {user_id}")
-        user_obj = self._get_user_object(user_id)
+        user_obj = await self._get_user_object(user_id)
         
         # 1. Fetch memories
         try:
-            all_memories = Memories.get_memories_by_user_id(user_id)
+            all_memories = await get_memories_by_user_id_compat(user_id)
             logger.info(f"Found {len(all_memories) if all_memories else 0} memories for user {user_id}")
 
             if not all_memories:
@@ -4816,8 +4855,7 @@ Your output must be valid JSON only. No additional text.""",
 
         # 1. Retrieve all memories
         try:
-            # This gets generic memory objects (SYNC call)
-            all_memories = Memories.get_memories_by_user_id(user_id)
+            all_memories = await get_memories_by_user_id_compat(user_id)
         except Exception as e:
             logger.error(f"Failed to fetch memories: {e}")
             all_memories = []
@@ -4907,7 +4945,7 @@ Your output must be valid JSON only. No additional text.""",
         # Identify Memories
         if user_message:
             try:
-                all_memories = Memories.get_memories_by_user_id(user_id)
+                all_memories = await get_memories_by_user_id_compat(user_id)
             except Exception as e:
                 logger.error(f"Failed to fetch memories for extraction context: {e}")
                 all_memories = []
@@ -5039,7 +5077,7 @@ Your output must be valid JSON only. No additional text.""",
         
         try:
             # Get all memory IDs from database
-            db_memories = Memories.get_memories_by_user_id(user_id)
+            db_memories = await get_memories_by_user_id_compat(user_id)
             valid_ids = {normalize_memory_id(m.id) for m in db_memories}
             
             collection_name = f"user-memory-{user_id}"
