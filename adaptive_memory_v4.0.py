@@ -3859,8 +3859,11 @@ class MemoryPipeline:
         for cluster_indices in clusters:
             try:
                 cluster_memories = [memories[i] for i in cluster_indices]
+                cluster_records = [
+                    self._get_memory_record(m) for m in cluster_memories
+                ]
                 cluster_text = "\n".join(
-                    [f"- {self._get_memory_record(m).content}" for m in cluster_memories]
+                    [f"- {record.content}" for record in cluster_records]
                 )
 
                 summary = await query_llm_func(
@@ -3870,18 +3873,32 @@ class MemoryPipeline:
 
                 if summary:
                     confidence_scores = []
-                    for m in cluster_memories:
-                        conf = self._get_memory_record(m).confidence
+                    source_tags = {"summary"}
+                    source_banks = set()
+                    for record in cluster_records:
+                        source_tags.update(record.tags or [])
+                        if record.memory_bank:
+                            source_banks.add(
+                                self._normalize_memory_bank(record.memory_bank)
+                            )
+
+                        conf = record.confidence
                         if conf is not None:
                             confidence_scores.append(conf)
 
                     avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.85
+                    merged_tags = self._normalize_tags(sorted(source_tags))
+                    merged_bank = (
+                        next(iter(source_banks))
+                        if len(source_banks) == 1
+                        else self._normalize_memory_bank(self.valves.default_memory_bank)
+                    )
 
                     op = {
                         "operation": "NEW",
                         "content": re.sub(r"\s+", " ", summary).strip(),
-                        "tags": ["summary"],
-                        "memory_bank": "General",
+                        "tags": merged_tags,
+                        "memory_bank": merged_bank,
                         "confidence": avg_confidence,
                     }
 
