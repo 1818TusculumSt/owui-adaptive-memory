@@ -1870,6 +1870,13 @@ class Mem0SyncManager:
 class MemoryPipeline:
     """Core logic for extracting, retrieving, and processing memories."""
 
+    _RE_TRIVIA_PATTERNS = [
+        re.compile(r"^(what|who|where|when|why|how)\b"),
+        re.compile(
+            r"\b(the capital of|world war|boiling point|photosynthesis|periodic table)\b"
+        ),
+    ]
+
     def __init__(
         self,
         valves: Any,
@@ -2191,12 +2198,8 @@ class MemoryPipeline:
         lowered = content.strip().lower()
         if not lowered:
             return False
-        trivia_patterns = [
-            r"^(what|who|where|when|why|how)\b",
-            r"\b(the capital of|world war|boiling point|photosynthesis|periodic table)\b",
-        ]
         return lowered.endswith("?") or any(
-            re.search(pattern, lowered) for pattern in trivia_patterns
+            pattern.search(lowered) for pattern in self._RE_TRIVIA_PATTERNS
         )
 
     def _passes_memory_filters(self, content: str) -> bool:
