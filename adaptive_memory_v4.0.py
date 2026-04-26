@@ -88,7 +88,7 @@ except ImportError:
 
 import numpy as np
 import aiohttp
-from pydantic import BaseModel, Field, model_validator, field_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator, field_validator
 
 # OpenWebUI Imports
 try:
@@ -459,9 +459,12 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 
 
 class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
-    def __init__(self, api_url: str, api_key: str, model_name: str):
+    def __init__(self, api_url: str, api_key: Union[str, SecretStr, None], model_name: str):
         self.api_url = api_url
-        self.api_key = api_key
+        if api_key is None:
+            self.api_key = None
+        else:
+            self.api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
         self.model_name = model_name
 
     async def get_embedding(self, text: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[np.ndarray]:
@@ -471,9 +474,10 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             should_close = session is None
             
             try:
+                api_key = self.api_key.get_secret_value() if isinstance(self.api_key, SecretStr) else self.api_key
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
+                    "Authorization": f"Bearer {api_key}",
                 }
                 data = {"input": text, "model": self.model_name}
                 async with inner_session.post(
@@ -500,9 +504,10 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             should_close = session is None
             
             try:
+                api_key = self.api_key.get_secret_value() if isinstance(self.api_key, SecretStr) else self.api_key
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
+                    "Authorization": f"Bearer {api_key}",
                 }
                 data = {"input": texts, "model": self.model_name}
                 async with inner_session.post(
@@ -580,12 +585,15 @@ class EmbeddingManager:
 
     def _ensure_provider(self):
         valves = self.get_valves()
+        embedding_api_key = valves.embedding_api_key
+        if isinstance(embedding_api_key, SecretStr):
+            embedding_api_key = embedding_api_key.get_secret_value()
         provider_signature = (
             getattr(valves, "embedding_source", "auto"),
             valves.embedding_provider_type,
             valves.embedding_model_name,
             valves.embedding_api_url,
-            valves.embedding_api_key,
+            embedding_api_key,
         )
         if not self.provider or self._provider_signature != provider_signature:
             if self._provider_signature and self._provider_signature != provider_signature:
@@ -602,7 +610,7 @@ class EmbeddingManager:
             elif valves.embedding_provider_type == "openai_compatible":
                 self.provider = OpenAICompatibleEmbeddingProvider(
                     valves.embedding_api_url,
-                    valves.embedding_api_key,
+                    embedding_api_key,
                     valves.embedding_model_name,
                 )
 
@@ -1264,10 +1272,13 @@ class Mem0SyncManager:
 
     def _is_enabled(self) -> bool:
         valves = self.get_valves()
+        mem0_api_key = getattr(valves, "mem0_api_key", None)
+        if isinstance(mem0_api_key, SecretStr):
+            mem0_api_key = mem0_api_key.get_secret_value()
         return bool(
             getattr(valves, "enable_mem0_sync", False)
             and str(getattr(valves, "mem0_api_base_url", "") or "").strip()
-            and str(getattr(valves, "mem0_api_key", "") or "").strip()
+            and str(mem0_api_key or "").strip()
         )
 
     def _ensure_session(self):
@@ -1278,8 +1289,11 @@ class Mem0SyncManager:
         return str(self.get_valves().mem0_api_base_url).rstrip("/")
 
     def _headers(self) -> Dict[str, str]:
+        mem0_api_key = self.get_valves().mem0_api_key
+        if isinstance(mem0_api_key, SecretStr):
+            mem0_api_key = mem0_api_key.get_secret_value()
         return {
-            "Authorization": f"Token {self.get_valves().mem0_api_key}",
+            "Authorization": f"Token {mem0_api_key}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
@@ -3338,7 +3352,7 @@ class Filter:
             default=None,
             description="Plugin-side embedding API endpoint used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
-        embedding_api_key: Optional[str] = Field(
+        embedding_api_key: Optional[SecretStr] = Field(
             default=None,
             description="Plugin-side embedding API key used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
@@ -3352,7 +3366,7 @@ class Filter:
             default="https://api.mem0.ai",
             description="Base URL for the Mem0 API when Mem0 mirroring is enabled.",
         )
-        mem0_api_key: Optional[str] = Field(
+        mem0_api_key: Optional[SecretStr] = Field(
             default=None,
             description="API key for Mem0. Required only when enable_mem0_sync is enabled.",
         )
@@ -3550,7 +3564,7 @@ Analyze the following related memories and provide a concise summary.""",
             default="http://host.docker.internal:11434/api/chat",
             description="API endpoint URL for the LLM provider (e.g., 'http://host.docker.internal:11434/api/chat', 'https://api.openai.com/v1/chat/completions')",
         )
-        llm_api_key: Optional[str] = Field(
+        llm_api_key: Optional[SecretStr] = Field(
             default=None,
             description="API Key for the LLM provider (required if type is 'openai_compatible')",
         )
@@ -3861,7 +3875,10 @@ Your output must be valid JSON only. No additional text.""",
 
         @model_validator(mode="after")
         def check_llm_config(self):
-            if self.llm_provider_type == "openai_compatible" and not self.llm_api_key:
+            llm_api_key = self.llm_api_key
+            if isinstance(llm_api_key, SecretStr):
+                llm_api_key = llm_api_key.get_secret_value()
+            if self.llm_provider_type == "openai_compatible" and not llm_api_key:
                 raise ValueError(
                     "API Key is required when llm_provider_type is 'openai_compatible'"
                 )
@@ -3870,7 +3887,10 @@ Your output must be valid JSON only. No additional text.""",
         @model_validator(mode="after")
         def check_mem0_config(self):
             if self.enable_mem0_sync:
-                if not self.mem0_api_key:
+                mem0_api_key = self.mem0_api_key
+                if isinstance(mem0_api_key, SecretStr):
+                    mem0_api_key = mem0_api_key.get_secret_value()
+                if not mem0_api_key:
                     raise ValueError(
                         "Mem0 API key is required when enable_mem0_sync is enabled"
                     )
@@ -3895,7 +3915,10 @@ Your output must be valid JSON only. No additional text.""",
                 self.embedding_source in {"auto", "plugin"}
                 and self.embedding_provider_type == "openai_compatible"
             ):
-                if not self.embedding_api_key:
+                embedding_api_key = self.embedding_api_key
+                if isinstance(embedding_api_key, SecretStr):
+                    embedding_api_key = embedding_api_key.get_secret_value()
+                if not embedding_api_key:
                     raise ValueError(
                         "API Key required for openai_compatible embedding provider"
                     )
@@ -4062,7 +4085,8 @@ Your output must be valid JSON only. No additional text.""",
                     url = valves.llm_api_endpoint_url
                     headers = {"Content-Type": "application/json"}
                     if valves.llm_api_key:
-                        headers["Authorization"] = f"Bearer {valves.llm_api_key}"
+                        llm_api_key = valves.llm_api_key.get_secret_value() if isinstance(valves.llm_api_key, SecretStr) else valves.llm_api_key
+                        headers["Authorization"] = f"Bearer {llm_api_key}"
 
                     payload = {
                         "model": valves.llm_model_name,
