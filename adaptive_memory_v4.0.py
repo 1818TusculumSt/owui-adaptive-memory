@@ -445,6 +445,12 @@ class EmbeddingManager:
             if not lock.locked() and (not hasattr(lock, '_waiters') or not lock._waiters):
                 del self._locks[user_id]
 
+    def _get_cache_file_path(self, user_id: str) -> str:
+        """Generate a secure, hashed file path for user's persistent embedding cache."""
+        cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
+        # Use SHA-256 to hash the user_id to prevent path traversal
+        hashed_user_id = hashlib.sha256(user_id.encode()).hexdigest()
+        return os.path.join(cache_dir, f"{hashed_user_id}_embeddings.json")
 
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
@@ -517,9 +523,8 @@ class EmbeddingManager:
         async with self._get_lock(user_id):
             try:
                 # Use data directory for persistence
-                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-                await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                cache_file = self._get_cache_file_path(user_id)
+                await asyncio.to_thread(os.makedirs, os.path.dirname(cache_file), exist_ok=True)
                 
                 # Load existing cache
                 cache = {}
@@ -564,9 +569,8 @@ class EmbeddingManager:
             
         async with self._get_lock(user_id):
             try:
-                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-                await asyncio.to_thread(os.makedirs, cache_dir, exist_ok=True)
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                cache_file = self._get_cache_file_path(user_id)
+                await asyncio.to_thread(os.makedirs, os.path.dirname(cache_file), exist_ok=True)
                 
                 # Load existing cache
                 cache = {}
@@ -611,8 +615,7 @@ class EmbeddingManager:
         result = None
         async with self._get_lock(user_id):
             try:
-                cache_dir = os.path.join(DATA_DIR, "cache", "embeddings")
-                cache_file = os.path.join(cache_dir, f"{user_id}_embeddings.json")
+                cache_file = self._get_cache_file_path(user_id)
                 
                 if not await asyncio.to_thread(os.path.exists, cache_file):
                     result = None
@@ -2022,7 +2025,8 @@ Your output must be valid JSON only. No additional text.""",
         """Detect if valves have changed and restart tasks if needed."""
         # Hash important valve settings that affect background tasks
         valve_str = f"{self.valves.enable_summarization_task}_{self.valves.summarization_interval}_{self.valves.enable_error_logging_task}"
-        new_hash = hashlib.md5(valve_str.encode()).hexdigest()
+        # Use SHA-256 for more secure fingerprinting
+        new_hash = hashlib.sha256(valve_str.encode()).hexdigest()
         
         if self._valve_hash is None:
             self._valve_hash = new_hash
