@@ -909,20 +909,6 @@ class EmbeddingManager:
             json.dump(cache, f)
         os.replace(tmp_file, cache_file)
 
-    def _store_embedding_legacy_json_sync(
-        self, user_id: str, memory_id: str, embedding: np.ndarray
-    ) -> None:
-        memory_id_str = normalize_memory_id(memory_id)
-        cache = self._load_legacy_cache_sync(user_id)
-        model, provider = self._default_record_identity()
-        cache[memory_id_str] = {
-            "embedding": np.asarray(embedding, dtype=np.float32).tolist(),
-            "model": model,
-            "provider": provider,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self._save_legacy_cache_sync(user_id, cache)
-
     def _store_embeddings_batch_legacy_json_sync(
         self, user_id: str, ids: List[str], embeddings: List[np.ndarray]
     ) -> None:
@@ -1164,7 +1150,10 @@ class EmbeddingManager:
                 )
                 try:
                     await asyncio.to_thread(
-                        self._store_embedding_legacy_json_sync, user_id, memory_id, embedding
+                        self._store_embeddings_batch_legacy_json_sync,
+                        user_id,
+                        [memory_id],
+                        [embedding],
                     )
                 except Exception as legacy_err:
                     logger.warning(
