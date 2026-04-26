@@ -689,6 +689,15 @@ class EmbeddingManager:
 class MemoryPipeline:
     """Core logic for extracting, retrieving, and processing memories."""
 
+    # Pre-compiled regexes for text normalization
+    _RE_PUNCTUATION = re.compile(r"[^\w\s]")
+    _RE_STANDALONE_S = re.compile(r"\bs\b")
+    _RE_ARTICLES = re.compile(r"\b(a|an|the)\b")
+    _RE_INTENSIFIERS = re.compile(
+        r"\b(really|very|quite|pretty|so|totally|absolutely)\b"
+    )
+    _RE_EXTRA_SPACES = re.compile(r"\s+")
+
     def __init__(
         self,
         valves: Any,
@@ -863,19 +872,19 @@ class MemoryPipeline:
     def _normalize_text(self, text: str) -> str:
         """Normalize text for comparison by removing punctuation, articles, intensifiers, and extra spaces."""
         # Remove punctuation, extra spaces, convert to lowercase
-        normalized = re.sub(r'[^\w\s]', '', text.strip().lower())
-        
+        normalized = self._RE_PUNCTUATION.sub("", text.strip().lower())
+
         # Handle common plural variations
-        normalized = re.sub(r'\bs\b', '', normalized)  # Remove standalone 's'
-        
+        normalized = self._RE_STANDALONE_S.sub("", normalized)  # Remove standalone 's'
+
         # Remove articles (a, an, the)
-        normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
-        
+        normalized = self._RE_ARTICLES.sub("", normalized)
+
         # Remove intensifiers (but keep adjectives like 'cold', 'hot')
-        normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
-        
+        normalized = self._RE_INTENSIFIERS.sub("", normalized)
+
         # Clean up extra spaces
-        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        normalized = self._RE_EXTRA_SPACES.sub(" ", normalized).strip()
         return normalized
 
     # --- Memory Operations ---
