@@ -885,6 +885,12 @@ class MemoryPipeline:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
         # Fetch full user object for Router DI (MockRequest)
         user_obj = Users.get_user_by_id(user_id)
+
+        # Optimization: Pre-fetch all memories for the user to avoid N+1 queries in deduplication
+        all_memories = None
+        if self.valves.deduplicate_memories and not skip_deduplication:
+            all_memories = Memories.get_memories_by_user_id(user_id) or []
+
         success_ops = []
         for op in operations:
             try:
@@ -899,7 +905,9 @@ class MemoryPipeline:
                     # Deduplication check (skip for summaries)
                     dedup_embedding = None
                     if self.valves.deduplicate_memories and not skip_deduplication:
-                        is_dupe, dedup_embedding = await self._is_duplicate(content, user_id)
+                        is_dupe, dedup_embedding = await self._is_duplicate(
+                            content, user_id, all_memories_override=all_memories
+                        )
                         if is_dupe:
                             logger.info(f"Skipping duplicate memory (length: {len(content)})")
                             continue
@@ -946,6 +954,9 @@ class MemoryPipeline:
                             mem_obj = Memories.insert_new_memory(user_id, final_content)
 
                         memory_id = getattr(mem_obj, 'id', None)
+                        if memory_id and all_memories is not None:
+                            all_memories.append(mem_obj)
+
                         success_ops.append(op)
                         logger.info(f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]")
                         
@@ -971,6 +982,18 @@ class MemoryPipeline:
                         )
                         
                         if updated_memory:
+                            # Update local cache for intra-batch deduplication
+                            if all_memories is not None:
+                                for i, m in enumerate(all_memories):
+                                    m_id = (
+                                        getattr(m, "id", None)
+                                        if hasattr(m, "id")
+                                        else m.get("id")
+                                    )
+                                    if str(m_id) == str(memory_id):
+                                        all_memories[i] = updated_memory
+                                        break
+
                             # Regenerate embedding for updated content
                             new_embedding = await self.embedding_manager.get_embedding(new_content)
                             
@@ -1015,7 +1038,16 @@ class MemoryPipeline:
                         
                         # Delete from database
                         Memories.delete_memory_by_id(memory_id)
-                        
+
+                        # Update local cache for intra-batch deduplication
+                        if all_memories is not None:
+                            all_memories = [
+                                m
+                                for m in all_memories
+                                if str(getattr(m, "id", None) if hasattr(m, "id") else m.get("id"))
+                                != str(memory_id)
+                            ]
+
                         # Delete from vector database if available
                         if VECTOR_DB_CLIENT:
                             try:
