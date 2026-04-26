@@ -775,8 +775,7 @@ class EmbeddingManager:
             EMBEDDING_ERRORS.labels(self._metrics_provider_label("open_webui")).inc()
             return None
 
-        if not self.provider:
-            self._ensure_provider()
+        self._ensure_provider()
 
         if not self.provider:
             self.error_manager.increment("embedding_errors")
@@ -813,8 +812,7 @@ class EmbeddingManager:
         if not self._should_use_plugin_embeddings():
             return list(open_webui_results)
 
-        if not self.provider:
-            self._ensure_provider()
+        self._ensure_provider()
 
         if not self.provider:
             return list(open_webui_results)
@@ -837,9 +835,25 @@ class EmbeddingManager:
             combined_results[idx] = provider_embedding
         return combined_results
 
-    def _get_legacy_cache_file(self, user_id: str) -> str:
+    def _get_hashed_legacy_cache_file(self, user_id: str) -> str:
         hashed_user_id = hashlib.sha256(str(user_id).encode()).hexdigest()
         return os.path.join(self._legacy_cache_dir, f"{hashed_user_id}_embeddings.json")
+
+    def _get_unhashed_legacy_cache_file(self, user_id: str) -> Optional[str]:
+        filename = f"{user_id}_embeddings.json"
+        if os.path.basename(filename) != filename or ".." in filename:
+            return None
+        return os.path.join(self._legacy_cache_dir, filename)
+
+    def _get_legacy_cache_file(self, user_id: str) -> str:
+        return self._get_hashed_legacy_cache_file(user_id)
+
+    def _get_legacy_cache_files_for_read(self, user_id: str) -> List[str]:
+        hashed_file = self._get_hashed_legacy_cache_file(user_id)
+        unhashed_file = self._get_unhashed_legacy_cache_file(user_id)
+        if unhashed_file is None or hashed_file == unhashed_file:
+            return [hashed_file]
+        return [hashed_file, unhashed_file]
 
     def _connect_cache_db(self) -> sqlite3.Connection:
         os.makedirs(self._cache_root, exist_ok=True)
@@ -902,11 +916,15 @@ class EmbeddingManager:
             return None
 
     def _load_legacy_cache_sync(self, user_id: str) -> Dict[str, Any]:
-        cache_file = self._get_legacy_cache_file(user_id)
-        if not os.path.exists(cache_file):
-            return {}
-        with open(cache_file, "r") as f:
-            return json.load(f)
+        merged_cache: Dict[str, Any] = {}
+        for cache_file in reversed(self._get_legacy_cache_files_for_read(user_id)):
+            if not os.path.exists(cache_file):
+                continue
+            with open(cache_file, "r") as f:
+                loaded_cache = json.load(f)
+            if isinstance(loaded_cache, dict):
+                merged_cache.update(loaded_cache)
+        return merged_cache
 
     def _save_legacy_cache_sync(self, user_id: str, cache: Dict[str, Any]) -> None:
         os.makedirs(self._legacy_cache_dir, exist_ok=True)
@@ -951,9 +969,6 @@ class EmbeddingManager:
         }
 
     def _delete_embedding_legacy_json_sync(self, user_id: str, memory_id: str) -> None:
-        cache_file = self._get_legacy_cache_file(user_id)
-        if not os.path.exists(cache_file):
-            return
         cache = self._load_legacy_cache_sync(user_id)
         memory_id_str = normalize_memory_id(memory_id)
         if memory_id_str not in cache:
@@ -962,8 +977,9 @@ class EmbeddingManager:
         if cache:
             self._save_legacy_cache_sync(user_id, cache)
         else:
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(cache_file)
+            for cache_file in self._get_legacy_cache_files_for_read(user_id):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(cache_file)
 
     def _store_embedding_sqlite_sync(
         self, user_id: str, memory_id: str, embedding: np.ndarray
@@ -1058,11 +1074,16 @@ class EmbeddingManager:
             conn.commit()
 
     def _migrate_legacy_cache_if_needed_sync(self, user_id: str) -> int:
-        cache_file = self._get_legacy_cache_file(user_id)
-        if not os.path.exists(cache_file):
+        cache_files = [
+            cache_file
+            for cache_file in self._get_legacy_cache_files_for_read(user_id)
+            if os.path.exists(cache_file)
+        ]
+        if not cache_files:
             return 0
 
-        legacy_mtime = os.path.getmtime(cache_file)
+        legacy_mtime = max(os.path.getmtime(cache_file) for cache_file in cache_files)
+        legacy_cache_key = "|".join(cache_files)
         with self._connect_cache_db() as conn:
             self._ensure_cache_db_schema(conn)
             existing = conn.execute(
@@ -1073,7 +1094,11 @@ class EmbeddingManager:
                 """,
                 (user_id,),
             ).fetchone()
-            if existing and float(existing["legacy_mtime"]) == float(legacy_mtime):
+            if (
+                existing
+                and existing["legacy_cache_file"] == legacy_cache_key
+                and float(existing["legacy_mtime"]) == float(legacy_mtime)
+            ):
                 return 0
 
             cache = self._load_legacy_cache_sync(user_id)
@@ -1117,7 +1142,7 @@ class EmbeddingManager:
                 """,
                 (
                     user_id,
-                    cache_file,
+                    legacy_cache_key,
                     legacy_mtime,
                     datetime.now(timezone.utc).isoformat(),
                 ),
@@ -3267,7 +3292,7 @@ class MemoryPipeline:
     ) -> List[Dict[str, Any]]:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
         # Fetch full user object for Router DI (MockRequest)
-        user_obj = await get_user_by_id_compat(user_id)
+        user_obj = await self._get_user_object(user_id)
         mem0_user_id_override = self._get_mem0_user_id_override(user_valves)
         try:
             all_user_memories = await get_memories_by_user_id_compat(user_id)
@@ -4110,7 +4135,7 @@ class Filter:
             default=None,
             description="Plugin-side embedding API endpoint used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
-        embedding_api_key: Optional[SecretStr] = Field(
+        embedding_api_key: Optional[str] = Field(
             default=None,
             description="Plugin-side embedding API key used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
@@ -4124,7 +4149,7 @@ class Filter:
             default="https://api.mem0.ai",
             description="Base URL for the Mem0 API when Mem0 mirroring is enabled.",
         )
-        mem0_api_key: Optional[SecretStr] = Field(
+        mem0_api_key: Optional[str] = Field(
             default=None,
             description="API key for Mem0. Required only when enable_mem0_sync is enabled.",
         )
@@ -4342,7 +4367,7 @@ Analyze the following related memories and provide a concise summary.""",
             default="http://host.docker.internal:11434/api/chat",
             description="API endpoint URL for the LLM provider (e.g., 'http://host.docker.internal:11434/api/chat', 'https://api.openai.com/v1/chat/completions')",
         )
-        llm_api_key: Optional[SecretStr] = Field(
+        llm_api_key: Optional[str] = Field(
             default=None,
             description="API Key for the LLM provider (required if type is 'openai_compatible')",
         )
