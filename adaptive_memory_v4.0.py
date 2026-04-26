@@ -1,5 +1,6 @@
 import json
 import traceback
+import contextlib
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import (
@@ -206,26 +207,20 @@ class JSONParser:
             return None
 
         # 1. Try direct parsing
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             return json.loads(text)
-        except json.JSONDecodeError:
-            pass
 
         # 2. Extract from code blocks
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
         if json_match:
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
 
         # 3. Extract from raw brackets
         bracket_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", text)
         if bracket_match:
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 return json.loads(bracket_match.group(1))
-            except json.JSONDecodeError:
-                pass
 
         return None
 
@@ -888,10 +883,8 @@ class EmbeddingManager:
         if cache:
             self._save_legacy_cache_sync(user_id, cache)
         else:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(cache_file)
-            except FileNotFoundError:
-                pass
 
     def _store_embedding_sqlite_sync(
         self, user_id: str, memory_id: str, embedding: np.ndarray
@@ -2270,10 +2263,8 @@ class MemoryPipeline:
                 r'"confidence"\s*:\s*(?P<confidence>-?\d+(?:\.\d+)?)', body
             )
             if confidence_match:
-                try:
+                with contextlib.suppress(ValueError):
                     op["confidence"] = float(confidence_match.group("confidence"))
-                except ValueError:
-                    pass
 
             operations.append(op)
         return operations
@@ -3969,12 +3960,11 @@ Your output must be valid JSON only. No additional text.""",
                 self._restart_task = asyncio.create_task(self._restart_tasks())
                 
                 def _log_restart_exception(task):
-                    try:
-                        task.result()
-                    except asyncio.CancelledError:
-                        pass  # Expected when task is cancelled
-                    except Exception as e:
-                        logger.exception(f"Background restart task failed: {e}")
+                    with contextlib.suppress(asyncio.CancelledError):
+                        try:
+                            task.result()
+                        except Exception as e:
+                            logger.exception(f"Background restart task failed: {e}")
                 
                 self._restart_task.add_done_callback(_log_restart_exception)
             return True
