@@ -332,6 +332,8 @@ def truncate_text(text: str, max_length: int) -> str:
     stripped = str(text or "").strip()
     if len(stripped) <= max_length:
         return stripped
+    if max_length <= 3:
+        return stripped[:max_length]
     return stripped[: max_length - 3].rstrip() + "..."
 
 
