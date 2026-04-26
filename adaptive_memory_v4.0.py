@@ -886,6 +886,7 @@ class MemoryPipeline:
         # Fetch full user object for Router DI (MockRequest)
         user_obj = Users.get_user_by_id(user_id)
         success_ops = []
+        ids_to_delete = []
         for op in operations:
             try:
                 kind = op.get("operation")
@@ -1016,25 +1017,28 @@ class MemoryPipeline:
                         # Delete from database
                         Memories.delete_memory_by_id(memory_id)
                         
-                        # Delete from vector database if available
-                        if VECTOR_DB_CLIENT:
-                            try:
-                                VECTOR_DB_CLIENT.delete(
-                                    collection_name=f"user-memory-{user_id}",
-                                    ids=[str(memory_id)]
-                                )
-                                logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
-                            except Exception as vec_err:
-                                logger.warning(f"Failed to delete memory from vector DB: {vec_err}")
+                        # Collect ID for batch deletion from vector database
+                        ids_to_delete.append(str(memory_id))
                         
                         success_ops.append(op)
-                        logger.info(f"Memory deleted (ID: {memory_id})")
+                        logger.info(f"Memory deleted from database (ID: {memory_id})")
                     except Exception as del_err:
-                        logger.exception(f"Failed to delete memory: {del_err}")
+                        logger.exception(f"Failed to delete memory from database: {del_err}")
 
             except Exception as e:
                 self.error_manager.increment("memory_crud_errors")
                 logger.exception(f"Memory operation failed: {e}")
+
+        # Batch delete from vector database if available
+        if ids_to_delete and VECTOR_DB_CLIENT:
+            try:
+                VECTOR_DB_CLIENT.delete(
+                    collection_name=f"user-memory-{user_id}",
+                    ids=ids_to_delete
+                )
+                logger.info(f"Batch deleted {len(ids_to_delete)} memories from vector DB")
+            except Exception as vec_err:
+                logger.warning(f"Failed to batch delete memories from vector DB: {vec_err}")
 
         return success_ops
 
@@ -1324,28 +1328,30 @@ class MemoryPipeline:
                             f"Summarization: New consolidated summary saved successfully. Now removing {len(cluster_memories)} source memories."
                         )
                         # ONLY delete old if saving the new summary succeeded
+                        ids_to_delete = []
                         for m in cluster_memories:
                             try:
                                 memory_id = str(m.id)
                                 
                                 # Delete from database
                                 Memories.delete_memory_by_id(memory_id)
-                                
-                                # Delete from vector database if available
-                                if VECTOR_DB_CLIENT:
-                                    try:
-                                        VECTOR_DB_CLIENT.delete(
-                                            collection_name=f"user-memory-{user_id}",
-                                            ids=[memory_id]
-                                        )
-                                        logger.debug(f"Summarization: Deleted memory {memory_id} from vector DB")
-                                    except Exception as vec_err:
-                                        logger.warning(f"Summarization: Failed to delete memory {memory_id} from vector DB: {vec_err}")
+                                ids_to_delete.append(memory_id)
                                 
                             except Exception as del_err:
                                 logger.error(
-                                    f"Summarization: Failed to delete source memory {m.id}: {del_err}"
+                                    f"Summarization: Failed to delete source memory {m.id} from database: {del_err}"
                                 )
+
+                        # Batch delete from vector database if available
+                        if ids_to_delete and VECTOR_DB_CLIENT:
+                            try:
+                                VECTOR_DB_CLIENT.delete(
+                                    collection_name=f"user-memory-{user_id}",
+                                    ids=ids_to_delete
+                                )
+                                logger.debug(f"Summarization: Batch deleted {len(ids_to_delete)} source memories from vector DB")
+                            except Exception as vec_err:
+                                logger.warning(f"Summarization: Failed to batch delete source memories from vector DB: {vec_err}")
 
                         logger.info(
                             f"Summarized {len(cluster_memories)} memories into new summary (Confidence 1.0)"
