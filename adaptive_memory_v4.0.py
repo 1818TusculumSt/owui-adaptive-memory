@@ -1,5 +1,6 @@
 import json
 import traceback
+import contextlib
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import (
@@ -88,7 +89,7 @@ except ImportError:
 
 import numpy as np
 import aiohttp
-from pydantic import BaseModel, Field, model_validator, field_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator, field_validator
 
 # OpenWebUI Imports
 try:
@@ -206,26 +207,20 @@ class JSONParser:
             return None
 
         # 1. Try direct parsing
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             return json.loads(text)
-        except json.JSONDecodeError:
-            pass
 
         # 2. Extract from code blocks
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
         if json_match:
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
 
         # 3. Extract from raw brackets
         bracket_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", text)
         if bracket_match:
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 return json.loads(bracket_match.group(1))
-            except json.JSONDecodeError:
-                pass
 
         return None
 
@@ -332,7 +327,17 @@ def truncate_text(text: str, max_length: int) -> str:
     stripped = str(text or "").strip()
     if len(stripped) <= max_length:
         return stripped
+    if max_length <= 3:
+        return stripped[:max_length]
     return stripped[: max_length - 3].rstrip() + "..."
+
+
+def secret_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    return str(value)
 
 
 async def _resolve_owui_result(result: Any) -> Any:
@@ -540,9 +545,9 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 
 
 class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
-    def __init__(self, api_url: str, api_key: str, model_name: str):
+    def __init__(self, api_url: str, api_key: Union[str, SecretStr, None], model_name: str):
         self.api_url = api_url
-        self.api_key = api_key
+        self.api_key = secret_value(api_key)
         self.model_name = model_name
 
     async def get_embedding(self, text: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[np.ndarray]:
@@ -661,12 +666,13 @@ class EmbeddingManager:
 
     def _ensure_provider(self):
         valves = self.get_valves()
+        embedding_api_key = secret_value(valves.embedding_api_key)
         provider_signature = (
             getattr(valves, "embedding_source", "auto"),
             valves.embedding_provider_type,
             valves.embedding_model_name,
             valves.embedding_api_url,
-            valves.embedding_api_key,
+            embedding_api_key,
         )
         if not self.provider or self._provider_signature != provider_signature:
             if self._provider_signature and self._provider_signature != provider_signature:
@@ -683,7 +689,7 @@ class EmbeddingManager:
             elif valves.embedding_provider_type == "openai_compatible":
                 self.provider = OpenAICompatibleEmbeddingProvider(
                     valves.embedding_api_url,
-                    valves.embedding_api_key,
+                    embedding_api_key,
                     valves.embedding_model_name,
                 )
 
@@ -832,7 +838,8 @@ class EmbeddingManager:
         return combined_results
 
     def _get_legacy_cache_file(self, user_id: str) -> str:
-        return os.path.join(self._legacy_cache_dir, f"{user_id}_embeddings.json")
+        hashed_user_id = hashlib.sha256(str(user_id).encode()).hexdigest()
+        return os.path.join(self._legacy_cache_dir, f"{hashed_user_id}_embeddings.json")
 
     def _connect_cache_db(self) -> sqlite3.Connection:
         os.makedirs(self._cache_root, exist_ok=True)
@@ -909,20 +916,6 @@ class EmbeddingManager:
             json.dump(cache, f)
         os.replace(tmp_file, cache_file)
 
-    def _store_embedding_legacy_json_sync(
-        self, user_id: str, memory_id: str, embedding: np.ndarray
-    ) -> None:
-        memory_id_str = normalize_memory_id(memory_id)
-        cache = self._load_legacy_cache_sync(user_id)
-        model, provider = self._default_record_identity()
-        cache[memory_id_str] = {
-            "embedding": np.asarray(embedding, dtype=np.float32).tolist(),
-            "model": model,
-            "provider": provider,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self._save_legacy_cache_sync(user_id, cache)
-
     def _store_embeddings_batch_legacy_json_sync(
         self, user_id: str, ids: List[str], embeddings: List[np.ndarray]
     ) -> None:
@@ -969,10 +962,8 @@ class EmbeddingManager:
         if cache:
             self._save_legacy_cache_sync(user_id, cache)
         else:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(cache_file)
-            except FileNotFoundError:
-                pass
 
     def _store_embedding_sqlite_sync(
         self, user_id: str, memory_id: str, embedding: np.ndarray
@@ -1164,7 +1155,10 @@ class EmbeddingManager:
                 )
                 try:
                     await asyncio.to_thread(
-                        self._store_embedding_legacy_json_sync, user_id, memory_id, embedding
+                        self._store_embeddings_batch_legacy_json_sync,
+                        user_id,
+                        [memory_id],
+                        [embedding],
                     )
                 except Exception as legacy_err:
                     logger.warning(
@@ -1355,10 +1349,11 @@ class Mem0SyncManager:
 
     def _is_enabled(self) -> bool:
         valves = self.get_valves()
+        mem0_api_key = secret_value(getattr(valves, "mem0_api_key", None))
         return bool(
             getattr(valves, "enable_mem0_sync", False)
             and str(getattr(valves, "mem0_api_base_url", "") or "").strip()
-            and str(getattr(valves, "mem0_api_key", "") or "").strip()
+            and str(mem0_api_key or "").strip()
         )
 
     def should_use_background_sync(self) -> bool:
@@ -1404,8 +1399,9 @@ class Mem0SyncManager:
         return str(self.get_valves().mem0_api_base_url).rstrip("/")
 
     def _headers(self) -> Dict[str, str]:
+        mem0_api_key = secret_value(self.get_valves().mem0_api_key)
         return {
-            "Authorization": f"Token {self.get_valves().mem0_api_key}",
+            "Authorization": f"Token {mem0_api_key}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
@@ -2486,6 +2482,20 @@ class Mem0SyncManager:
 class MemoryPipeline:
     """Core logic for extracting, retrieving, and processing memories."""
 
+    _RE_PUNCTUATION = re.compile(r"[^\w\s]")
+    _RE_STANDALONE_S = re.compile(r"\bs\b")
+    _RE_ARTICLES = re.compile(r"\b(a|an|the)\b")
+    _RE_INTENSIFIERS = re.compile(
+        r"\b(really|very|quite|pretty|so|totally|absolutely)\b"
+    )
+    _RE_EXTRA_SPACES = re.compile(r"\s+")
+    _RE_TRIVIA_PATTERNS = [
+        re.compile(r"^(what|who|where|when|why|how)\b"),
+        re.compile(
+            r"\b(the capital of|world war|boiling point|photosynthesis|periodic table)\b"
+        ),
+    ]
+
     def __init__(
         self,
         valves: Any,
@@ -2896,12 +2906,8 @@ class MemoryPipeline:
         lowered = content.strip().lower()
         if not lowered:
             return False
-        trivia_patterns = [
-            r"^(what|who|where|when|why|how)\b",
-            r"\b(the capital of|world war|boiling point|photosynthesis|periodic table)\b",
-        ]
         return lowered.endswith("?") or any(
-            re.search(pattern, lowered) for pattern in trivia_patterns
+            pattern.search(lowered) for pattern in self._RE_TRIVIA_PATTERNS
         )
 
     def _passes_memory_filters(self, content: str) -> bool:
@@ -2975,10 +2981,8 @@ class MemoryPipeline:
                 r'"confidence"\s*:\s*(?P<confidence>-?\d+(?:\.\d+)?)', body
             )
             if confidence_match:
-                try:
+                with contextlib.suppress(ValueError):
                     op["confidence"] = float(confidence_match.group("confidence"))
-                except ValueError:
-                    pass
 
             operations.append(op)
         return operations
@@ -3238,19 +3242,19 @@ class MemoryPipeline:
     def _normalize_text(self, text: str) -> str:
         """Normalize text for comparison by removing punctuation, articles, intensifiers, and extra spaces."""
         # Remove punctuation, extra spaces, convert to lowercase
-        normalized = re.sub(r'[^\w\s]', '', text.strip().lower())
+        normalized = self._RE_PUNCTUATION.sub("", text.strip().lower())
         
         # Handle common plural variations
-        normalized = re.sub(r'\bs\b', '', normalized)  # Remove standalone 's'
+        normalized = self._RE_STANDALONE_S.sub("", normalized)  # Remove standalone 's'
         
         # Remove articles (a, an, the)
-        normalized = re.sub(r'\b(a|an|the)\b', '', normalized)
+        normalized = self._RE_ARTICLES.sub("", normalized)
         
         # Remove intensifiers (but keep adjectives like 'cold', 'hot')
-        normalized = re.sub(r'\b(really|very|quite|pretty|so|totally|absolutely)\b', '', normalized)
+        normalized = self._RE_INTENSIFIERS.sub("", normalized)
         
         # Clean up extra spaces
-        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        normalized = self._RE_EXTRA_SPACES.sub(" ", normalized).strip()
         return normalized
 
     # --- Memory Operations ---
@@ -3265,6 +3269,13 @@ class MemoryPipeline:
         # Fetch full user object for Router DI (MockRequest)
         user_obj = await get_user_by_id_compat(user_id)
         mem0_user_id_override = self._get_mem0_user_id_override(user_valves)
+        try:
+            all_user_memories = await get_memories_by_user_id_compat(user_id)
+        except Exception as fetch_err:
+            logger.warning(
+                f"Failed to prefetch memories for operation batch; continuing with empty cache: {fetch_err}"
+            )
+            all_user_memories = []
         success_ops = []
         for op in operations:
             try:
@@ -3289,7 +3300,11 @@ class MemoryPipeline:
                         and not skip_deduplication
                         and not skip_preference_dedupe
                     ):
-                        is_dupe, dedup_embedding = await self._is_duplicate(content, user_id)
+                        is_dupe, dedup_embedding = await self._is_duplicate(
+                            content,
+                            user_id,
+                            all_memories_override=all_user_memories,
+                        )
                         if is_dupe:
                             logger.info(f"Skipping duplicate memory (length: {len(content)})")
                             continue
@@ -3303,7 +3318,7 @@ class MemoryPipeline:
                             memory_id
                             for memory_id in (
                                 self._get_memory_id(memory)
-                                for memory in await get_memories_by_user_id_compat(user_id)
+                                for memory in all_user_memories
                             )
                             if memory_id is not None
                         }
@@ -3364,6 +3379,11 @@ class MemoryPipeline:
                                 user_id, mem_obj, final_content, user_obj=user_obj
                             )
                         success_ops.append(normalized_op)
+                        if all(
+                            self._get_memory_id(memory) != memory_id
+                            for memory in all_user_memories
+                        ):
+                            all_user_memories.append(mem_obj)
                         logger.info(
                             f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]"
                         )
@@ -3401,11 +3421,10 @@ class MemoryPipeline:
                     try:
                         memory_id = normalize_memory_id(normalized_op["id"])
                         new_content = content
-                        existing_memories = await get_memories_by_user_id_compat(user_id)
                         existing_memory = next(
                             (
                                 memory
-                                for memory in existing_memories
+                                for memory in all_user_memories
                                 if self._get_memory_id(memory) == memory_id
                             ),
                             None,
@@ -3436,7 +3455,10 @@ class MemoryPipeline:
                             and not skip_preference_dedupe
                         ):
                             is_dupe, new_embedding = await self._is_duplicate(
-                                new_content, user_id, exclude_id=memory_id
+                                new_content,
+                                user_id,
+                                exclude_id=memory_id,
+                                all_memories_override=all_user_memories,
                             )
                             if is_dupe:
                                 logger.info(
@@ -3452,6 +3474,11 @@ class MemoryPipeline:
                         )
 
                         if updated_memory:
+                            for index, memory in enumerate(all_user_memories):
+                                if self._get_memory_id(memory) == memory_id:
+                                    all_user_memories[index] = updated_memory
+                                    break
+
                             if new_embedding is None:
                                 new_embedding = await self.embedding_manager.get_embedding(
                                     new_content, user=user_obj
@@ -3505,6 +3532,11 @@ class MemoryPipeline:
                             log_context="Memory operation",
                         )
                         if deleted:
+                            all_user_memories = [
+                                memory
+                                for memory in all_user_memories
+                                if self._get_memory_id(memory) != memory_id
+                            ]
                             success_ops.append(normalized_op)
                     except Exception as del_err:
                         logger.exception(f"Failed to delete memory: {del_err}")
@@ -3516,7 +3548,9 @@ class MemoryPipeline:
         # Prune old memories if we exceeded the limit
         if success_ops and user_id:
             try:
-                deleted_count = await self._prune_old_memories(user_id)
+                deleted_count = await self._prune_old_memories(
+                    user_id, all_memories_override=all_user_memories
+                )
                 if deleted_count > 0:
                     logger.info(f"Pruned {deleted_count} old memories to maintain limit of {self.valves.max_total_memories}")
             except Exception as prune_err:
@@ -3629,7 +3663,9 @@ class MemoryPipeline:
         return False
 
     # --- Memory Pruning ---
-    async def _prune_old_memories(self, user_id: str) -> int:
+    async def _prune_old_memories(
+        self, user_id: str, all_memories_override: Optional[List[Any]] = None
+    ) -> int:
         """Prune memories when total count exceeds max_total_memories.
         
         Returns:
@@ -3637,7 +3673,11 @@ class MemoryPipeline:
         """
         try:
             # Get all memories for the user
-            all_memories = await get_memories_by_user_id_compat(user_id)
+            all_memories = (
+                all_memories_override
+                if all_memories_override is not None
+                else await get_memories_by_user_id_compat(user_id)
+            )
             
             if not all_memories:
                 return 0
@@ -4070,7 +4110,7 @@ class Filter:
             default=None,
             description="Plugin-side embedding API endpoint used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
-        embedding_api_key: Optional[str] = Field(
+        embedding_api_key: Optional[SecretStr] = Field(
             default=None,
             description="Plugin-side embedding API key used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
         )
@@ -4084,7 +4124,7 @@ class Filter:
             default="https://api.mem0.ai",
             description="Base URL for the Mem0 API when Mem0 mirroring is enabled.",
         )
-        mem0_api_key: Optional[str] = Field(
+        mem0_api_key: Optional[SecretStr] = Field(
             default=None,
             description="API key for Mem0. Required only when enable_mem0_sync is enabled.",
         )
@@ -4302,7 +4342,7 @@ Analyze the following related memories and provide a concise summary.""",
             default="http://host.docker.internal:11434/api/chat",
             description="API endpoint URL for the LLM provider (e.g., 'http://host.docker.internal:11434/api/chat', 'https://api.openai.com/v1/chat/completions')",
         )
-        llm_api_key: Optional[str] = Field(
+        llm_api_key: Optional[SecretStr] = Field(
             default=None,
             description="API Key for the LLM provider (required if type is 'openai_compatible')",
         )
@@ -4626,7 +4666,10 @@ Your output must be valid JSON only. No additional text.""",
 
         @model_validator(mode="after")
         def check_llm_config(self):
-            if self.llm_provider_type == "openai_compatible" and not self.llm_api_key:
+            if (
+                self.llm_provider_type == "openai_compatible"
+                and not secret_value(self.llm_api_key)
+            ):
                 raise ValueError(
                     "API Key is required when llm_provider_type is 'openai_compatible'"
                 )
@@ -4635,7 +4678,7 @@ Your output must be valid JSON only. No additional text.""",
         @model_validator(mode="after")
         def check_mem0_config(self):
             if self.enable_mem0_sync:
-                if not self.mem0_api_key:
+                if not secret_value(self.mem0_api_key):
                     raise ValueError(
                         "Mem0 API key is required when enable_mem0_sync is enabled"
                     )
@@ -4660,7 +4703,7 @@ Your output must be valid JSON only. No additional text.""",
                 self.embedding_source in {"auto", "plugin"}
                 and self.embedding_provider_type == "openai_compatible"
             ):
-                if not self.embedding_api_key:
+                if not secret_value(self.embedding_api_key):
                     raise ValueError(
                         "API Key required for openai_compatible embedding provider"
                     )
@@ -4718,7 +4761,7 @@ Your output must be valid JSON only. No additional text.""",
             f"{self.valves.mem0_sync_batch_size}_{self.valves.mem0_sync_batch_interval_seconds}_"
             f"{self.valves.mem0_sync_retry_delay_seconds}"
         )
-        new_hash = hashlib.md5(valve_str.encode()).hexdigest()
+        new_hash = hashlib.sha256(valve_str.encode()).hexdigest()
         
         if self._valve_hash is None:
             self._valve_hash = new_hash
@@ -4830,7 +4873,7 @@ Your output must be valid JSON only. No additional text.""",
                     url = valves.llm_api_endpoint_url
                     headers = {"Content-Type": "application/json"}
                     if valves.llm_api_key:
-                        headers["Authorization"] = f"Bearer {valves.llm_api_key}"
+                        headers["Authorization"] = f"Bearer {secret_value(valves.llm_api_key)}"
 
                     payload = {
                         "model": valves.llm_model_name,
