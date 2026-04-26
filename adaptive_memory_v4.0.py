@@ -2327,7 +2327,6 @@ Your output must be valid JSON only. No additional text.""",
 
         return body
 
-    # ... Placeholder for other required methods (referenced by TaskManager) ...
     async def _summarize_old_memories_loop(self):
         """Background task for summarization."""
         logger.info(f"Summarization background task launched with interval: {self.valves.summarization_interval} seconds")
