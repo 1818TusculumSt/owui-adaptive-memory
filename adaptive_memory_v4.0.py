@@ -101,7 +101,6 @@ except ImportError:
 
 from open_webui.models.memories import Memories
 from open_webui.models.users import Users
-from open_webui.main import app as webui_app
 
 # --- Router & Mock Imports for Vector Indexing ---
 try:
