@@ -4701,7 +4701,7 @@ Your output must be valid JSON only. No additional text.""",
             f"{self.valves.mem0_sync_batch_size}_{self.valves.mem0_sync_batch_interval_seconds}_"
             f"{self.valves.mem0_sync_retry_delay_seconds}"
         )
-        new_hash = hashlib.md5(valve_str.encode()).hexdigest()
+        new_hash = hashlib.sha256(valve_str.encode()).hexdigest()
         
         if self._valve_hash is None:
             self._valve_hash = new_hash
