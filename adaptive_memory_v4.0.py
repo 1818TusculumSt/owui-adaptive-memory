@@ -1088,7 +1088,7 @@ class EmbeddingManager:
             self._ensure_cache_db_schema(conn)
             existing = conn.execute(
                 """
-                SELECT legacy_mtime
+                SELECT legacy_cache_file, legacy_mtime
                 FROM legacy_cache_migrations
                 WHERE user_id = ?
                 """,
