@@ -1013,22 +1013,36 @@ class MemoryPipeline:
                     try:
                         memory_id = op["id"]
                         
-                        # Delete from database
-                        Memories.delete_memory_by_id(memory_id)
+                        # Delete from database - uses scoped deletion to prevent IDOR
+                        # Use delete_memory_by_id_and_user_id if available, otherwise fallback to check ownership
+                        delete_success = False
+                        if hasattr(Memories, "delete_memory_by_id_and_user_id"):
+                            delete_success = Memories.delete_memory_by_id_and_user_id(memory_id, user_id)
+                        else:
+                            # Fallback: check if the memory belongs to the user before deleting
+                            # This is a safe fallback for older versions of Open WebUI
+                            user_memories = Memories.get_memories_by_user_id(user_id)
+                            if any(str(m.id) == str(memory_id) for m in user_memories):
+                                delete_success = Memories.delete_memory_by_id(memory_id)
+                            else:
+                                logger.warning(f"Unauthorized delete attempt for memory {memory_id} by user {user_id}")
                         
-                        # Delete from vector database if available
-                        if VECTOR_DB_CLIENT:
-                            try:
-                                VECTOR_DB_CLIENT.delete(
-                                    collection_name=f"user-memory-{user_id}",
-                                    ids=[str(memory_id)]
-                                )
-                                logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
-                            except Exception as vec_err:
-                                logger.warning(f"Failed to delete memory from vector DB: {vec_err}")
-                        
-                        success_ops.append(op)
-                        logger.info(f"Memory deleted (ID: {memory_id})")
+                        # Only delete from vector database if DB deletion was successful
+                        if delete_success:
+                            if VECTOR_DB_CLIENT:
+                                try:
+                                    VECTOR_DB_CLIENT.delete(
+                                        collection_name=f"user-memory-{user_id}",
+                                        ids=[str(memory_id)]
+                                    )
+                                    logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
+                                except Exception as vec_err:
+                                    logger.warning(f"Failed to delete memory from vector DB: {vec_err}")
+
+                            success_ops.append(op)
+                            logger.info(f"Memory deleted (ID: {memory_id})")
+                        else:
+                            logger.error(f"Failed to delete memory (ID: {memory_id}) - not found or unauthorized")
                     except Exception as del_err:
                         logger.exception(f"Failed to delete memory: {del_err}")
 
@@ -1328,19 +1342,27 @@ class MemoryPipeline:
                             try:
                                 memory_id = str(m.id)
                                 
-                                # Delete from database
-                                Memories.delete_memory_by_id(memory_id)
+                                # Delete from database - uses scoped deletion to prevent IDOR
+                                delete_success = False
+                                if hasattr(Memories, "delete_memory_by_id_and_user_id"):
+                                    delete_success = Memories.delete_memory_by_id_and_user_id(memory_id, user_id)
+                                else:
+                                    # Fallback: check if the memory belongs to the user before deleting
+                                    user_memories = Memories.get_memories_by_user_id(user_id)
+                                    if any(str(mem.id) == str(memory_id) for mem in user_memories):
+                                        delete_success = Memories.delete_memory_by_id(memory_id)
                                 
-                                # Delete from vector database if available
-                                if VECTOR_DB_CLIENT:
-                                    try:
-                                        VECTOR_DB_CLIENT.delete(
-                                            collection_name=f"user-memory-{user_id}",
-                                            ids=[memory_id]
-                                        )
-                                        logger.debug(f"Summarization: Deleted memory {memory_id} from vector DB")
-                                    except Exception as vec_err:
-                                        logger.warning(f"Summarization: Failed to delete memory {memory_id} from vector DB: {vec_err}")
+                                # Delete from vector database if available and DB deletion was successful
+                                if delete_success:
+                                    if VECTOR_DB_CLIENT:
+                                        try:
+                                            VECTOR_DB_CLIENT.delete(
+                                                collection_name=f"user-memory-{user_id}",
+                                                ids=[memory_id]
+                                            )
+                                            logger.debug(f"Summarization: Deleted memory {memory_id} from vector DB")
+                                        except Exception as vec_err:
+                                            logger.warning(f"Summarization: Failed to delete memory {memory_id} from vector DB: {vec_err}")
                                 
                             except Exception as del_err:
                                 logger.error(
