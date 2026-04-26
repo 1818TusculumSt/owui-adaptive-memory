@@ -3265,6 +3265,10 @@ class MemoryPipeline:
         # Fetch full user object for Router DI (MockRequest)
         user_obj = await get_user_by_id_compat(user_id)
         mem0_user_id_override = self._get_mem0_user_id_override(user_valves)
+
+        # Optimization: Fetch all memories once to avoid N+1 queries in the loop
+        all_user_memories = await get_memories_by_user_id_compat(user_id)
+
         success_ops = []
         for op in operations:
             try:
@@ -3289,7 +3293,9 @@ class MemoryPipeline:
                         and not skip_deduplication
                         and not skip_preference_dedupe
                     ):
-                        is_dupe, dedup_embedding = await self._is_duplicate(content, user_id)
+                        is_dupe, dedup_embedding = await self._is_duplicate(
+                            content, user_id, all_memories_override=all_user_memories
+                        )
                         if is_dupe:
                             logger.info(f"Skipping duplicate memory (length: {len(content)})")
                             continue
@@ -3303,7 +3309,7 @@ class MemoryPipeline:
                             memory_id
                             for memory_id in (
                                 self._get_memory_id(memory)
-                                for memory in await get_memories_by_user_id_compat(user_id)
+                                for memory in all_user_memories
                             )
                             if memory_id is not None
                         }
@@ -3337,9 +3343,8 @@ class MemoryPipeline:
                             logger.warning(
                                 f"Router add_memory failed ({add_err}), falling back to insert_new_memory"
                             )
-                            current_memories = await get_memories_by_user_id_compat(user_id)
                             mem_obj = self._find_memory_by_exact_content(
-                                current_memories,
+                                all_user_memories,
                                 final_content,
                                 excluded_ids=existing_memory_ids,
                             )
@@ -3364,6 +3369,10 @@ class MemoryPipeline:
                                 user_id, mem_obj, final_content, user_obj=user_obj
                             )
                         success_ops.append(normalized_op)
+                        # Keep all_user_memories in sync
+                        if mem_obj not in all_user_memories:
+                            all_user_memories.append(mem_obj)
+
                         logger.info(
                             f"Memory saved (ID: {memory_id}) [Bank: {bank}] [Confidence: {confidence:.2f}]"
                         )
@@ -3401,11 +3410,10 @@ class MemoryPipeline:
                     try:
                         memory_id = normalize_memory_id(normalized_op["id"])
                         new_content = content
-                        existing_memories = await get_memories_by_user_id_compat(user_id)
                         existing_memory = next(
                             (
                                 memory
-                                for memory in existing_memories
+                                for memory in all_user_memories
                                 if self._get_memory_id(memory) == memory_id
                             ),
                             None,
@@ -3436,7 +3444,10 @@ class MemoryPipeline:
                             and not skip_preference_dedupe
                         ):
                             is_dupe, new_embedding = await self._is_duplicate(
-                                new_content, user_id, exclude_id=memory_id
+                                new_content,
+                                user_id,
+                                exclude_id=memory_id,
+                                all_memories_override=all_user_memories,
                             )
                             if is_dupe:
                                 logger.info(
@@ -3452,6 +3463,12 @@ class MemoryPipeline:
                         )
 
                         if updated_memory:
+                            # Keep all_user_memories in sync
+                            for i, m in enumerate(all_user_memories):
+                                if self._get_memory_id(m) == memory_id:
+                                    all_user_memories[i] = updated_memory
+                                    break
+
                             if new_embedding is None:
                                 new_embedding = await self.embedding_manager.get_embedding(
                                     new_content, user=user_obj
@@ -3505,6 +3522,12 @@ class MemoryPipeline:
                             log_context="Memory operation",
                         )
                         if deleted:
+                            # Keep all_user_memories in sync
+                            all_user_memories = [
+                                m
+                                for m in all_user_memories
+                                if self._get_memory_id(m) != memory_id
+                            ]
                             success_ops.append(normalized_op)
                     except Exception as del_err:
                         logger.exception(f"Failed to delete memory: {del_err}")
@@ -3516,7 +3539,9 @@ class MemoryPipeline:
         # Prune old memories if we exceeded the limit
         if success_ops and user_id:
             try:
-                deleted_count = await self._prune_old_memories(user_id)
+                deleted_count = await self._prune_old_memories(
+                    user_id, all_memories_override=all_user_memories
+                )
                 if deleted_count > 0:
                     logger.info(f"Pruned {deleted_count} old memories to maintain limit of {self.valves.max_total_memories}")
             except Exception as prune_err:
@@ -3629,7 +3654,9 @@ class MemoryPipeline:
         return False
 
     # --- Memory Pruning ---
-    async def _prune_old_memories(self, user_id: str) -> int:
+    async def _prune_old_memories(
+        self, user_id: str, all_memories_override: Optional[List[Any]] = None
+    ) -> int:
         """Prune memories when total count exceeds max_total_memories.
         
         Returns:
@@ -3637,8 +3664,12 @@ class MemoryPipeline:
         """
         try:
             # Get all memories for the user
-            all_memories = await get_memories_by_user_id_compat(user_id)
-            
+            all_memories = (
+                all_memories_override
+                if all_memories_override is not None
+                else await get_memories_by_user_id_compat(user_id)
+            )
+
             if not all_memories:
                 return 0
             
