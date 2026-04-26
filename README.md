@@ -6,6 +6,8 @@ Give Open WebUI persistent, user-specific memory with semantic recall, deduplica
 
 This function watches user messages, extracts durable facts and preferences, stores them in Open WebUI memory, and injects the most relevant memories back into later chats.
 
+This README reflects the current `adaptive_memory_v4.0.py` implementation. Some older valves are still present for compatibility with saved Open WebUI settings, but only the implemented behavior is described as active below.
+
 It is designed to stay mostly automatic once configured:
 - Extract likely long-term memories from recent user messages
 - Save them into Open WebUI memory
@@ -58,9 +60,10 @@ Use:
 - `embedding_source = auto`
 - `embedding_provider_type = local`
 - `embedding_model_name = all-MiniLM-L6-v2`
-- your normal Ollama or OpenAI-compatible model for memory extraction
+- `llm_provider_type = ollama` with `llm_api_endpoint_url = http://host.docker.internal:11434/api/chat`, or an OpenAI-compatible endpoint with `llm_api_key`
+- your normal model in `llm_model_name` for memory extraction
 
-That gives you Open WebUI embeddings when available, with plugin embeddings as a fallback.
+That gives you Open WebUI embeddings when available, with plugin embeddings as a fallback. You do not need to change the embedding valves if Open WebUI already has a working embedding function and the local fallback is acceptable.
 
 ### Mem0 Mirroring
 
@@ -124,13 +127,40 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 
 ## Important Valves
 
-### Memory Extraction and Recall
+### Embeddings
+
+- `embedding_source`
+- `embedding_provider_type`
+- `embedding_model_name`
+- `embedding_api_url`
+- `embedding_api_key`
+
+### LLM Provider
+
+- `llm_provider_type`
+- `llm_model_name`
+- `llm_api_endpoint_url`
+- `llm_api_key`
+- `max_retries`
+- `retry_delay`
+
+### Memory Extraction
 
 - `recent_messages_n`
+- `memory_identification_prompt`
+- `enable_json_stripping`
+- `enable_fallback_regex`
+- `enable_short_preference_shortcut`
+- `short_preference_no_dedupe_length`
+- `preference_keywords_no_dedupe`
+
+### Recall and Injection
+
 - `related_memories_n`
 - `relevance_threshold`
 - `vector_similarity_threshold`
 - `show_memories`
+- `max_injected_memory_length`
 - `memory_format`
 
 ### Deduplication
@@ -152,6 +182,12 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `whitelist_keywords`
 - `allowed_memory_banks`
 - `default_memory_bank`
+- `enable_identity_memories`
+- `enable_behavior_memories`
+- `enable_preference_memories`
+- `enable_goal_memories`
+- `enable_relationship_memories`
+- `enable_possession_memories`
 
 ### Size Control
 
@@ -163,6 +199,7 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `summarization_similarity_threshold`
 - `summarization_max_cluster_size`
 - `summarization_min_memory_age_days`
+- `summarization_memory_prompt`
 
 ### Mem0
 
@@ -179,9 +216,8 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `mem0_user_id_template`
 - `mem0_user_id_override`
 - `mem0_infer_on_create`
-- `log_user_id_on_memory_save`
 
-### Background Tasks
+### Background Tasks and Logging
 
 - `enable_summarization_task`
 - `enable_error_logging_task`
@@ -189,6 +225,16 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `summarization_interval`
 - `error_logging_interval`
 - `vector_cleanup_interval`
+- `log_user_id_on_memory_save`
+
+### User Valves
+
+- `enabled`
+- `show_status`
+- `mem0_user_id_override`
+- `timezone`
+
+The active user-level controls are `enabled`, `show_status`, and `mem0_user_id_override`. User `timezone` is still present in the schema but is not currently used by the processing path.
 
 ## Background Tasks That Actually Run
 
@@ -199,7 +245,27 @@ Current active background loops:
 - Orphaned vector cleanup
 - Rogue task scavenging on startup
 
-There are a few task-related valves in the schema that look future-facing, but not every one currently has an implemented loop in this file.
+Compatibility valves that are present in the schema but not currently wired into active behavior:
+- `enable_date_update_task`
+- `date_update_interval`
+- `enable_model_discovery_task`
+- `model_discovery_interval`
+- `summarization_strategy`
+- `save_relevance_threshold`
+- `memory_threshold`
+- `llm_skip_relevance_threshold`
+- `top_n_memories`
+- `cache_ttl_seconds`
+- `use_llm_for_relevance`
+- `memory_relevance_prompt`
+- `memory_merge_prompt`
+- `enable_error_counter_guard`
+- `error_guard_threshold`
+- `error_guard_window_seconds`
+- `debug_error_counter_logs`
+- global `show_status`
+- global `timezone`
+- user `timezone`
 
 ## Storage and Sidecar Files
 
@@ -215,7 +281,8 @@ Legacy embedding JSON cache files may also appear if SQLite persistence fails an
 
 - The function tries to keep Open WebUI's vector DB in sync with local memory CRUD.
 - Retrieval uses the stored memories plus embeddings managed by this function.
-- If embedding provider settings change, cached embeddings may become incompatible and will be regenerated over time.
+- If the embedding model or provider type changes, persistent cache entries are treated as incompatible and regenerated over time.
+- If the embedding API URL or key changes for the same model/provider type, the plugin provider is refreshed and the in-memory embedding cache is cleared; existing persistent embeddings for that same model/provider type may still be reused.
 - A background vector cleanup task removes orphaned vectors when possible.
 
 ## Notes on Summarization
@@ -251,7 +318,7 @@ Optional:
 - In `background` mode, Mem0 can lag behind local memory by up to `mem0_sync_batch_interval_seconds`.
 - Reconciliation runs during inbound requests, not as a separate continuous Mem0 polling loop.
 - If Mem0 is unavailable, local memory remains intact.
-- Some logging and configuration fields are broader than the currently implemented feature set.
+- Some compatibility valves remain in the schema so existing Open WebUI saved settings do not break, even though they do not currently change behavior.
 
 ## Credit
 
