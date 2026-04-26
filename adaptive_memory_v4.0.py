@@ -1013,20 +1013,25 @@ class MemoryPipeline:
                     try:
                         memory_id = op["id"]
                         
-                        # Delete from database
-                        Memories.delete_memory_by_id(memory_id)
-                        
-                        # Delete from vector database if available
-                        if VECTOR_DB_CLIENT:
-                            try:
-                                VECTOR_DB_CLIENT.delete(
-                                    collection_name=f"user-memory-{user_id}",
-                                    ids=[str(memory_id)]
-                                )
-                                logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
-                            except Exception as vec_err:
-                                logger.warning(f"Failed to delete memory from vector DB: {vec_err}")
-                        
+                        # Security Fix: Verify ownership before deletion
+                        user_memories = Memories.get_memories_by_user_id(user_id)
+                        if any(str(m.id) == str(memory_id) for m in user_memories):
+                            # Delete from database
+                            Memories.delete_memory_by_id(memory_id)
+
+                            # Delete from vector database if available
+                            if VECTOR_DB_CLIENT:
+                                try:
+                                    VECTOR_DB_CLIENT.delete(
+                                        collection_name=f"user-memory-{user_id}",
+                                        ids=[str(memory_id)]
+                                    )
+                                    logger.info(f"Memory deleted from vector DB (ID: {memory_id})")
+                                except Exception as vec_err:
+                                    logger.warning(f"Failed to delete memory from vector DB: {vec_err}")
+                        else:
+                            logger.warning(f"Unauthorized deletion attempt for memory {memory_id} by user {user_id}")
+                            continue
                         success_ops.append(op)
                         logger.info(f"Memory deleted (ID: {memory_id})")
                     except Exception as del_err:
