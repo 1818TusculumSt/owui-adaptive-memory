@@ -3264,6 +3264,122 @@ class MemoryPipeline:
             return 0.0
         return float(np.dot(v1, v2) / (norm1 * norm2))
 
+    def _shared_summarization_tags(
+        self, record_a: StoredMemoryRecord, record_b: StoredMemoryRecord
+    ) -> Set[str]:
+        tags_a = set(record_a.tags or []) - {"summary"}
+        tags_b = set(record_b.tags or []) - {"summary"}
+        return tags_a & tags_b
+
+    def _same_summarization_bank(
+        self, record_a: StoredMemoryRecord, record_b: StoredMemoryRecord
+    ) -> bool:
+        bank_a = self._normalize_memory_bank(record_a.memory_bank)
+        bank_b = self._normalize_memory_bank(record_b.memory_bank)
+        return bank_a.lower() == bank_b.lower()
+
+    def _summarization_pair_score(
+        self,
+        record_a: StoredMemoryRecord,
+        embedding_a: Optional[np.ndarray],
+        record_b: StoredMemoryRecord,
+        embedding_b: Optional[np.ndarray],
+    ) -> float:
+        if embedding_a is None or embedding_b is None:
+            return 0.0
+        return self._cosine_similarity(embedding_a, embedding_b)
+
+    def _are_memories_related_for_summarization(
+        self,
+        record_a: StoredMemoryRecord,
+        embedding_a: Optional[np.ndarray],
+        record_b: StoredMemoryRecord,
+        embedding_b: Optional[np.ndarray],
+    ) -> bool:
+        strategy = str(getattr(self.valves, "summarization_strategy", "hybrid") or "hybrid").lower()
+        shared_tags = self._shared_summarization_tags(record_a, record_b)
+        same_bank = self._same_summarization_bank(record_a, record_b)
+
+        if strategy == "tags":
+            return bool(shared_tags) and same_bank
+
+        similarity = self._summarization_pair_score(
+            record_a, embedding_a, record_b, embedding_b
+        )
+        threshold = self.valves.summarization_similarity_threshold
+
+        if strategy == "hybrid" and shared_tags and same_bank:
+            threshold = max(0.0, threshold - 0.08)
+
+        return similarity >= threshold
+
+    def _build_summarization_clusters(
+        self,
+        records: List[StoredMemoryRecord],
+        embeddings: List[Optional[np.ndarray]],
+        valid_indices: List[int],
+    ) -> List[List[int]]:
+        neighbors: Dict[int, Set[int]] = {index: set() for index in valid_indices}
+
+        for position, i in enumerate(valid_indices):
+            for j in valid_indices[position + 1 :]:
+                if self._are_memories_related_for_summarization(
+                    records[i], embeddings[i], records[j], embeddings[j]
+                ):
+                    neighbors[i].add(j)
+                    neighbors[j].add(i)
+
+        components = []
+        seen = set()
+        for index in valid_indices:
+            if index in seen:
+                continue
+
+            stack = [index]
+            component = []
+            seen.add(index)
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for neighbor in sorted(neighbors[current]):
+                    if neighbor not in seen:
+                        seen.add(neighbor)
+                        stack.append(neighbor)
+
+            if len(component) >= self.valves.summarization_min_cluster_size:
+                components.append(sorted(component))
+
+        clusters = []
+        for component in components:
+            remaining = sorted(
+                component,
+                key=lambda idx: len(neighbors[idx]),
+                reverse=True,
+            )
+
+            while remaining:
+                seed = remaining.pop(0)
+                cluster = [seed]
+                candidates = sorted(
+                    remaining,
+                    key=lambda idx: self._summarization_pair_score(
+                        records[seed], embeddings[seed], records[idx], embeddings[idx]
+                    ),
+                    reverse=True,
+                )
+
+                for candidate in candidates:
+                    if len(cluster) >= self.valves.summarization_max_cluster_size:
+                        break
+                    if any(candidate in neighbors[cluster_index] for cluster_index in cluster):
+                        cluster.append(candidate)
+
+                remaining = [idx for idx in remaining if idx not in cluster]
+                if len(cluster) >= self.valves.summarization_min_cluster_size:
+                    clusters.append(cluster)
+
+        return clusters
+
     def _normalize_text(self, text: str) -> str:
         """Normalize text for comparison by removing punctuation, articles, intensifiers, and extra spaces."""
         # Remove punctuation, extra spaces, convert to lowercase
@@ -3804,7 +3920,7 @@ class MemoryPipeline:
             now = datetime.now(timezone.utc)
             for memory in all_memories:
                 memory_record = self._get_memory_record(memory)
-                if not memory_record.content or "summary" in memory_record.tags:
+                if not memory_record.content:
                     continue
 
                 created_at = getattr(memory, "created_at", None)
@@ -3827,95 +3943,85 @@ class MemoryPipeline:
             logger.exception(f"Summarization fetch failed: {e}")
             return
 
-        logger.info(f"Processing embeddings for {len(memories)} memories")
-        contents = [self._get_memory_record(m).content for m in memories]
+        records = [self._get_memory_record(m) for m in memories]
+        contents = [record.content for record in records]
         ids = [self._get_memory_id(m) for m in memories]
+        strategy = str(getattr(self.valves, "summarization_strategy", "hybrid") or "hybrid").lower()
 
-        embeddings = []
+        embeddings: List[Optional[np.ndarray]] = []
         uncached_indices = []
         uncached_contents = []
+        new_embeddings: List[Optional[np.ndarray]] = []
 
-        for i, (memory_id, content) in enumerate(zip(ids, contents, strict=True)):
-            if not memory_id or not content:
-                embeddings.append(None)
-                continue
-            cached_embedding = await self.embedding_manager.cache.get(memory_id)
-            if cached_embedding is not None:
-                embeddings.append(cached_embedding)
-            else:
-                persistent_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
-                if persistent_embedding is not None:
-                    await self.embedding_manager.cache.set(memory_id, persistent_embedding)
-                    embeddings.append(persistent_embedding)
-                else:
-                    embeddings.append(None)
-                    uncached_indices.append(i)
-                    uncached_contents.append(content)
-
-        if uncached_contents:
-            logger.info(f"Generating embeddings for {len(uncached_contents)} uncached memories (using cache for {len(memories) - len(uncached_contents)})")
-            new_embeddings = await self.embedding_manager.get_embeddings_batch(
-                uncached_contents, user=user_obj
+        if strategy == "tags":
+            logger.info(
+                f"Summarization strategy is tags; clustering {len(memories)} eligible memories by shared tags and memory bank"
             )
-            
-            for idx, new_emb in zip(uncached_indices, new_embeddings, strict=True):
-                if new_emb is not None:
-                    embeddings[idx] = new_emb
-                    await self.embedding_manager.cache.set(ids[idx], new_emb)
-            
-            await self.embedding_manager.store_embeddings_batch_persistent(
-                user_id, 
-                [str(ids[idx]) for idx in uncached_indices],
-                uncached_contents,
-                new_embeddings
-            )
+            embeddings = [None for _ in memories]
+            valid_indices = list(range(len(memories)))
+            newly_generated_count = 0
         else:
-            logger.info(f"Using cached embeddings for all {len(memories)} memories")
-            new_embeddings = []
+            logger.info(f"Processing embeddings for {len(memories)} memories")
 
-        valid_indices = [i for i, e in enumerate(embeddings) if e is not None]
-        newly_generated_count = len([e for e in new_embeddings if e is not None]) if new_embeddings else 0
-        logger.info(f"Ready for clustering: {len(valid_indices)} valid embeddings ({len(memories) - len(uncached_contents)} from cache, {newly_generated_count} newly generated)")
-        
+            for i, (memory_id, content) in enumerate(zip(ids, contents, strict=True)):
+                if not memory_id or not content:
+                    embeddings.append(None)
+                    continue
+                cached_embedding = await self.embedding_manager.cache.get(memory_id)
+                if cached_embedding is not None:
+                    embeddings.append(cached_embedding)
+                else:
+                    persistent_embedding = await self.embedding_manager.load_embedding_persistent(user_id, memory_id)
+                    if persistent_embedding is not None:
+                        await self.embedding_manager.cache.set(memory_id, persistent_embedding)
+                        embeddings.append(persistent_embedding)
+                    else:
+                        embeddings.append(None)
+                        uncached_indices.append(i)
+                        uncached_contents.append(content)
+
+            if uncached_contents:
+                logger.info(f"Generating embeddings for {len(uncached_contents)} uncached memories (using cache for {len(memories) - len(uncached_contents)})")
+                new_embeddings = await self.embedding_manager.get_embeddings_batch(
+                    uncached_contents, user=user_obj
+                )
+
+                for idx, new_emb in zip(uncached_indices, new_embeddings, strict=True):
+                    if new_emb is not None:
+                        embeddings[idx] = new_emb
+                        await self.embedding_manager.cache.set(ids[idx], new_emb)
+
+                await self.embedding_manager.store_embeddings_batch_persistent(
+                    user_id,
+                    [str(ids[idx]) for idx in uncached_indices],
+                    uncached_contents,
+                    new_embeddings
+                )
+            else:
+                logger.info(f"Using cached embeddings for all {len(memories)} memories")
+
+            valid_indices = [i for i, e in enumerate(embeddings) if e is not None]
+            newly_generated_count = len([e for e in new_embeddings if e is not None]) if new_embeddings else 0
+
+        if strategy == "tags":
+            logger.info(f"Ready for clustering: {len(valid_indices)} tag-eligible memories")
+        else:
+            logger.info(f"Ready for clustering: {len(valid_indices)} valid embeddings ({len(memories) - len(uncached_contents)} from cache, {newly_generated_count} newly generated)")
+
         if len(valid_indices) < self.valves.summarization_min_cluster_size:
-            logger.info(f"Only {len(valid_indices)} valid embeddings, need at least {self.valves.summarization_min_cluster_size} for clustering")
+            logger.info(f"Only {len(valid_indices)} valid summarization candidates, need at least {self.valves.summarization_min_cluster_size} for clustering")
             return
 
-        logger.info(f"Starting complete linkage clustering with similarity threshold {self.valves.summarization_similarity_threshold}")
-        clusters = []
-        visited = set()
-
-        for i in valid_indices:
-            if i in visited:
-                continue
-
-            cluster = [i]
-            visited.add(i)
-
-            for j in valid_indices:
-                if j in visited:
-                    continue
-
-                vec_j = embeddings[j]
-                similar_to_all = True
-                for cluster_idx in cluster:
-                    vec_cluster = embeddings[cluster_idx]
-                    sim = self._cosine_similarity(vec_j, vec_cluster)
-                    
-                    if sim < self.valves.summarization_similarity_threshold:
-                        similar_to_all = False
-                        break
-                
-                if similar_to_all:
-                    cluster.append(j)
-                    visited.add(j)
-
-                    if len(cluster) >= self.valves.summarization_max_cluster_size:
-                        break
-
-            if len(cluster) >= self.valves.summarization_min_cluster_size:
-                clusters.append(cluster)
-                logger.info(f"Found cluster with {len(cluster)} memories (all members mutually similar >= {self.valves.summarization_similarity_threshold})")
+        logger.info(
+            f"Starting {strategy} connected clustering with similarity threshold {self.valves.summarization_similarity_threshold}"
+        )
+        clusters = self._build_summarization_clusters(
+            records, embeddings, valid_indices
+        )
+        for cluster in clusters:
+            logger.info(
+                f"Found summarization cluster with {len(cluster)} related memories"
+            )
 
         logger.info(f"Found {len(clusters)} clusters ready for summarization")
 
@@ -3924,11 +4030,20 @@ class MemoryPipeline:
         for cluster_indices in clusters:
             try:
                 cluster_memories = [memories[i] for i in cluster_indices]
-                cluster_records = [
-                    self._get_memory_record(m) for m in cluster_memories
+                cluster_records = [records[i] for i in cluster_indices]
+                cluster_dates = [
+                    self._coerce_created_at(
+                        getattr(memory, "created_at", None)
+                    )
+                    for memory in cluster_memories
                 ]
                 cluster_text = "\n".join(
-                    [f"- {record.content}" for record in cluster_records]
+                    [
+                        f"- [{created_at.isoformat() if created_at else 'unknown date'}] {record.content}"
+                        for record, created_at in zip(
+                            cluster_records, cluster_dates, strict=True
+                        )
+                    ]
                 )
 
                 summary = await query_llm_func(
@@ -4261,11 +4376,11 @@ class Filter:
         summarization_memory_prompt: str = Field(
             default="""You are a memory summarization assistant. Your task is to combine related memories about a user into a concise, comprehensive summary.
 
-Given a set of related memories about a user, create a single paragraph that:
-1. Captures all key information from the individual memories
-2. Resolves any contradictions (prefer newer information)
-3. Maintains specific details when important
-4. Removes redundancy
+Given a set of related memories about a user, create a single durable memory that:
+1. Captures every important user-specific fact from the individual memories
+2. Resolves any contradictions by preferring newer dated information
+3. Preserves names, quantities, tools, projects, constraints, and strong preferences
+4. Removes redundancy without dropping distinct details
 5. Presents the information in a clear, concise format
 
 Focus on preserving the user's:
@@ -4276,8 +4391,8 @@ Focus on preserving the user's:
 - Possessions
 - Behavioral patterns
 
-Your summary should be factual, concise, and maintain the same tone as the original memories.
-Produce a single paragraph summary of approximately 50-100 words that effectively condenses the information.
+Your summary should be factual, concise, and maintain the same tone as the original memories. Do not invent details.
+Produce a single paragraph summary of approximately 75-150 words when needed to preserve distinct facts.
 
 Example:
 Individual memories:

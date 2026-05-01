@@ -137,6 +137,81 @@ class TestHelpers(unittest.TestCase):
         self.assertNotIn("SecretStr", str(annotations["mem0_api_key"]))
         self.assertNotIn("SecretStr", str(annotations["llm_api_key"]))
 
+    def test_tag_summarization_clusters_include_prior_summaries(self):
+        valves = types.SimpleNamespace(
+            summarization_strategy="tags",
+            summarization_similarity_threshold=0.7,
+            summarization_min_cluster_size=2,
+            summarization_max_cluster_size=8,
+            allowed_memory_banks=["General", "Personal", "Work"],
+            default_memory_bank="General",
+            enable_identity_memories=True,
+            enable_behavior_memories=True,
+            enable_preference_memories=True,
+            enable_goal_memories=True,
+            enable_relationship_memories=True,
+            enable_possession_memories=True,
+        )
+        pipeline = am.MemoryPipeline(valves, None, am.ErrorManager())
+        records = [
+            am.StoredMemoryRecord(
+                content="User prefers Open WebUI memory tooling.",
+                tags=["summary", "preference"],
+                memory_bank="Work",
+            ),
+            am.StoredMemoryRecord(
+                content="User likes concise memory debug logs.",
+                tags=["preference"],
+                memory_bank="Work",
+            ),
+            am.StoredMemoryRecord(
+                content="User wants memory retrieval quality tuned.",
+                tags=["preference"],
+                memory_bank="Work",
+            ),
+        ]
+
+        clusters = pipeline._build_summarization_clusters(
+            records, [None, None, None], [0, 1, 2]
+        )
+
+        self.assertEqual(clusters, [[0, 1, 2]])
+
+    def test_tag_summarization_does_not_merge_summary_tag_alone(self):
+        valves = types.SimpleNamespace(
+            summarization_strategy="tags",
+            summarization_similarity_threshold=0.7,
+            summarization_min_cluster_size=2,
+            summarization_max_cluster_size=8,
+            allowed_memory_banks=["General", "Personal", "Work"],
+            default_memory_bank="General",
+            enable_identity_memories=True,
+            enable_behavior_memories=True,
+            enable_preference_memories=True,
+            enable_goal_memories=True,
+            enable_relationship_memories=True,
+            enable_possession_memories=True,
+        )
+        pipeline = am.MemoryPipeline(valves, None, am.ErrorManager())
+        records = [
+            am.StoredMemoryRecord(
+                content="User has a prior summary.",
+                tags=["summary"],
+                memory_bank="Work",
+            ),
+            am.StoredMemoryRecord(
+                content="User likes concise memory debug logs.",
+                tags=["preference"],
+                memory_bank="Work",
+            ),
+        ]
+
+        clusters = pipeline._build_summarization_clusters(
+            records, [None, None], [0, 1]
+        )
+
+        self.assertEqual(clusters, [])
+
 
 class TestLRUCache(unittest.TestCase):
     def test_get_updates_recently_used_entry(self):

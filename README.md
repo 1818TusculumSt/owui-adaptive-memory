@@ -195,6 +195,7 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `pruning_strategy`
 - `enable_summarization_task`
 - `summarization_interval`
+- `summarization_strategy`
 - `summarization_min_cluster_size`
 - `summarization_similarity_threshold`
 - `summarization_max_cluster_size`
@@ -250,7 +251,6 @@ Compatibility valves that are present in the schema but not currently wired into
 - `date_update_interval`
 - `enable_model_discovery_task`
 - `model_discovery_interval`
-- `summarization_strategy`
 - `save_relevance_threshold`
 - `memory_threshold`
 - `llm_skip_relevance_threshold`
@@ -287,8 +287,8 @@ Legacy embedding JSON cache files may also appear if SQLite persistence fails an
 
 ## Notes on Summarization
 
-- Summarization only considers eligible non-summary memories.
-- Clusters are formed with embedding similarity.
+- Summarization considers eligible memories, including prior summaries, so newer related facts can be folded into an existing summary later.
+- Clusters are formed as connected groups. `embeddings` uses embedding similarity, `tags` uses shared tags plus memory bank, and `hybrid` uses embedding similarity with a small threshold relaxation when tags and bank also match.
 - A new summary memory is saved first.
 - Source memories are deleted only after the summary save succeeds.
 - Source memory deletion also cleans vectors, persistent embeddings, and Mem0 mirror state.
