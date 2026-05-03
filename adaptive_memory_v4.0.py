@@ -4959,6 +4959,92 @@ Your output must be valid JSON only. No additional text.""",
             if __event_emitter__:
                 await __event_emitter__(bg_status_dict)
 
+    async def _inlet_early_exit(
+        self, body: Dict[str, Any], __user__: Optional[Dict[str, Any]], __event_emitter__
+    ) -> Tuple[bool, Optional["Filter.UserValves"], str, str]:
+        """Check for early exit conditions and initialize state."""
+        if not __user__ or not body.get("messages"):
+            return True, None, "", ""
+
+        user_valves = self._load_user_valves(__user__)
+        if not user_valves.enabled:
+            return True, user_valves, "", ""
+
+        if not self._tasks_started:
+            self._tasks_started = self.task_manager.start_tasks()
+
+        # Check if valves have changed and restart tasks if needed
+        self._check_and_handle_valve_changes()
+
+        user_id = __user__["id"]
+        self.seen_users.add(user_id)  # Track active user
+        messages = body["messages"]
+        last_message = extract_message_text(messages[-1].get("content"))
+
+        # Skip command processing
+        if last_message.startswith("/"):
+            logger.info("Skipping memory processing for command")
+            if user_valves.show_status:
+                await self._emit_queued_notifications(__event_emitter__)
+            return True, user_valves, user_id, last_message
+
+        if not last_message:
+            logger.debug("Skipping memory processing for empty message.")
+            if user_valves.show_status:
+                await self._emit_queued_notifications(__event_emitter__)
+            return True, user_valves, user_id, last_message
+
+        return False, user_valves, user_id, last_message
+
+    async def _inlet_get_all_memories(
+        self, pipeline: MemoryPipeline, user_id: str
+    ) -> List[Any]:
+        """Fetch and reconcile memories for a user."""
+        try:
+            all_memories = await get_memories_by_user_id_compat(user_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch memories: {e}")
+            all_memories = []
+
+        if all_memories and self.mem0_sync_manager:
+            try:
+                all_memories = await pipeline.reconcile_mem0_deleted_memories(
+                    user_id, all_memories
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Mem0 reconcile failed for user {user_id}; continuing with local memories: {e}"
+                )
+        return all_memories
+
+    def _inlet_inject_memories(self, messages: List[Dict[str, Any]], relevant_memories: List[Any]) -> None:
+        """Inject relevant memories into the system prompt."""
+        if relevant_memories and self.valves.show_memories:
+            context_text = self._format_relevant_memories(relevant_memories)
+
+            if context_text:
+                if messages[0]["role"] == "system":
+                    messages[0]["content"] += f"\n\n{context_text}"
+                else:
+                    messages.insert(0, {"role": "system", "content": context_text})
+
+    async def _inlet_emit_status(self, __event_emitter__, user_valves: "Filter.UserValves", count: int) -> None:
+        """Emit status notifications about recalled memories."""
+        if user_valves.show_status:
+            if count > 0:
+                suffix = "memory" if count == 1 else "memories"
+                status_dict = {
+                    "type": "status",
+                    "data": {
+                        "description": f"🧠 Recalled {count} {suffix}.",
+                        "done": True,
+                    },
+                }
+                if __event_emitter__:
+                    await __event_emitter__(status_dict)
+
+            await self._emit_queued_notifications(__event_emitter__)
+
     # --------------------------------------------------------------------------
     # Helper: LLM Query Wrapper
     # --------------------------------------------------------------------------
@@ -5023,35 +5109,10 @@ Your output must be valid JSON only. No additional text.""",
         self, body: Dict[str, Any], __event_emitter__=None, __user__=None
     ) -> Dict[str, Any]:
         """Process incoming message: Identify user, inject context memories."""
-        if not __user__ or not body.get("messages"):
-            return body
-
-        user_valves = self._load_user_valves(__user__)
-        if not user_valves.enabled:
-            return body
-
-        if not self._tasks_started:
-            self._tasks_started = self.task_manager.start_tasks()
-        
-        # Check if valves have changed and restart tasks if needed
-        self._check_and_handle_valve_changes()
-
-        user_id = __user__["id"]
-        self.seen_users.add(user_id)  # Track active user
-        messages = body["messages"]
-        last_message = extract_message_text(messages[-1].get("content"))
-
-        # Skip command processing
-        if last_message.startswith("/"):
-            logger.info("Skipping memory processing for command")
-            if user_valves.show_status:
-                await self._emit_queued_notifications(__event_emitter__)
-            return body
-
-        if not last_message:
-            logger.debug("Skipping memory processing for empty message.")
-            if user_valves.show_status:
-                await self._emit_queued_notifications(__event_emitter__)
+        should_exit, user_valves, user_id, last_message = await self._inlet_early_exit(
+            body, __user__, __event_emitter__
+        )
+        if should_exit:
             return body
 
         # Pipeline
@@ -5063,21 +5124,7 @@ Your output must be valid JSON only. No additional text.""",
         )
 
         # 1. Retrieve all memories
-        try:
-            all_memories = await get_memories_by_user_id_compat(user_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch memories: {e}")
-            all_memories = []
-
-        if all_memories and self.mem0_sync_manager:
-            try:
-                all_memories = await pipeline.reconcile_mem0_deleted_memories(
-                    user_id, all_memories
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Mem0 reconcile failed for user {user_id}; continuing with local memories: {e}"
-                )
+        all_memories = await self._inlet_get_all_memories(pipeline, user_id)
 
         # 2. Filter relevant memories
         relevant_memories = []
@@ -5085,35 +5132,21 @@ Your output must be valid JSON only. No additional text.""",
             relevant_memories = await pipeline.get_relevant_memories(
                 last_message, user_id, all_memories
             )
-            logger.info(f"Memory retrieval: found {len(relevant_memories)} relevant memories from {len(all_memories)} total memories")
+            logger.info(
+                f"Memory retrieval: found {len(relevant_memories)} relevant memories from {len(all_memories)} total memories"
+            )
         else:
-            logger.debug(f"Memory retrieval: no existing memories found for user {user_id}")
+            logger.debug(
+                f"Memory retrieval: no existing memories found for user {user_id}"
+            )
 
         # 3. Inject into system prompt
-        if relevant_memories and self.valves.show_memories:
-            context_text = self._format_relevant_memories(relevant_memories)
+        self._inlet_inject_memories(body["messages"], relevant_memories)
 
-            if context_text:
-                if messages[0]["role"] == "system":
-                    messages[0]["content"] += f"\n\n{context_text}"
-                else:
-                    messages.insert(0, {"role": "system", "content": context_text})
-
-        if user_valves.show_status:
-            count = len(relevant_memories)
-            if count > 0:
-                suffix = "memory" if count == 1 else "memories"
-                status_dict = {
-                    "type": "status",
-                    "data": {
-                        "description": f"🧠 Recalled {count} {suffix}.",
-                        "done": True,
-                    },
-                }
-                if __event_emitter__:
-                    await __event_emitter__(status_dict)
-
-            await self._emit_queued_notifications(__event_emitter__)
+        # 4. Status updates
+        await self._inlet_emit_status(
+            __event_emitter__, user_valves, len(relevant_memories)
+        )
 
         return body
 
