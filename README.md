@@ -26,7 +26,7 @@ At a high level:
 3. If Mem0 sync is enabled, mapped Mem0 records are checked and locally deleted if the upstream Mem0 memory is gone.
 4. Relevant memories are selected with embeddings and injected into the prompt.
 5. After the assistant responds, `outlet()` asks the configured LLM to propose memory operations.
-6. Valid `NEW`, `UPDATE`, and `DELETE` operations are applied locally.
+6. Valid `NEW` operations are applied locally. `UPDATE` and `DELETE` operations must also pass a conservative current-message intent gate.
 7. When Mem0 is enabled, local CRUD is either mirrored inline or queued for the next scheduled Mem0 sync cycle, depending on `mem0_sync_strategy`.
 
 Open WebUI remains the primary local store. Mem0 is optional and best-effort.
@@ -41,10 +41,13 @@ Open WebUI remains the primary local store. Mem0 is optional and best-effort.
 - Background memory summarization
 - Background orphaned vector cleanup
 - Optional Mem0 mirroring for create, update, and delete
-- Scheduled background Mem0 batch syncing with persistent queueing
+- Scheduled background Mem0 batch syncing with persistent queueing and durable job claiming
 - Best-effort Mem0 delete reconciliation back into Open WebUI
 - Per-user or global Mem0 user ID overrides
 - Router-aware memory creation path for vector sync compatibility
+- Conservative intent gating for LLM-proposed memory updates/deletes
+- Heuristic filtering for obvious secrets and credentials
+- Safe production breadcrumbs with hashed identifiers and reason codes
 
 ## Installation
 
@@ -92,6 +95,8 @@ When Mem0 sync is enabled, the function does four separate things:
 
 In background mode, queued jobs are coalesced by `(user_id, memory_id)`, so repeated updates collapse into the latest state before the next Mem0 sync cycle runs.
 
+Background workers atomically claim ready jobs in SQLite before processing. Claimed rows are marked `processing` with `claimed_at`, `claimed_by`, `status`, `attempt_count`, and `last_error` metadata. Successful jobs are deleted from the queue. Failed jobs are returned to `queued` with a retry time. If a worker dies mid-job, stale `processing` claims become claimable again after `mem0_sync_claim_timeout_seconds`.
+
 That last piece matters: this is no longer just one-way mirroring. If a mapped memory is deleted upstream in Mem0, the local Open WebUI copy is cleaned up on a later reconciliation pass.
 
 `mem0_infer_on_create` is disabled by default. When you turn it on, mirrored create requests let Mem0 infer facts from the provided message, which can improve Mem0-side deduplication and conflict resolution. This only affects create ingestion; direct update/delete calls still use explicit memory IDs.
@@ -106,8 +111,26 @@ Reconciliation is best-effort and intentionally conservative:
 For most setups, use:
 - `mem0_sync_strategy = background`
 - `mem0_sync_batch_interval_seconds = 7200`
+- `mem0_sync_claim_timeout_seconds = 300`
 
 That keeps Mem0 latency out of the chat path and makes syncing behave more like the summarization task.
+
+## Memory Mutation Safety
+
+The LLM can propose `NEW`, `UPDATE`, and `DELETE` operations, but destructive or mutating operations are gated by the current user message before execution.
+
+- `DELETE` is allowed only when the current user message clearly asks to forget, delete, remove, erase, or stop remembering something.
+- `UPDATE` is allowed only when the current user message clearly asks to update, correct, change, replace, revise, or otherwise correct stale information.
+- Instructions found only inside recalled memories, quoted text, or prompt-injection text are not enough.
+- Ambiguous messages default to no destructive action.
+
+This is intentionally conservative. A vague message may save a new corrected fact instead of updating an old one.
+
+## Prompt And Privacy Boundaries
+
+Recalled memories are injected as untrusted factual context, not instructions. This reduces the blast radius of stored prompt-injection text, but it does not make memory content harmless. Treat saved memories as user-controlled data.
+
+The function also rejects obvious high-risk secrets before storage, including common API key labels, bearer tokens, passwords, private-key blocks, database URLs with credentials, SSN-like values, and credit-card-like values that pass a Luhn check. This is heuristic filtering, not full DLP. It will miss some sensitive data and may reject a small number of benign strings that look like credentials.
 
 ## Mem0 User ID Resolution
 
@@ -213,6 +236,7 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `mem0_sync_batch_size`
 - `mem0_sync_batch_interval_seconds`
 - `mem0_sync_retry_delay_seconds`
+- `mem0_sync_claim_timeout_seconds`
 - `mem0_reconcile_cooldown_seconds`
 - `mem0_user_id_template`
 - `mem0_user_id_override`
@@ -226,6 +250,8 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `summarization_interval`
 - `error_logging_interval`
 - `vector_cleanup_interval`
+- `enable_debug_logging`
+- `debug_error_counter_logs`
 - `log_user_id_on_memory_save`
 
 ### User Valves
@@ -262,7 +288,6 @@ Compatibility valves that are present in the schema but not currently wired into
 - `enable_error_counter_guard`
 - `error_guard_threshold`
 - `error_guard_window_seconds`
-- `debug_error_counter_logs`
 - global `show_status`
 - global `timezone`
 - user `timezone`
@@ -275,7 +300,7 @@ This function may also maintain sidecar files under `DATA_DIR/cache`:
 - `embeddings.sqlite`: persistent embedding cache
 - `mem0_sync.sqlite`: Mem0 memory mappings, user mappings, and queued background sync jobs
 
-Legacy embedding JSON cache files may also appear if SQLite persistence fails and the code falls back.
+Legacy embedding JSON cache files from older versions may also exist; the function reads and migrates them into SQLite when possible.
 
 ## Notes on Vectors and Embeddings
 
@@ -295,9 +320,59 @@ Legacy embedding JSON cache files may also appear if SQLite persistence fails an
 
 ## Notes on Logging
 
-Recent cleanup changed two logging behaviors:
+The function now emits safe, sparse, key/value-style breadcrumbs around the memory lifecycle:
+
+- Open WebUI entry points: `owui_entry_started`, `owui_entry_skipped`, `owui_entry_completed`
+- extraction and operation decisions: `memory_extraction_completed`, `memory_operation_decision`, `memory_operations_completed`
+- intent gating: `memory_intent_gate_decision`
+- privacy filtering: `memory_candidate_blocked`
+- retrieval/injection: `memory_retrieval_completed`, `memory_injection_completed`
+- storage/vector/embedding work: `memory_create_succeeded`, `memory_update_succeeded`, `memory_delete_succeeded`, `embedding_cache_*`
+- Mem0 queue work: `mem0_queue_job_queued`, `mem0_queue_claim_succeeded`, `mem0_queue_retry_scheduled`, `mem0_queue_batch_completed`
+- external calls: `external_request_attempted`, `external_request_succeeded`, `external_request_failed`, `llm_request_*`
+
+Identifiers in logs are hashed: `user_hash`, `session_hash`, `memory_hash`, `job_hash`, and worker hashes are stable enough for debugging but do not expose raw IDs.
+
+The logs intentionally never include:
+- raw user messages
+- raw memory contents
+- raw prompts or completions
+- raw LLM responses
+- raw Mem0 request payloads
+- API keys, bearer tokens, passwords, private keys, database URLs with credentials, SSNs, or credit-card-like values
+
+Common reason codes:
+- `explicit_create_candidate`
+- `explicit_update_intent`
+- `explicit_delete_intent`
+- `blocked_missing_update_intent`
+- `blocked_missing_delete_intent`
+- `blocked_sensitive_content`
+- `blocked_empty_input`
+- `blocked_malformed_llm_response`
+- `blocked_prompt_injection_risk`
+- `retrieval_no_memories`
+- `storage_unavailable`
+- `user_context_missing`
+
+Set `enable_debug_logging = true` to enable DEBUG-level safe breadcrumbs such as cache hits/misses and queue claim internals. Set `debug_error_counter_logs = true` if you also want periodic error counter snapshots. Leave both disabled for quieter normal operation.
+
+Privacy limitations still apply. Secret detection and log redaction are heuristic safeguards, not full DLP. A determined or unusual secret format may evade detection, so upstream policy and operator discipline still matter.
+
+Recent cleanup also changed these logging behaviors:
 - expected Mem0 reconciliation `404`s are no longer treated as warning-level failures
 - duplicate emission from logger propagation has been disabled so each record should log once
+- Mem0 failure response bodies are summarized, redacted, and logged only as size/hash metadata
+
+## Tests
+
+Run the local validation suite with:
+
+```bash
+python -m py_compile adaptive_memory_v4.0.py tests\adaptive_memory_loader.py tests\test_adaptive_memory_helpers.py tests\test_extract_memory_id.py
+python -m unittest discover -s tests
+git diff --check
+```
 
 ## Requirements
 
@@ -316,8 +391,10 @@ Optional:
 
 - Mem0 sync is best-effort, not transactional.
 - In `background` mode, Mem0 can lag behind local memory by up to `mem0_sync_batch_interval_seconds`.
+- In multi-worker deployments, SQLite row claiming prevents the same queued job from being processed concurrently by cooperating workers that share the same `mem0_sync.sqlite` file.
 - Reconciliation runs during inbound requests, not as a separate continuous Mem0 polling loop.
 - If Mem0 is unavailable, local memory remains intact.
+- Secret filtering is heuristic, not a replacement for upstream privacy controls or careful operator policy.
 - Some compatibility valves remain in the schema so existing Open WebUI saved settings do not break, even though they do not currently change behavior.
 
 ## Credit
