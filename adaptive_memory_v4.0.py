@@ -926,33 +926,6 @@ class EmbeddingManager:
                 merged_cache.update(loaded_cache)
         return merged_cache
 
-    def _save_legacy_cache_sync(self, user_id: str, cache: Dict[str, Any]) -> None:
-        os.makedirs(self._legacy_cache_dir, exist_ok=True)
-        cache_file = self._get_legacy_cache_file(user_id)
-        tmp_file = cache_file + ".tmp"
-        with open(tmp_file, "w") as f:
-            json.dump(cache, f)
-        os.replace(tmp_file, cache_file)
-
-    def _store_embeddings_batch_legacy_json_sync(
-        self, user_id: str, ids: List[str], embeddings: List[np.ndarray]
-    ) -> None:
-        if not ids:
-            return
-        cache = self._load_legacy_cache_sync(user_id)
-        timestamp = datetime.now(timezone.utc).isoformat()
-        model, provider = self._default_record_identity()
-        for memory_id, embedding in zip(ids, embeddings, strict=True):
-            if embedding is None:
-                continue
-            cache[normalize_memory_id(memory_id)] = {
-                "embedding": np.asarray(embedding, dtype=np.float32).tolist(),
-                "model": model,
-                "provider": provider,
-                "timestamp": timestamp,
-            }
-        self._save_legacy_cache_sync(user_id, cache)
-
     def _load_embedding_legacy_json_sync(
         self, user_id: str, memory_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -973,13 +946,13 @@ class EmbeddingManager:
         memory_id_str = normalize_memory_id(memory_id)
         if memory_id_str not in cache:
             return
-        cache.pop(memory_id_str, None)
-        if cache:
-            self._save_legacy_cache_sync(user_id, cache)
-        else:
-            for cache_file in self._get_legacy_cache_files_for_read(user_id):
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(cache_file)
+
+        # We no longer update the legacy JSON cache. If a memory is deleted,
+        # we remove all legacy cache files for this user to ensure consistency
+        # and prevent accidental re-migration of deleted items.
+        for cache_file in self._get_legacy_cache_files_for_read(user_id):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(cache_file)
 
     def _store_embedding_sqlite_sync(
         self, user_id: str, memory_id: str, embedding: np.ndarray
@@ -1176,19 +1149,8 @@ class EmbeddingManager:
                 logger.debug(f"Stored embedding for memory {memory_id} in SQLite cache")
             except Exception as e:
                 logger.warning(
-                    f"SQLite cache store failed for memory {memory_id}; falling back to legacy JSON cache: {e}"
+                    f"SQLite cache store failed for memory {memory_id}: {e}"
                 )
-                try:
-                    await asyncio.to_thread(
-                        self._store_embeddings_batch_legacy_json_sync,
-                        user_id,
-                        [memory_id],
-                        [embedding],
-                    )
-                except Exception as legacy_err:
-                    logger.warning(
-                        f"Failed to store embedding in persistent cache for memory {memory_id}: {legacy_err}"
-                    )
             finally:
                 self._cleanup_lock(user_id)
 
@@ -1215,19 +1177,8 @@ class EmbeddingManager:
                 )
             except Exception as e:
                 logger.warning(
-                    f"SQLite batch cache store failed; falling back to legacy JSON cache: {e}"
+                    f"SQLite batch cache store failed: {e}"
                 )
-                try:
-                    await asyncio.to_thread(
-                        self._store_embeddings_batch_legacy_json_sync,
-                        user_id,
-                        ids,
-                        embeddings,
-                    )
-                except Exception as legacy_err:
-                    logger.warning(
-                        f"Failed to store batch embeddings in persistent cache: {legacy_err}"
-                    )
             finally:
                 self._cleanup_lock(user_id)
 
