@@ -2840,19 +2840,6 @@ class MemoryPipeline:
 
         return None
 
-    def _memory_created_at_sort_key(self, memory: Any) -> datetime:
-        created_at = (
-            getattr(memory, "created_at", None)
-            if hasattr(memory, "created_at")
-            else memory.get("created_at")
-        )
-
-        normalized_created_at = self._coerce_created_at(created_at)
-        if normalized_created_at is not None:
-            return normalized_created_at
-
-        return datetime.min.replace(tzinfo=timezone.utc)
-
     def _enabled_memory_tags(self) -> Set[str]:
         enabled_tags = {"summary"}
         tag_flag_map = {
@@ -3838,8 +3825,13 @@ class MemoryPipeline:
             if self.valves.pruning_strategy == "fifo":
                 # Sort by created_at (oldest first)
                 sorted_memories = sorted(
-                    all_memories, 
-                    key=self._memory_created_at_sort_key
+                    all_memories,
+                    key=lambda m: self._coerce_created_at(
+                        getattr(m, "created_at", None)
+                        if hasattr(m, "created_at")
+                        else m.get("created_at")
+                    )
+                    or datetime.min.replace(tzinfo=timezone.utc),
                 )
                 memories_to_delete = sorted_memories[:num_to_delete]
                 logger.info(f"Using FIFO strategy: deleting {num_to_delete} oldest memories")
@@ -3864,10 +3856,17 @@ class MemoryPipeline:
                 memories_to_delete = [m for _, m in sorted_memories[:num_to_delete]]
                 logger.info(f"Using least_relevant strategy: deleting {num_to_delete} least relevant memories")
             else:
-                logger.warning(f"Unknown pruning strategy: {self.valves.pruning_strategy}, defaulting to FIFO")
+                logger.warning(
+                    f"Unknown pruning strategy: {self.valves.pruning_strategy}, defaulting to FIFO"
+                )
                 sorted_memories = sorted(
                     all_memories,
-                    key=self._memory_created_at_sort_key
+                    key=lambda m: self._coerce_created_at(
+                        getattr(m, "created_at", None)
+                        if hasattr(m, "created_at")
+                        else m.get("created_at")
+                    )
+                    or datetime.min.replace(tzinfo=timezone.utc),
                 )
                 memories_to_delete = sorted_memories[:num_to_delete]
             

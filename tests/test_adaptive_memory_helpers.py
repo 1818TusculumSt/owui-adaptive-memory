@@ -41,7 +41,9 @@ def load_adaptive_memory():
     )
     np_module.linalg = types.SimpleNamespace(norm=lambda value: 1.0)
 
-    _install_module("aiohttp", ClientSession=MagicMock, ClientError=Exception)
+    _install_module(
+        "aiohttp", ClientSession=MagicMock, ClientError=Exception, ClientTimeout=MagicMock
+    )
     _install_module("pytz", timezone=lambda value: value)
     _install_module("sentence_transformers", SentenceTransformer=None)
 
