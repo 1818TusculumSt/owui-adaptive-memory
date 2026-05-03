@@ -2417,11 +2417,10 @@ class Mem0SyncManager:
         if not jobs:
             return result
 
-        for job in jobs:
+        async def process_job(job: Dict[str, Any]) -> bool:
             operation = str(job.get("operation") or "").upper()
             job_error = "Unknown error"
             success = False
-            result["processed"] += 1
             try:
                 if operation == "UPSERT":
                     success = await self._process_upsert_job(job)
@@ -2444,8 +2443,7 @@ class Mem0SyncManager:
                 await self._delete_job(
                     str(job["user_id"]), str(job["owui_memory_id"])
                 )
-                result["succeeded"] += 1
-                continue
+                return True
 
             retry_at = datetime.now(timezone.utc) + timedelta(
                 seconds=self._get_sync_retry_delay_seconds()
@@ -2457,7 +2455,17 @@ class Mem0SyncManager:
                 retry_at,
                 job_error,
             )
-            result["retried"] += 1
+            return False
+
+        # Process batch concurrently
+        job_results = await asyncio.gather(*[process_job(job) for job in jobs])
+
+        for success in job_results:
+            result["processed"] += 1
+            if success:
+                result["succeeded"] += 1
+            else:
+                result["retried"] += 1
 
         return result
 
