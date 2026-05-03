@@ -953,21 +953,6 @@ class EmbeddingManager:
             }
         self._save_legacy_cache_sync(user_id, cache)
 
-    def _load_embedding_legacy_json_sync(
-        self, user_id: str, memory_id: str
-    ) -> Optional[Dict[str, Any]]:
-        memory_id_str = normalize_memory_id(memory_id)
-        cache = self._load_legacy_cache_sync(user_id)
-        embedding_data = cache.get(memory_id_str)
-        if not embedding_data:
-            return None
-        return {
-            "embedding_json": json.dumps(embedding_data.get("embedding")),
-            "model": embedding_data.get("model"),
-            "provider": embedding_data.get("provider"),
-            "timestamp": embedding_data.get("timestamp"),
-        }
-
     def _delete_embedding_legacy_json_sync(self, user_id: str, memory_id: str) -> None:
         cache = self._load_legacy_cache_sync(user_id)
         memory_id_str = normalize_memory_id(memory_id)
@@ -1255,25 +1240,6 @@ class EmbeddingManager:
                     logger.debug(
                         f"Cache miss for {memory_id_str}: Model/provider changed"
                     )
-
-                if result is None:
-                    legacy_record = await asyncio.to_thread(
-                        self._load_embedding_legacy_json_sync, user_id, memory_id_str
-                    )
-                    if legacy_record and self._is_record_compatible(legacy_record):
-                        result = self._record_to_embedding(legacy_record)
-                        if result is not None:
-                            try:
-                                await asyncio.to_thread(
-                                    self._store_embedding_sqlite_sync,
-                                    user_id,
-                                    memory_id_str,
-                                    result,
-                                )
-                            except Exception as sqlite_err:
-                                logger.debug(
-                                    f"Failed to hydrate SQLite cache from legacy JSON for {memory_id_str}: {sqlite_err}"
-                                )
             except Exception as e:
                 logger.warning(
                     f"Error loading embedding from persistent cache for memory {memory_id}: {e}"
