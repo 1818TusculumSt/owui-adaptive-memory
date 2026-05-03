@@ -968,19 +968,6 @@ class EmbeddingManager:
             "timestamp": embedding_data.get("timestamp"),
         }
 
-    def _delete_embedding_legacy_json_sync(self, user_id: str, memory_id: str) -> None:
-        cache = self._load_legacy_cache_sync(user_id)
-        memory_id_str = normalize_memory_id(memory_id)
-        if memory_id_str not in cache:
-            return
-        cache.pop(memory_id_str, None)
-        if cache:
-            self._save_legacy_cache_sync(user_id, cache)
-        else:
-            for cache_file in self._get_legacy_cache_files_for_read(user_id):
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(cache_file)
-
     def _store_embedding_sqlite_sync(
         self, user_id: str, memory_id: str, embedding: np.ndarray
     ) -> None:
@@ -1298,14 +1285,6 @@ class EmbeddingManager:
                     f"Failed to delete embedding from SQLite cache for memory {memory_id_str}: {e}"
                 )
 
-            try:
-                await asyncio.to_thread(
-                    self._delete_embedding_legacy_json_sync, user_id, memory_id_str
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to delete embedding from legacy JSON cache for memory {memory_id_str}: {e}"
-                )
             finally:
                 self._cleanup_lock(user_id)
 
