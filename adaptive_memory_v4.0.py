@@ -7171,10 +7171,23 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
     # Helper: LLM Query Wrapper
     # --------------------------------------------------------------------------
-    async def _query_llm(self, system_prompt: str, user_prompt: str, model_override: Optional[str] = None) -> Optional[str]:
+    async def _query_llm(self, system_prompt: str, user_prompt: str, model_override: Optional[str] = None,) -> Optional[str]:
         """Unified LLM query method with retries and metrics."""
         valves = self.valves
-        model_name = model_override or valves.llm_model_name  # use override if provided
+        # model_name = model_override or valves.llm_model_name  # use override if provided
+
+        model_name = str(model_override or valves.llm_model_name or "").strip()
+        if not model_name:
+            logger.warning(
+                "llm_request_failed %s",
+                safe_log_context(
+                    provider=valves.llm_provider_type,
+                    operation="LLM_QUERY",
+                    reason="missing_model",
+                ),
+            )
+            self.error_manager.increment("llm_call_errors")
+            return None
 
         for attempt in range(valves.max_retries + 1):
             start = time.perf_counter()
@@ -7467,15 +7480,16 @@ Your output must be valid JSON only. No additional text.""",
                 )
 
             # Pass our _query_llm as callback, bound to the current conversation model
-            current_model = body.get("model")
-
+            #current_model = body.get("model")
+            current_model = str(body.get("model") or "").strip() or None
+            
             async def _bound_query_llm(system_prompt, user_prompt):
-                return await self._query_llm(system_prompt, user_prompt, fallback_model=current_model)
+                return await self._query_llm(system_prompt, user_prompt, model_override=current_model)
 
             ops = await pipeline.identify_memories(
                 user_message,
                 context_memories=context_memories,
-                query_llm_func=self._query_llm,
+                query_llm_func=_bound_query_llm,
                 user_id=user_id,
                 session_id=session_id,
             )
