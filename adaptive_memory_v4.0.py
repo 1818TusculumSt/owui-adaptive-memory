@@ -6393,8 +6393,8 @@ Analyze the following related memories and provide a concise summary.""",
             description="Type of LLM provider ('ollama' or 'openai_compatible')",
         )
         llm_model_name: str = Field(
-            default="llama3:latest",
-            description="Name of the LLM model to use (e.g., 'llama3:latest', 'gpt-4o')",
+            default="",
+            description="Name of the LLM model to use (e.g., 'llama3:latest', 'gpt-4o'). Leave blank to use the current conversation model.",
         )
         llm_api_endpoint_url: str = Field(
             default="http://host.docker.internal:11434/api/chat",
@@ -7171,10 +7171,11 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
     # Helper: LLM Query Wrapper
     # --------------------------------------------------------------------------
-    async def _query_llm(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+    async def _query_llm(self, system_prompt: str, user_prompt: str, model_override: Optional[str] = None) -> Optional[str]:
         """Unified LLM query method with retries and metrics."""
         valves = self.valves
-        
+        model_name = model_override or valves.llm_model_name  # use override if provided
+
         for attempt in range(valves.max_retries + 1):
             start = time.perf_counter()
             try:
@@ -7194,7 +7195,7 @@ Your output must be valid JSON only. No additional text.""",
                         headers["Authorization"] = f"Bearer {secret_value(valves.llm_api_key)}"
 
                     payload = {
-                        "model": valves.llm_model_name,
+                        "model": model_name,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
@@ -7465,7 +7466,12 @@ Your output must be valid JSON only. No additional text.""",
                     retrieval_query, user_id, all_memories
                 )
 
-            # Pass our _query_llm as callback
+            # Pass our _query_llm as callback, bound to the current conversation model
+            current_model = body.get("model")
+
+            async def _bound_query_llm(system_prompt, user_prompt):
+                return await self._query_llm(system_prompt, user_prompt, fallback_model=current_model)
+
             ops = await pipeline.identify_memories(
                 user_message,
                 context_memories=context_memories,
