@@ -182,9 +182,20 @@ Plain global values like `jefe` are ignored. This valve is now only for explicit
 - `related_memories_n`
 - `relevance_threshold`
 - `vector_similarity_threshold`
+- `use_llm_for_relevance`
+- `top_n_memories`
+- `llm_skip_relevance_threshold`
+- `memory_relevance_prompt`
 - `show_memories`
 - `max_injected_memory_length`
 - `memory_format`
+
+Retrieval first uses embeddings as a broad candidate filter, then, when
+`use_llm_for_relevance` is enabled, sends up to `top_n_memories` candidate
+memories in one batched LLM call for final relevance scoring. `relevance_threshold`
+is then applied to the LLM relevance score. If every vector candidate is at or
+above `llm_skip_relevance_threshold`, the LLM ranking call is skipped and vector
+scores are used directly.
 
 ### Deduplication
 
@@ -279,11 +290,7 @@ Compatibility valves that are present in the schema but not currently wired into
 - `model_discovery_interval`
 - `save_relevance_threshold`
 - `memory_threshold`
-- `llm_skip_relevance_threshold`
-- `top_n_memories`
 - `cache_ttl_seconds`
-- `use_llm_for_relevance`
-- `memory_relevance_prompt`
 - `memory_merge_prompt`
 - `enable_error_counter_guard`
 - `error_guard_threshold`

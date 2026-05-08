@@ -4538,7 +4538,12 @@ class MemoryPipeline:
 
     # --- Relevance Retrieval ---
     async def get_relevant_memories(
-        self, query: str, user_id: str, all_memories: List[Any]
+        self,
+        query: str,
+        user_id: str,
+        all_memories: List[Any],
+        query_llm_func: Optional[Callable] = None,
+        session_id: Optional[str] = None,
     ) -> List[Any]:
         """Retrieve relevant memories using vector similarity + optional LLM ranking."""
         if not query:
@@ -4546,6 +4551,7 @@ class MemoryPipeline:
                 "memory_retrieval_skipped %s",
                 safe_log_context(
                     user_id=user_id,
+                    session_id=session_id,
                     operation="RETRIEVE",
                     reason="blocked_empty_input",
                 ),
@@ -4556,6 +4562,7 @@ class MemoryPipeline:
                 "memory_retrieval_completed %s",
                 safe_log_context(
                     user_id=user_id,
+                    session_id=session_id,
                     operation="RETRIEVE",
                     reason="retrieval_no_memories",
                     total_memories=0,
@@ -4571,6 +4578,7 @@ class MemoryPipeline:
             "memory_retrieval_attempted %s",
             safe_log_context(
                 user_id=user_id,
+                session_id=session_id,
                 operation="RETRIEVE",
                 total_memories=len(all_memories),
             ),
@@ -4586,6 +4594,7 @@ class MemoryPipeline:
                     "memory_retrieval_failed %s",
                     safe_log_context(
                         user_id=user_id,
+                        session_id=session_id,
                         operation="RETRIEVE",
                         reason="query_embedding_unavailable",
                     ),
@@ -4597,6 +4606,7 @@ class MemoryPipeline:
                 "memory_retrieval_failed %s %s",
                 safe_log_context(
                     user_id=user_id,
+                    session_id=session_id,
                     operation="RETRIEVE",
                     reason="query_embedding_failed",
                 ),
@@ -4652,6 +4662,7 @@ class MemoryPipeline:
                 "memory_retrieval_embeddings_missing %s",
                 safe_log_context(
                     user_id=user_id,
+                    session_id=session_id,
                     operation="RETRIEVE",
                     missing_embeddings=len(texts_to_embed),
                     cached_embeddings=len(all_memories) - len(texts_to_embed),
@@ -4683,6 +4694,7 @@ class MemoryPipeline:
                 "memory_retrieval_cache_hit %s",
                 safe_log_context(
                     user_id=user_id,
+                    session_id=session_id,
                     operation="RETRIEVE",
                     cached_embeddings=len(all_memories),
                 ),
@@ -4690,17 +4702,42 @@ class MemoryPipeline:
 
         # Sort by similarity
         scored_memories.sort(key=lambda x: x[0], reverse=True)
-        top_memories = [
-            mem
-            for sim, mem in scored_memories
-            if sim >= self.valves.relevance_threshold
-        ][: self.valves.related_memories_n]
+        self._log_retrieval_score_summary(user_id, session_id, scored_memories)
+
+        if (
+            getattr(self.valves, "use_llm_for_relevance", False)
+            and query_llm_func
+            and scored_memories
+        ):
+            top_memories = await self._rank_memories_with_llm_relevance(
+                query,
+                user_id,
+                scored_memories,
+                query_llm_func,
+                session_id=session_id,
+            )
+        else:
+            if (
+                getattr(self.valves, "use_llm_for_relevance", False)
+                and not query_llm_func
+            ):
+                logger.warning(
+                    "memory_relevance_llm_skipped %s",
+                    safe_log_context(
+                        user_id=user_id,
+                        session_id=session_id,
+                        operation="RETRIEVE",
+                        reason="llm_callback_missing",
+                    ),
+                )
+            top_memories = self._rank_memories_with_vector_scores(scored_memories)
         
         RETRIEVAL_LATENCY.observe(time.perf_counter() - start_time)
         logger.info(
             "memory_retrieval_completed %s",
             safe_log_context(
                 user_id=user_id,
+                session_id=session_id,
                 operation="RETRIEVE",
                 reason=(
                     "retrieval_success"
@@ -4714,6 +4751,208 @@ class MemoryPipeline:
             ),
         )
         return top_memories
+
+    def _rank_memories_with_vector_scores(
+        self, scored_memories: List[Tuple[float, Any]]
+    ) -> List[Any]:
+        return [
+            mem
+            for sim, mem in scored_memories
+            if sim >= self.valves.relevance_threshold
+        ][: self.valves.related_memories_n]
+
+    def _log_retrieval_score_summary(
+        self,
+        user_id: str,
+        session_id: Optional[str],
+        scored_memories: List[Tuple[float, Any]],
+    ) -> None:
+        if not scored_memories:
+            logger.debug(
+                "memory_retrieval_scores %s",
+                safe_log_context(
+                    user_id=user_id,
+                    session_id=session_id,
+                    operation="RETRIEVE",
+                    vector_candidates=0,
+                ),
+            )
+            return
+
+        scores = [score for score, _ in scored_memories]
+        logger.debug(
+            "memory_retrieval_scores %s",
+            safe_log_context(
+                user_id=user_id,
+                session_id=session_id,
+                operation="RETRIEVE",
+                vector_candidates=len(scored_memories),
+                max_similarity=f"{max(scores):.3f}",
+                min_similarity=f"{min(scores):.3f}",
+                avg_similarity=f"{(sum(scores) / len(scores)):.3f}",
+            ),
+        )
+
+    async def _rank_memories_with_llm_relevance(
+        self,
+        query: str,
+        user_id: str,
+        scored_memories: List[Tuple[float, Any]],
+        query_llm_func: Callable,
+        session_id: Optional[str] = None,
+    ) -> List[Any]:
+        if self._should_skip_llm_relevance(scored_memories):
+            logger.debug(
+                "memory_relevance_llm_skipped %s",
+                safe_log_context(
+                    user_id=user_id,
+                    session_id=session_id,
+                    operation="RETRIEVE",
+                    reason="high_vector_confidence",
+                    vector_candidates=len(scored_memories),
+                    skip_threshold=self.valves.llm_skip_relevance_threshold,
+                ),
+            )
+            return self._rank_memories_with_vector_scores(scored_memories)
+
+        candidate_limit = max(1, int(getattr(self.valves, "top_n_memories", 1)))
+        candidates = scored_memories[:candidate_limit]
+        id_to_candidate: Dict[str, Tuple[float, Any]] = {}
+        prompt_lines = []
+        for index, (similarity, memory) in enumerate(candidates, start=1):
+            memory_id = self._get_memory_id(memory)
+            memory_record = self._get_memory_record(memory)
+            if not memory_id or not memory_record.content:
+                continue
+
+            memory_id = str(memory_id)
+            id_to_candidate[memory_id] = (similarity, memory)
+            metadata = []
+            if memory_record.memory_bank:
+                metadata.append(f"bank={memory_record.memory_bank}")
+            if memory_record.tags:
+                metadata.append(f"tags={', '.join(memory_record.tags)}")
+            metadata.append(f"vector_similarity={similarity:.3f}")
+            prompt_lines.append(
+                f"{index}. ID: {memory_id} ({'; '.join(metadata)})\n"
+                f"Content: {memory_record.content}"
+            )
+
+        if not prompt_lines:
+            return self._rank_memories_with_vector_scores(scored_memories)
+
+        user_prompt = (
+            f"Current User Message:\n{query}\n\n"
+            "Candidate Memories:\n"
+            + "\n\n".join(prompt_lines)
+            + "\n\nReturn only a JSON array. Include every candidate ID with a relevance score from 0 to 1."
+        )
+
+        try:
+            response = await query_llm_func(
+                self.valves.memory_relevance_prompt, user_prompt
+            )
+            relevance_scores = self._parse_llm_relevance_scores(response)
+        except Exception as e:
+            logger.warning(
+                "memory_relevance_llm_failed %s %s",
+                safe_log_context(
+                    user_id=user_id,
+                    session_id=session_id,
+                    operation="RETRIEVE",
+                    reason="llm_relevance_exception",
+                ),
+                summarize_error_for_log(e),
+            )
+            return self._rank_memories_with_vector_scores(scored_memories)
+
+        if not relevance_scores:
+            logger.warning(
+                "memory_relevance_llm_failed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    session_id=session_id,
+                    operation="RETRIEVE",
+                    reason="llm_relevance_empty_or_unparseable",
+                    llm_candidates=len(id_to_candidate),
+                ),
+            )
+            return self._rank_memories_with_vector_scores(scored_memories)
+
+        ranked_memories = []
+        for memory_id, relevance in relevance_scores.items():
+            candidate = id_to_candidate.get(memory_id)
+            if not candidate:
+                continue
+            vector_similarity, memory = candidate
+            if relevance >= self.valves.relevance_threshold:
+                ranked_memories.append((relevance, vector_similarity, memory))
+
+        ranked_memories.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        logger.debug(
+            "memory_relevance_llm_completed %s",
+            safe_log_context(
+                user_id=user_id,
+                session_id=session_id,
+                operation="RETRIEVE",
+                vector_candidates=len(scored_memories),
+                llm_candidates=len(id_to_candidate),
+                llm_relevant=len(ranked_memories),
+                relevance_threshold=self.valves.relevance_threshold,
+            ),
+        )
+        return [
+            memory
+            for _, _, memory in ranked_memories[: self.valves.related_memories_n]
+        ]
+
+    def _should_skip_llm_relevance(
+        self, scored_memories: List[Tuple[float, Any]]
+    ) -> bool:
+        if not scored_memories:
+            return True
+        skip_threshold = getattr(self.valves, "llm_skip_relevance_threshold", 1.0)
+        return all(score >= skip_threshold for score, _ in scored_memories)
+
+    def _parse_llm_relevance_scores(self, response: Optional[str]) -> Dict[str, float]:
+        if not response:
+            return {}
+
+        data = (
+            JSONParser.extract_and_parse(response)
+            if self.valves.enable_json_stripping
+            else json.loads(response)
+        )
+        if isinstance(data, dict):
+            for key in ("memories", "results", "relevance"):
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
+            else:
+                data = [data]
+
+        if not isinstance(data, list):
+            return {}
+
+        scores = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            memory_id = (
+                item.get("id")
+                or item.get("memory_id")
+                or item.get("memoryId")
+                or item.get("ID")
+            )
+            if memory_id is None:
+                continue
+            try:
+                relevance = float(item.get("relevance", item.get("score")))
+            except (TypeError, ValueError):
+                continue
+            scores[str(memory_id)] = max(0.0, min(1.0, relevance))
+
+        return scores
 
     def _cosine_similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
         if v1.shape != v2.shape:
@@ -6419,24 +6658,24 @@ Analyze the following related memories and provide a concise summary.""",
             description="Threshold for similarity when comparing memories (0-1)",
         )
         vector_similarity_threshold: float = Field(
-            default=0.60,
-            description="Minimum cosine similarity for initial vector filtering (0-1)",
+            default=0.20,
+            description="Minimum cosine similarity for broad initial vector candidate filtering (0-1)",
         )
         llm_skip_relevance_threshold: float = Field(
             default=0.93,
             description="If *all* vector-filtered memories have similarity >= this threshold, treat the vector score as final relevance and skip the additional LLM call.",
         )
         top_n_memories: int = Field(
-            default=3,
-            description="Number of top similar memories to pass to LLM",
+            default=5,
+            description="Number of top vector candidates to pass to LLM relevance ranking",
         )
         cache_ttl_seconds: int = Field(
             default=86400,
             description="Cache time-to-live in seconds (default 24 hours)",
         )
         use_llm_for_relevance: bool = Field(
-            default=False,
-            description="Use LLM call for final relevance scoring (if False, relies solely on vector similarity + relevance_threshold)",
+            default=True,
+            description="Use one batched LLM call for final relevance scoring after vector candidate filtering (if False, relies solely on vector similarity + relevance_threshold)",
         )
         deduplicate_memories: bool = Field(
             default=True,
@@ -7322,7 +7561,11 @@ Your output must be valid JSON only. No additional text.""",
         relevant_memories = []
         if all_memories:
             relevant_memories = await pipeline.get_relevant_memories(
-                last_message, user_id, all_memories
+                last_message,
+                user_id,
+                all_memories,
+                query_llm_func=self._query_llm,
+                session_id=session_id,
             )
             logger.info(
                 "memory_retrieval_completed %s",
@@ -7462,7 +7705,11 @@ Your output must be valid JSON only. No additional text.""",
             context_memories = []
             if all_memories and retrieval_query:
                 context_memories = await pipeline.get_relevant_memories(
-                    retrieval_query, user_id, all_memories
+                    retrieval_query,
+                    user_id,
+                    all_memories,
+                    query_llm_func=self._query_llm,
+                    session_id=session_id,
                 )
 
             # Pass our _query_llm as callback

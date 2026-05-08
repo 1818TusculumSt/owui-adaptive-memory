@@ -32,14 +32,18 @@ def make_valves(**overrides):
         "use_embeddings_for_deduplication": False,
         "similarity_threshold": 0.95,
         "embedding_similarity_threshold": 0.75,
-        "vector_similarity_threshold": 0.6,
+        "vector_similarity_threshold": 0.2,
         "relevance_threshold": 0.6,
         "related_memories_n": 5,
+        "llm_skip_relevance_threshold": 0.93,
+        "top_n_memories": 5,
+        "use_llm_for_relevance": True,
         "max_total_memories": 200,
         "pruning_strategy": "fifo",
         "max_injected_memory_length": 300,
         "memory_format": "bullet",
         "memory_identification_prompt": "Return memory JSON.",
+        "memory_relevance_prompt": "Return relevance JSON.",
         "recent_messages_n": 5,
         "show_memories": True,
         "show_status": True,
@@ -77,6 +81,36 @@ def make_pipeline(**valve_overrides):
     return am.MemoryPipeline(
         make_valves(**valve_overrides), None, am.ErrorManager()
     )
+
+
+class FakeCache:
+    async def get(self, key):
+        return None
+
+    async def set(self, key, value):
+        return None
+
+
+class FakeEmbeddingManager:
+    def __init__(self):
+        self.cache = FakeCache()
+
+    async def get_embedding(self, text, user=None):
+        return "query"
+
+    def get_memory_cache_key(self, user_id, memory_id):
+        return f"{user_id}:{memory_id}"
+
+    async def load_embedding_persistent(self, user_id, memory_id):
+        return None
+
+    async def get_embeddings_batch(self, texts, user=None):
+        return texts
+
+    async def store_embeddings_batch_persistent(
+        self, user_id, memory_ids, texts, embeddings
+    ):
+        return None
 
 
 def make_queue_db_path():
@@ -335,6 +369,95 @@ class TestMemoryPipelineFlow(unittest.TestCase):
         )
 
         self.assertEqual(result, [])
+
+    def test_relevant_memories_uses_one_llm_call_for_vector_candidates(self):
+        memories = [
+            {"id": "m1", "content": "User works as a security analyst in fintech"},
+            {"id": "m2", "content": "User prefers Python over JavaScript"},
+            {"id": "m3", "content": "User likes green tea"},
+        ]
+        pipeline = am.MemoryPipeline(
+            make_valves(
+                vector_similarity_threshold=0.2,
+                relevance_threshold=0.6,
+                related_memories_n=5,
+                top_n_memories=5,
+                use_llm_for_relevance=True,
+            ),
+            FakeEmbeddingManager(),
+            am.ErrorManager(),
+        )
+        scores = {
+            memories[0]["content"]: 0.34,
+            memories[1]["content"]: 0.29,
+            memories[2]["content"]: 0.10,
+        }
+        pipeline._cosine_similarity = (
+            lambda query_embedding, embedding: scores[embedding]
+        )
+        llm_calls = []
+
+        async def fake_llm(system_prompt, user_prompt):
+            llm_calls.append((system_prompt, user_prompt))
+            self.assertIn("ID: m1", user_prompt)
+            self.assertIn("ID: m2", user_prompt)
+            self.assertNotIn("ID: m3", user_prompt)
+            return json.dumps(
+                [
+                    {"id": "m1", "relevance": 0.92},
+                    {"id": "m2", "relevance": 0.15},
+                ]
+            )
+
+        result = asyncio.run(
+            pipeline.get_relevant_memories(
+                "What attacks should I worry about at work?",
+                "user-a",
+                memories,
+                query_llm_func=fake_llm,
+            )
+        )
+
+        self.assertEqual(result, [memories[0]])
+        self.assertEqual(len(llm_calls), 1)
+
+    def test_relevant_memories_skips_llm_when_vectors_are_high_confidence(self):
+        memories = [
+            {"id": "m1", "content": "User prefers Python"},
+            {"id": "m2", "content": "User writes Python tests"},
+        ]
+        pipeline = am.MemoryPipeline(
+            make_valves(
+                vector_similarity_threshold=0.2,
+                relevance_threshold=0.6,
+                related_memories_n=5,
+                use_llm_for_relevance=True,
+                llm_skip_relevance_threshold=0.9,
+            ),
+            FakeEmbeddingManager(),
+            am.ErrorManager(),
+        )
+        scores = {
+            memories[0]["content"]: 0.95,
+            memories[1]["content"]: 0.91,
+        }
+        pipeline._cosine_similarity = (
+            lambda query_embedding, embedding: scores[embedding]
+        )
+
+        async def fail_if_called(system_prompt, user_prompt):
+            raise AssertionError("LLM relevance should be skipped")
+
+        result = asyncio.run(
+            pipeline.get_relevant_memories(
+                "Python",
+                "user-a",
+                memories,
+                query_llm_func=fail_if_called,
+            )
+        )
+
+        self.assertEqual(result, memories)
 
     def test_text_duplicate_detection_uses_user_memories(self):
         pipeline = make_pipeline(use_embeddings_for_deduplication=False)
