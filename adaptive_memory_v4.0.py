@@ -6206,29 +6206,51 @@ class MemoryPipeline:
                                 source_memory_count=len(cluster_memories),
                             ),
                         )
+                        deletion_tasks = []
+                        valid_cluster_memories = []
                         for m in cluster_memories:
                             try:
                                 memory_id = self._get_memory_id(m)
-                                if not memory_id:
-                                    continue
-                                deleted = await self._delete_local_memory(
-                                    user_id,
-                                    memory_id,
-                                    mirror_to_mem0=True,
-                                    log_context="Summarization",
-                                )
-                                if deleted:
-                                    source_memories_deleted += 1
-                            except Exception as del_err:
+                                if memory_id:
+                                    valid_cluster_memories.append(m)
+                                    deletion_tasks.append(
+                                        self._delete_local_memory(
+                                            user_id,
+                                            memory_id,
+                                            mirror_to_mem0=True,
+                                            log_context="Summarization",
+                                        )
+                                    )
+                            except Exception as get_err:
                                 logger.error(
-                                    "memory_summarization_source_delete_failed %s %s",
+                                    "memory_summarization_get_id_failed %s %s",
                                     safe_log_context(
                                         user_id=user_id,
                                         memory_id=get_memory_value(m, "id"),
                                         operation="SUMMARIZE",
                                     ),
-                                    summarize_error_for_log(del_err),
+                                    summarize_error_for_log(get_err),
                                 )
+
+                        if deletion_tasks:
+                            deletion_results = await asyncio.gather(
+                                *deletion_tasks, return_exceptions=True
+                            )
+                            for m, result in zip(
+                                valid_cluster_memories, deletion_results
+                            ):
+                                if isinstance(result, Exception):
+                                    logger.error(
+                                        "memory_summarization_source_delete_failed %s %s",
+                                        safe_log_context(
+                                            user_id=user_id,
+                                            memory_id=get_memory_value(m, "id"),
+                                            operation="SUMMARIZE",
+                                        ),
+                                        summarize_error_for_log(result),
+                                    )
+                                elif result:
+                                    source_memories_deleted += 1
 
                         summaries_created += 1
                         logger.info(
