@@ -1873,6 +1873,11 @@ class Mem0SyncManager:
     def _timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(total=float(self.get_valves().mem0_timeout_seconds))
 
+    def _quote_identifier(self, identifier: str) -> str:
+        """Safely quote a SQL identifier by doubling double-quotes and wrapping in quotes."""
+        safe_id = identifier.replace('"', '""')
+        return f'"{safe_id}"'
+
     def _connect_db(self) -> sqlite3.Connection:
         os.makedirs(self._cache_root, exist_ok=True)
         conn = sqlite3.connect(
@@ -1947,12 +1952,16 @@ class Mem0SyncManager:
     def _ensure_db_column(
         self, conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str
     ) -> None:
+        quoted_table = self._quote_identifier(table_name)
+        quoted_column = self._quote_identifier(column_name)
         columns = {
             str(row["name"])
-            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            for row in conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
         }
         if column_name not in columns:
-            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+            conn.execute(
+                f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {ddl}"
+            )
 
     def _upsert_mapping_sync(
         self, user_id: str, owui_memory_id: str, mem0_memory_id: str
