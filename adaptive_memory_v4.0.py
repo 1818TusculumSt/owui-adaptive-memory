@@ -355,6 +355,13 @@ SENSITIVE_MEMORY_CATEGORY_PATTERNS: List[Tuple[str, re.Pattern]] = [
 
 
 @dataclass
+class SyncContext:
+    user_id: str
+    mem0_user_id: str
+    owui_memory_id: str
+
+
+@dataclass
 class StoredMemoryRecord:
     content: str
     tags: List[str] = field(default_factory=list)
@@ -2679,18 +2686,16 @@ class Mem0SyncManager:
 
     def _build_metadata(
         self,
-        user_id: str,
-        mem0_user_id: str,
-        owui_memory_id: str,
+        ctx: SyncContext,
         tags: List[str],
         memory_bank: str,
         confidence: Optional[float],
     ) -> Dict[str, Any]:
         return {
             "source": "adaptive_memory",
-            "owui_user_id": str(user_id),
-            "mem0_user_id": str(mem0_user_id),
-            "owui_memory_id": normalize_memory_id(owui_memory_id),
+            "owui_user_id": str(ctx.user_id),
+            "mem0_user_id": str(ctx.mem0_user_id),
+            "owui_memory_id": normalize_memory_id(ctx.owui_memory_id),
             "tags": list(tags or []),
             "memory_bank": str(memory_bank or "General"),
             "confidence": self._normalize_confidence(confidence),
@@ -3027,7 +3032,10 @@ class Mem0SyncManager:
             "infer": bool(getattr(self.get_valves(), "mem0_infer_on_create", True)),
             "async_mode": False,
             "metadata": self._build_metadata(
-                user_id, mem0_user_id, owui_memory_id, tags, memory_bank, confidence
+                SyncContext(user_id, mem0_user_id, owui_memory_id),
+                tags,
+                memory_bank,
+                confidence,
             ),
         }
         status, response_data = await self._request("POST", "/v1/memories/", payload)
@@ -3118,7 +3126,10 @@ class Mem0SyncManager:
         payload = {
             "text": content,
             "metadata": self._build_metadata(
-                user_id, mem0_user_id, owui_memory_id, tags, memory_bank, confidence
+                SyncContext(user_id, mem0_user_id, owui_memory_id),
+                tags,
+                memory_bank,
+                confidence,
             ),
         }
         status, _ = await self._request(
