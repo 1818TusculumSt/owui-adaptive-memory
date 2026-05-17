@@ -1952,13 +1952,33 @@ class Mem0SyncManager:
     def _ensure_db_column(
         self, conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str
     ) -> None:
-        quoted_table = self._quote_identifier(table_name)
-        quoted_column = self._quote_identifier(column_name)
+        """Ensure a column exists in a table, adding it if necessary.
+        Uses pragma_table_info(?) for safe parameterized inspection of table schema.
+        Note: ALTER TABLE identifiers cannot be parameterized, so they are quoted.
+        """
+        # Validate identifiers to contain only alphanumeric or underscores
+        # as an extra layer of defense for ALTER TABLE
+        import re
+
+        if not re.match(r"^[a-zA-Z0-9_]+$", table_name):
+            raise ValueError(f"Invalid table name: {table_name}")
+        if not re.match(r"^[a-zA-Z0-9_]+$", column_name):
+            raise ValueError(f"Invalid column name: {column_name}")
+
         columns = {
             str(row["name"])
-            for row in conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+            for row in conn.execute(
+                "SELECT name FROM pragma_table_info(?)", (table_name,)
+            ).fetchall()
         }
         if column_name not in columns:
+            quoted_table = self._quote_identifier(table_name)
+            quoted_column = self._quote_identifier(column_name)
+            # ddl is also potentially risky, but here it is controlled by the caller
+            # and usually just 'TEXT' or similar. Still, we can do a basic check.
+            if ";" in ddl:
+                raise ValueError(f"Invalid DDL: {ddl}")
+
             conn.execute(
                 f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {ddl}"
             )
