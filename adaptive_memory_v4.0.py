@@ -1952,6 +1952,15 @@ class Mem0SyncManager:
     def _ensure_db_column(
         self, conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str
     ) -> None:
+        """Ensure a column exists in a table. Validates inputs to prevent SQL injection."""
+        # Strict validation as PRAGMA and ALTER TABLE don't support parameters
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", table_name):
+            raise ValueError(f"Invalid table name: {table_name}")
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", column_name):
+            raise ValueError(f"Invalid column name: {column_name}")
+        if not re.fullmatch(r"[a-zA-Z0-9_ ']+", ddl):
+            raise ValueError(f"Invalid DDL: {ddl}")
+
         quoted_table = self._quote_identifier(table_name)
         quoted_column = self._quote_identifier(column_name)
         columns = {
@@ -1959,9 +1968,7 @@ class Mem0SyncManager:
             for row in conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
         }
         if column_name not in columns:
-            conn.execute(
-                f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {ddl}"
-            )
+            conn.execute(f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {ddl}")
 
     def _upsert_mapping_sync(
         self, user_id: str, owui_memory_id: str, mem0_memory_id: str
