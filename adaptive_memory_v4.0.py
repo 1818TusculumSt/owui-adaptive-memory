@@ -24,6 +24,7 @@ import time
 import os
 import hashlib
 import sqlite3
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -363,7 +364,12 @@ class StoredMemoryRecord:
 
 
 def normalize_memory_id(memory_id: Any) -> str:
-    return str(memory_id)
+    if memory_id is None:
+        return ""
+    result = str(memory_id).strip()
+    if not result:
+        return ""
+    return result
 
 
 def build_embedding_cache_key(user_id: str, memory_id: Any) -> str:
@@ -516,12 +522,12 @@ def get_memory_value(memory: Any, key: str, default: Any = None) -> Any:
 
     try:
         return getattr(memory, key)
-    except Exception:
+    except (AttributeError, TypeError):
         pass
 
     try:
         get_value = getattr(memory, "get")
-    except Exception:
+    except (AttributeError, TypeError):
         return default
 
     if not callable(get_value):
@@ -557,11 +563,6 @@ def contains_credit_card_like_value(content: str) -> bool:
         if 13 <= len(digits) <= 19 and _passes_luhn_check(digits):
             return True
     return False
-
-
-def looks_like_sensitive_memory(content: str) -> bool:
-    text = str(content or "")
-    return sensitive_category_for_log(text) is not None
 
 
 def summarize_external_response_for_logs(
@@ -987,36 +988,28 @@ class EmbeddingManager:
         self.provider: Optional[EmbeddingProvider] = None
         self._provider_signature: Optional[Tuple[Any, ...]] = None
         self._session: Optional[aiohttp.ClientSession] = None
-        # WeakValueDictionary allows garbage collection of locks when no longer referenced,
-        # preventing unbounded growth of the locks dict
-        # Use regular dict instead of WeakValueDictionary to avoid premature GC of Lock objects
+        self._session_lock = asyncio.Lock()
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._locks_guard = threading.Lock()
         self._cache_root = os.path.join(DATA_DIR, "cache")
         self._legacy_cache_dir = os.path.join(self._cache_root, "embeddings")
         self._sqlite_cache_file = os.path.join(self._cache_root, "embeddings.sqlite")
 
     def _get_lock(self, user_id: str) -> asyncio.Lock:
-        """Get or create a lock for the given user_id."""
-        if user_id not in self._locks:
-            self._locks[user_id] = asyncio.Lock()
-        return self._locks[user_id]
+        """Get or create a lock for the given user_id.
+
+        Uses threading.Lock to guard dict mutation, preventing a race where
+        two threads (via asyncio.to_thread) create different Lock objects
+        for the same user_id, defeating mutual exclusion.
+        """
+        with self._locks_guard:
+            if user_id not in self._locks:
+                self._locks[user_id] = asyncio.Lock()
+            return self._locks[user_id]
 
     def get_memory_cache_key(self, user_id: str, memory_id: Any) -> str:
         return build_embedding_cache_key(user_id, memory_id)
     
-    def _cleanup_lock(self, user_id: str) -> None:
-        """Remove lock for user_id if it's not locked and has no waiters.
-        
-        This prevents unbounded growth of the locks dict while ensuring
-        we don't delete locks that are still in use.
-        """
-        if user_id in self._locks:
-            lock = self._locks[user_id]
-            # Only delete if lock is not currently held and has no tasks waiting
-            if not lock.locked() and (not hasattr(lock, '_waiters') or not lock._waiters):
-                del self._locks[user_id]
-
-
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
         if self._session:
@@ -1213,9 +1206,6 @@ class EmbeddingManager:
             return None
         return os.path.join(self._legacy_cache_dir, filename)
 
-    def _get_legacy_cache_file(self, user_id: str) -> str:
-        return self._get_hashed_legacy_cache_file(user_id)
-
     def _get_legacy_cache_files_for_read(self, user_id: str) -> List[str]:
         hashed_file = self._get_hashed_legacy_cache_file(user_id)
         unhashed_file = self._get_unhashed_legacy_cache_file(user_id)
@@ -1312,17 +1302,23 @@ class EmbeddingManager:
         }
 
     def _delete_embedding_legacy_json_sync(self, user_id: str, memory_id: str) -> None:
-        cache = self._load_legacy_cache_sync(user_id)
         memory_id_str = normalize_memory_id(memory_id)
-        if memory_id_str not in cache:
-            return
-
-        # We no longer update the legacy JSON cache. If a memory is deleted,
-        # we remove all legacy cache files for this user to ensure consistency
-        # and prevent accidental re-migration of deleted items.
         for cache_file in self._get_legacy_cache_files_for_read(user_id):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(cache_file)
+            if not os.path.exists(cache_file):
+                continue
+            try:
+                with open(cache_file, "r") as f:
+                    cache = json.load(f)
+                if not isinstance(cache, dict) or memory_id_str not in cache:
+                    continue
+                del cache[memory_id_str]
+                tmp_file = cache_file + ".tmp"
+                with open(tmp_file, "w") as f:
+                    json.dump(cache, f)
+                os.replace(tmp_file, cache_file)
+            except (json.JSONDecodeError, OSError):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(cache_file)
 
     def _store_embedding_sqlite_sync(
         self, user_id: str, memory_id: str, embedding: np.ndarray
@@ -1542,8 +1538,6 @@ class EmbeddingManager:
                     ),
                     summarize_error_for_log(e),
                 )
-            finally:
-                self._cleanup_lock(user_id)
 
     async def store_embeddings_batch_persistent(self, user_id: str, ids: List[str], _texts: List[str], embeddings: List[np.ndarray]) -> None:
         """Store multiple embeddings in the plugin's persistent sidecar cache."""
@@ -1588,8 +1582,6 @@ class EmbeddingManager:
                     ),
                     summarize_error_for_log(e),
                 )
-            finally:
-                self._cleanup_lock(user_id)
 
     async def load_embedding_persistent(self, user_id: str, memory_id: str) -> Optional[np.ndarray]:
         """Load a stored embedding from the plugin's persistent sidecar cache."""
@@ -1666,16 +1658,15 @@ class EmbeddingManager:
                     summarize_error_for_log(e),
                 )
                 result = None
-            finally:
-                self._cleanup_lock(user_id)
         return result
 
     async def delete_embedding_persistent(self, user_id: str, memory_id: str) -> None:
         """Delete a stored embedding from memory and all persistent cache backends."""
         memory_id_str = normalize_memory_id(memory_id)
-        await self.cache.delete(self.get_memory_cache_key(user_id, memory_id_str))
 
         async with self._get_lock(user_id):
+            await self.cache.delete(self.get_memory_cache_key(user_id, memory_id_str))
+
             try:
                 await asyncio.to_thread(
                     self._delete_embedding_sqlite_sync, user_id, memory_id_str
@@ -1707,8 +1698,6 @@ class EmbeddingManager:
                     ),
                     summarize_error_for_log(e),
                 )
-            finally:
-                self._cleanup_lock(user_id)
 
     async def get_embedding_with_persistence(
         self, text: str, user_id: str, memory_id: str, user: Any = None
@@ -1845,6 +1834,15 @@ class Mem0SyncManager:
         except (TypeError, ValueError):
             retry_delay = 15.0
         return max(1.0, retry_delay)
+
+    def _get_sync_max_retries(self) -> int:
+        try:
+            max_retries = int(
+                getattr(self.get_valves(), "mem0_sync_max_retries", 20)
+            )
+        except (TypeError, ValueError):
+            max_retries = 20
+        return max_retries
 
     def _get_sync_claim_timeout_seconds(self) -> float:
         try:
@@ -3431,13 +3429,38 @@ class Mem0SyncManager:
                 logger.debug("mem0_queue_job_processing_completed %s", job_context)
                 return True
 
+            max_retries = self._get_sync_max_retries()
+            attempt_count = int(job.get("attempt_count", 0))
+            if max_retries > 0 and attempt_count >= max_retries:
+                logger.error(
+                    "mem0_queue_job_dropped %s",
+                    safe_log_context(
+                        user_id=job.get("user_id"),
+                        memory_id=job.get("owui_memory_id"),
+                        job_id=safe_job_id(
+                            job.get("user_id"),
+                            job.get("owui_memory_id"),
+                            operation,
+                        ),
+                        provider="mem0",
+                        operation=operation or "UNKNOWN",
+                        reason="max_retries_exhausted",
+                        attempt_count=attempt_count,
+                        worker_hash=safe_hash_id(self._worker_id),
+                    ),
+                )
+                await self._delete_job(
+                    str(job["user_id"]), str(job["owui_memory_id"])
+                )
+                return False
+
             retry_at = datetime.now(timezone.utc) + timedelta(
                 seconds=self._get_sync_retry_delay_seconds()
             )
             await self._reschedule_job(
                 str(job["user_id"]),
                 str(job["owui_memory_id"]),
-                int(job.get("attempt_count", 0)),
+                attempt_count,
                 retry_at,
                 job_error,
             )
@@ -3671,6 +3694,17 @@ class MemoryPipeline:
             )
             if queued:
                 return
+            logger.warning(
+                "mem0_queue_enqueue_failed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    memory_id=memory_id,
+                    provider="mem0",
+                    operation="UPSERT",
+                    reason="queue_unavailable",
+                ),
+            )
+            return
 
         await self.mem0_sync_manager.sync_memory_update(
             user_id=user_id,
@@ -3697,6 +3731,17 @@ class MemoryPipeline:
             )
             if queued:
                 return
+            logger.warning(
+                "mem0_queue_enqueue_failed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    memory_id=memory_id,
+                    provider="mem0",
+                    operation="DELETE",
+                    reason="queue_unavailable",
+                ),
+            )
+            return
 
         deleted = await self.mem0_sync_manager.sync_memory_delete(user_id, memory_id)
         if not deleted:
@@ -4149,12 +4194,6 @@ class MemoryPipeline:
         if not message or self._has_mutation_intent_blocker(message):
             return False
         return any(pattern.search(message) for pattern in self._RE_UPDATE_INTENT_PATTERNS)
-
-    def _operation_allowed_by_user_intent(
-        self, operation: Dict[str, Any], user_message: str
-    ) -> bool:
-        allowed, _reason = self._operation_intent_decision(operation, user_message)
-        return allowed
 
     def _operation_intent_decision(
         self, operation: Dict[str, Any], user_message: str
@@ -6501,6 +6540,10 @@ class Filter:
             default=300.0,
             description="Seconds after which an in-progress Mem0 background sync job claim is considered stale and can be claimed by another worker.",
         )
+        mem0_sync_max_retries: int = Field(
+            default=20,
+            description="Maximum number of retries for a failed Mem0 background sync job before it is permanently dropped. Set to 0 to retry indefinitely.",
+        )
         mem0_user_id_template: str = Field(
             default="owui:{user_id}",
             description="Template used to map an Open WebUI user id into a Mem0 user id. May include {user_id} for per-user mapping, or be a fixed string such as 'jefe' to force all mirrored memories into one Mem0 user/entity.",
@@ -7007,6 +7050,12 @@ Your output must be valid JSON only. No additional text.""",
                 raise ValueError(f"{info.field_name} must be a non-negative float")
             return float(v)
 
+        @field_validator("mem0_sync_max_retries")
+        def check_non_negative_mem0_sync_max_retries(cls, v, info):
+            if not isinstance(v, int) or v < 0:
+                raise ValueError(f"{info.field_name} must be a non-negative integer")
+            return v
+
         @field_validator("timezone")
         def check_valid_timezone(cls, v):
             try:
@@ -7093,13 +7142,11 @@ Your output must be valid JSON only. No additional text.""",
         self.task_manager = TaskManager(self)
 
         # Initialize internal state
-        self._processed_messages = set()
-        self._last_body = {}
-        self.memory_embeddings = {}  # Local in-memory cache
         self.seen_users = set()  # Track active users for background tasks
         self.notification_queue = []  # Queue for background task notifications
         self._tasks_started = False
         self._valve_hash = None  # Track valve changes
+        self._llm_session: Optional[aiohttp.ClientSession] = None
 
         logger.info("Adaptive Memory Filter v4.0.2 initialized")
 
@@ -7149,6 +7196,7 @@ Your output must be valid JSON only. No additional text.""",
             f"{self.valves.enable_mem0_sync}_{self.valves.mem0_sync_strategy}_"
             f"{self.valves.mem0_sync_batch_size}_{self.valves.mem0_sync_batch_interval_seconds}_"
             f"{self.valves.mem0_sync_retry_delay_seconds}_{self.valves.mem0_sync_claim_timeout_seconds}_"
+            f"{self.valves.mem0_sync_max_retries}_"
             f"{self.valves.enable_debug_logging}"
         )
         new_hash = hashlib.sha256(valve_str.encode()).hexdigest()
@@ -7197,7 +7245,6 @@ Your output must be valid JSON only. No additional text.""",
     async def _restart_tasks(self):
         """Restart background tasks with new valve settings."""
         await self.task_manager.stop_tasks()
-        self._tasks_started = False
         self._tasks_started = self.task_manager.start_tasks()
         logger.info(
             "background_tasks_restarted %s",
@@ -7212,6 +7259,9 @@ Your output must be valid JSON only. No additional text.""",
         await self.task_manager.stop_tasks()
         await self.embedding_manager.cleanup()
         await self.mem0_sync_manager.cleanup()
+        if self._llm_session and not self._llm_session.closed:
+            await self._llm_session.close()
+            self._llm_session = None
 
     def _load_user_valves(self, __user__: Optional[Dict[str, Any]]) -> "Filter.UserValves":
         raw_valves = (__user__ or {}).get("valves", {})
@@ -7458,9 +7508,15 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
     # Helper: LLM Query Wrapper
     # --------------------------------------------------------------------------
+    def _ensure_llm_session(self):
+        """Ensure a shared aiohttp session exists for LLM queries."""
+        if not self._llm_session or self._llm_session.closed:
+            self._llm_session = aiohttp.ClientSession()
+
     async def _query_llm(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         """Unified LLM query method with retries and metrics."""
         valves = self.valves
+        self._ensure_llm_session()
         
         for attempt in range(valves.max_retries + 1):
             start = time.perf_counter()
@@ -7474,70 +7530,59 @@ Your output must be valid JSON only. No additional text.""",
                         max_attempts=valves.max_retries + 1,
                     ),
                 )
-                async with aiohttp.ClientSession() as session:
-                    url = valves.llm_api_endpoint_url
-                    headers = {"Content-Type": "application/json"}
-                    if valves.llm_api_key:
-                        headers["Authorization"] = f"Bearer {secret_value(valves.llm_api_key)}"
+                url = valves.llm_api_endpoint_url
+                headers = {"Content-Type": "application/json"}
+                if valves.llm_api_key:
+                    headers["Authorization"] = f"Bearer {secret_value(valves.llm_api_key)}"
 
-                    payload = {
-                        "model": valves.llm_model_name,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "stream": False,
-                    }
+                payload = {
+                    "model": valves.llm_model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "stream": False,
+                }
 
-                    if valves.llm_provider_type == "openai_compatible":
-                        # For identify_memories, we expect an array. 
-                        # openai_compatible's 'json_object' format requires a root object, not array.
-                        # Only use it if not identification or if the prompt can be adjusted.
-                        # For now, following CodeRabbit: remove to avoid array errors.
-                        pass
-
-                    async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            # Extract content logic...
-                            if "choices" in data:
-                                logger.debug(
-                                    "llm_request_succeeded %s",
-                                    safe_log_context(
-                                        provider=valves.llm_provider_type,
-                                        operation="LLM_QUERY",
-                                        attempt=attempt + 1,
-                                        latency_ms=int((time.perf_counter() - start) * 1000),
-                                    ),
-                                )
-                                return data["choices"][0]["message"]["content"]
-                            elif "message" in data:
-                                logger.debug(
-                                    "llm_request_succeeded %s",
-                                    safe_log_context(
-                                        provider=valves.llm_provider_type,
-                                        operation="LLM_QUERY",
-                                        attempt=attempt + 1,
-                                        latency_ms=int((time.perf_counter() - start) * 1000),
-                                    ),
-                                )
-                                return data["message"]["content"]
-                        elif resp.status >= 500:
-                            # Server error - retry
-                            raise aiohttp.ClientError(f"Server error: {resp.status}")
-                        else:
-                            # Client error (4xx) - don't retry
-                            logger.warning(
-                                "llm_request_failed %s",
+                async with self._llm_session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if "choices" in data:
+                            logger.debug(
+                                "llm_request_succeeded %s",
                                 safe_log_context(
                                     provider=valves.llm_provider_type,
                                     operation="LLM_QUERY",
-                                    reason="client_error",
-                                    status=resp.status,
+                                    attempt=attempt + 1,
                                     latency_ms=int((time.perf_counter() - start) * 1000),
                                 ),
                             )
-                            return None
+                            return data["choices"][0]["message"]["content"]
+                        elif "message" in data:
+                            logger.debug(
+                                "llm_request_succeeded %s",
+                                safe_log_context(
+                                    provider=valves.llm_provider_type,
+                                    operation="LLM_QUERY",
+                                    attempt=attempt + 1,
+                                    latency_ms=int((time.perf_counter() - start) * 1000),
+                                ),
+                            )
+                            return data["message"]["content"]
+                    elif resp.status >= 500:
+                        raise aiohttp.ClientError(f"Server error: {resp.status}")
+                    else:
+                        logger.warning(
+                            "llm_request_failed %s",
+                            safe_log_context(
+                                provider=valves.llm_provider_type,
+                                operation="LLM_QUERY",
+                                reason="client_error",
+                                status=resp.status,
+                                latency_ms=int((time.perf_counter() - start) * 1000),
+                            ),
+                        )
+                        return None
                             
             except Exception as e:
                 if attempt < valves.max_retries:

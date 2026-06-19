@@ -62,6 +62,7 @@ def make_valves(**overrides):
         "mem0_sync_batch_interval_seconds": 7200.0,
         "mem0_sync_retry_delay_seconds": 15.0,
         "mem0_sync_claim_timeout_seconds": 300.0,
+        "mem0_sync_max_retries": 20,
         "enable_identity_memories": True,
         "enable_behavior_memories": True,
         "enable_preference_memories": True,
