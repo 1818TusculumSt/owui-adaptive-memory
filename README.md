@@ -1,8 +1,13 @@
-# Adaptive Memory for Open WebUI
+# 🧠 Adaptive Memory for Open WebUI
 
-Persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, and optional Mem0 mirroring.
+> Persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, and optional Mem0 mirroring.
 
-## Quick Start
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+
+---
+
+## 🚀 Quick Start
 
 1. Upload `adaptive_memory_v4.0.py` to Open WebUI Functions
 2. Enable the function for your models
@@ -15,9 +20,9 @@ Persistent, user-specific memory with semantic recall, deduplication, pruning, s
 | `llm_model_name` | `llama3:latest` (or your model) |
 | `embedding_source` | `auto` |
 
-The function will use Open WebUI's embedding engine when available, falling back to the bundled `all-MiniLM-L6-v2` model. Everything else works on defaults.
+> 💡 The function uses Open WebUI's embedding engine when available, falling back to the bundled `all-MiniLM-L6-v2` model. Everything else works on defaults.
 
-## How It Works
+## 🔄 How It Works
 
 ```
 User message → inlet()
@@ -36,9 +41,9 @@ User message → inlet()
   └─ Emit status if user valve `show_status` is on
 ```
 
-## Valve Reference
+## ⚙️ Valve Reference
 
-### Essential
+### 🔌 Essential
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -52,7 +57,7 @@ User message → inlet()
 | `embedding_api_url` | `None` | Embedding API endpoint (plugin fallback) |
 | `embedding_api_key` | `None` | Embedding API key (plugin fallback) |
 
-### Memory Extraction
+### 🧲 Memory Extraction
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -64,7 +69,7 @@ User message → inlet()
 | `short_preference_no_dedupe_length` | `100` | Max chars for a short preference to skip dedup |
 | `preference_keywords_no_dedupe` | `favorite,love,...` | Keywords that trigger the short-preference shortcut |
 
-### Quality Filters
+### 🎯 Quality Filters
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -82,7 +87,7 @@ User message → inlet()
 | `enable_relationship_memories` | `True` | Allow `relationship` tag memories |
 | `enable_possession_memories` | `True` | Allow `possession` tag memories |
 
-### Retrieval & Injection
+### 🔍 Retrieval & Injection
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -97,7 +102,7 @@ User message → inlet()
 | `memory_format` | `bullet` | `bullet` or `numbered` |
 | `show_memories` | `True` | Show memory context in the injected prompt label |
 
-### Deduplication
+### 🗂️ Deduplication
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -106,7 +111,7 @@ User message → inlet()
 | `embedding_similarity_threshold` | `0.75` | Cosine similarity threshold for embedding dedup |
 | `similarity_threshold` | `0.95` | Text sequence similarity threshold (fallback) |
 
-### Size Control
+### 📦 Size Control
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -121,7 +126,7 @@ User message → inlet()
 | `summarization_min_memory_age_days` | `7` | Min age before a memory is eligible for summarization |
 | `summarization_memory_prompt` | *(prompt)* | System prompt for the summarization LLM |
 
-### Mem0 Mirroring *(optional)*
+### ☁️ Mem0 Mirroring *(optional)*
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -135,21 +140,21 @@ User message → inlet()
 | `mem0_sync_batch_interval_seconds` | `7200` | Seconds between sync cycles |
 | `mem0_sync_retry_delay_seconds` | `15` | Delay before retrying a failed job |
 | `mem0_sync_claim_timeout_seconds` | `300` | Stale claim timeout for multi-worker safety |
-| `mem0_sync_max_retries` | `20` | Max retries before permanently dropping a job (0 = unlimited) |
+| `mem0_sync_max_retries` | `20` | Max retries before permanently dropping a job (`0` = unlimited) |
 | `mem0_reconcile_cooldown_seconds` | `30` | Min seconds between Mem0 reconciliation checks per user |
 | `mem0_user_id_template` | `owui:{user_id}` | Template mapping OWUI users to Mem0 user IDs |
 | `mem0_user_id_override` | `""` | Per-user mapping table (`owui_id:mem0_id, ...`) |
 | `mem0_infer_on_create` | `False` | Pass `infer=true` on Mem0 create requests |
 
-Mem0 mirroring is **best-effort, not transactional**. Local Open WebUI memory is always the primary store. In `background` mode, Mem0 can lag by up to `mem0_sync_batch_interval_seconds`. If Mem0 is unavailable, local memory remains intact.
+> ⚠️ Mem0 mirroring is **best-effort, not transactional**. Local Open WebUI memory is always the primary store. In `background` mode, Mem0 can lag by up to `mem0_sync_batch_interval_seconds`. If Mem0 is unavailable, local memory remains intact.
 
-**Mem0 user ID resolution order:**
+**👤 Mem0 user ID resolution order:**
 1. Per-user valve `mem0_user_id_override`
 2. Matching entry in global `mem0_user_id_override` (e.g. `user_a:jefe`)
 3. Previously stored Mem0 user mapping
 4. `mem0_user_id_template`
 
-### Background Tasks & Logging
+### 📡 Background Tasks & Logging
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -161,7 +166,7 @@ Mem0 mirroring is **best-effort, not transactional**. Local Open WebUI memory is
 | `debug_error_counter_logs` | `False` | Include error counter snapshots in debug output |
 | `log_user_id_on_memory_save` | `False` | Log plain user IDs on memory save (off by default) |
 
-### User Valves *(per-user overrides)*
+### 👤 User Valves *(per-user overrides)*
 
 | Valve | Default | Description |
 |-------|---------|-------------|
@@ -169,48 +174,55 @@ Mem0 mirroring is **best-effort, not transactional**. Local Open WebUI memory is
 | `show_status` | `True` | Show memory-saved status message after each response |
 | `mem0_user_id_override` | `""` | Per-user Mem0 user ID |
 
-## Mutation Safety
+## 🛡️ Mutation Safety
 
 The LLM can propose `NEW`, `UPDATE`, and `DELETE` operations. Destructive operations are gated:
 
-- **DELETE** — only allowed when the user's *current message* explicitly asks to forget, delete, remove, or stop remembering
-- **UPDATE** — only allowed when the user's *current message* explicitly asks to correct, change, replace, or revise
+- **🗑️ DELETE** — only allowed when the user's *current message* explicitly asks to forget, delete, remove, or stop remembering
+- **✏️ UPDATE** — only allowed when the user's *current message* explicitly asks to correct, change, replace, or revise
 
-Instructions buried in recalled memory text, quoted text, or prompt-injection attempts are ignored. Ambiguous messages default to no destructive action. This is intentionally conservative.
+> 🔒 Instructions buried in recalled memory text, quoted text, or prompt-injection attempts are ignored. Ambiguous messages default to no destructive action. This is intentionally conservative.
 
-## Privacy Protections
+## 🔐 Privacy Protections
 
-- **Secret filtering**: Blocks API keys, bearer tokens, passwords, private keys, DB URLs with credentials, SSNs, and Luhn-validated credit card numbers before storage. Heuristic, not full DLP.
-- **Safe logging**: All logged identifiers are hashed. Raw user messages, memory contents, prompts, completions, and API keys are never logged.
-- **Memory injection**: Recalled memories are injected as untrusted factual context, not instructions, reducing prompt-injection blast radius.
+| Guard | Detail |
+|-------|--------|
+| 🤫 **Secret filtering** | Blocks API keys, bearer tokens, passwords, private keys, DB URLs with credentials, SSNs, and Luhn-validated credit card numbers before storage. Heuristic, not full DLP. |
+| 🔏 **Safe logging** | All logged identifiers are hashed. Raw user messages, memory contents, prompts, completions, and API keys are never logged. |
+| 🧱 **Memory injection** | Recalled memories are injected as untrusted factual context, not instructions, reducing prompt-injection blast radius. |
 
-## Sidecar Files
+## 📁 Sidecar Files
 
 Located under `DATA_DIR/cache`:
-- `embeddings.sqlite` — persistent embedding cache
-- `mem0_sync.sqlite` — Mem0 memory mappings, user mappings, and queued background sync jobs
 
-Legacy JSON cache files from older versions are read and migrated to SQLite on access.
+| File | Purpose |
+|------|---------|
+| `embeddings.sqlite` | Persistent embedding cache |
+| `mem0_sync.sqlite` | Mem0 memory mappings, user mappings, and queued background sync jobs |
 
-## Inactive Valves
+> 📜 Legacy JSON cache files from older versions are read and migrated to SQLite on access.
 
-These valves exist in the schema to preserve saved Open WebUI settings but are not currently wired to behavior:
+## 💤 Inactive Valves
 
-`enable_date_update_task`, `date_update_interval`, `enable_model_discovery_task`, `model_discovery_interval`, `save_relevance_threshold`, `memory_threshold`, `cache_ttl_seconds`, `memory_merge_prompt`, `enable_error_counter_guard`, `error_guard_threshold`, `error_guard_window_seconds`, global `show_status`, global `timezone`, user `timezone`.
+> These valves exist in the schema to preserve saved Open WebUI settings but are not currently wired to behavior.
 
-## Requirements
+`enable_date_update_task` `·` `date_update_interval` `·` `enable_model_discovery_task` `·` `model_discovery_interval` `·` `save_relevance_threshold` `·` `memory_threshold` `·` `cache_ttl_seconds` `·` `memory_merge_prompt` `·` `enable_error_counter_guard` `·` `error_guard_threshold` `·` `error_guard_window_seconds` `·` global `show_status` `·` global `timezone` `·` user `timezone`
+
+## 📋 Requirements
 
 - **Required**: Open WebUI, `numpy`, `aiohttp`, `pydantic`, `pytz`
 - **Optional**: `sentence-transformers` (local embeddings), `prometheus-client` (metrics)
 
-## Tests
+## 🧪 Tests
 
 ```bash
-python -m py_compile adaptive_memory_v4.0.py tests/adaptive_memory_loader.py tests/test_adaptive_memory_helpers.py tests/test_extract_memory_id.py tests/test_extract_message_text.py
+python -m py_compile adaptive_memory_v4.0.py tests/adaptive_memory_loader.py \
+    tests/test_adaptive_memory_helpers.py tests/test_extract_memory_id.py \
+    tests/test_extract_message_text.py
 python -m unittest discover -s tests
 git diff --check
 ```
 
-## License
+## 📄 License
 
-MIT. Forked from [gramanoid/owui-adaptive-memory](https://github.com/gramanoid/owui-adaptive-memory).
+MIT · Forked from [gramanoid/owui-adaptive-memory](https://github.com/gramanoid/owui-adaptive-memory)
