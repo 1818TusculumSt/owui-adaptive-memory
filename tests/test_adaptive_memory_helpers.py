@@ -820,6 +820,117 @@ class TestMultiSignalMemory(unittest.TestCase):
         finally:
             del am.update_memory_by_id_and_user_id_compat
 
+    def test_extraction_quality_gate_rejects_general_knowledge(self):
+        pipeline = make_pipeline(enable_extraction_quality_gate=True)
+        ops = [
+            {"operation": "NEW", "content": "World War II started in 1939", "tags": ["identity"], "importance": 3},
+            {"operation": "NEW", "content": "User is a software engineer", "tags": ["identity"], "importance": 5},
+        ]
+        filtered = pipeline._validate_extraction_quality(ops, "test")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["content"], "User is a software engineer")
+
+    def test_extraction_quality_gate_downgrades_transient(self):
+        pipeline = make_pipeline(enable_extraction_quality_gate=True)
+        ops = [
+            {"operation": "NEW", "content": "Today I am working on a bug fix", "tags": ["behavior"], "importance": 4, "stability": "fluid"},
+        ]
+        filtered = pipeline._validate_extraction_quality(ops, "test")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["importance"], 2)
+        self.assertEqual(filtered[0]["stability"], "transient")
+
+    def test_extraction_quality_gate_disabled(self):
+        pipeline = make_pipeline(enable_extraction_quality_gate=False)
+        ops = [
+            {"operation": "NEW", "content": "World War II started in 1939", "tags": ["identity"], "importance": 3},
+        ]
+        filtered = pipeline._validate_extraction_quality(ops, "test")
+        self.assertEqual(len(filtered), 1)
+
+    def test_memory_acknowledgment_in_format(self):
+        f = am.Filter()
+        f.valves = make_valves(enable_memory_acknowledgment=True)
+        mem = types.SimpleNamespace(
+            id="m1",
+            content=am.format_memory_content("User likes coffee", ["preference"], "Personal", 0.9),
+            created_at=datetime.now(timezone.utc),
+        )
+        formatted = f._format_relevant_memories([mem])
+        self.assertIn("naturally acknowledge", formatted)
+
+    def test_memory_acknowledgment_disabled(self):
+        f = am.Filter()
+        f.valves = make_valves(enable_memory_acknowledgment=False)
+        mem = types.SimpleNamespace(
+            id="m1",
+            content=am.format_memory_content("User likes coffee", ["preference"], "Personal", 0.9),
+            created_at=datetime.now(timezone.utc),
+        )
+        formatted = f._format_relevant_memories([mem])
+        self.assertNotIn("naturally acknowledge", formatted)
+
+    def test_memory_command_memories(self):
+        f = am.Filter()
+        f.valves = make_valves(enable_memory_commands=True)
+        mem = types.SimpleNamespace(
+            id="m1",
+            content=am.format_memory_content("User likes coffee", ["preference"], "Personal", 0.9, importance=4),
+            created_at=datetime.now(timezone.utc),
+        )
+        emitted = []
+
+        async def emitter(d):
+            emitted.append(d)
+
+        asyncio.run(f._handle_memory_command("/memories", "u1", emitter, [mem]))
+        self.assertTrue(len(emitted) > 0)
+        self.assertIn("coffee", emitted[0]["data"]["description"])
+
+    def test_memory_command_remember(self):
+        f = am.Filter()
+        f.valves = make_valves(enable_memory_commands=True)
+
+        saved = []
+
+        async def fake_insert(user_id, content):
+            saved.append((user_id, content))
+            return types.SimpleNamespace(id="new1", content=content)
+
+        original = am.insert_new_memory_compat
+        am.insert_new_memory_compat = fake_insert
+        emitted = []
+
+        async def emitter(d):
+            emitted.append(d)
+
+        try:
+            asyncio.run(f._handle_memory_command("/remember I prefer dark mode", "u1", emitter, []))
+            self.assertTrue(len(saved) > 0)
+            self.assertIn("I prefer dark mode", saved[0][1])
+        finally:
+            am.insert_new_memory_compat = original
+
+    def test_session_context_in_identify_memories(self):
+        pipeline = make_pipeline(
+            enable_conversation_context=True,
+            enable_short_preference_shortcut=False,
+        )
+
+        async def fake_llm(system_prompt, user_prompt):
+            self.assertIn("Conversation Context", user_prompt)
+            self.assertIn("discussing Python", user_prompt)
+            return "[]"
+
+        ops = asyncio.run(
+            pipeline.identify_memories(
+                "I also like Rust",
+                query_llm_func=fake_llm,
+                session_context="User is discussing Python programming",
+            )
+        )
+        self.assertEqual(ops, [])
+
 
 class TestMemoryPipelineFlow(unittest.TestCase):
     def test_identify_memories_normal_flow(self):
