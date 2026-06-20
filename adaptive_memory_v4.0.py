@@ -6654,6 +6654,24 @@ class MemoryPipeline:
         clusters = self._build_summarization_clusters(
             records, embeddings, valid_indices
         )
+
+        decay_rates = {"stable": 0.0, "fluid": 0.003, "transient": 0.015}
+
+        def cluster_decay_score(cluster_indices: List[int]) -> float:
+            if not cluster_indices:
+                return 0.0
+            total = 0.0
+            for idx in cluster_indices:
+                if idx < len(records):
+                    r = records[idx]
+                    importance = r.importance or 3
+                    stability = r.stability or "fluid"
+                    decay = decay_rates.get(stability, 0.005)
+                    total += importance - (decay * 10)
+            return total / len(cluster_indices)
+
+        clusters.sort(key=cluster_decay_score)
+
         for cluster in clusters:
             logger.info(
                 "memory_summarization_cluster_found %s",
@@ -6722,12 +6740,25 @@ class MemoryPipeline:
                         else self._normalize_memory_bank(self.valves.default_memory_bank)
                     )
 
+                    cluster_importance = max(
+                        (r.importance or 3) for r in cluster_records
+                    ) if cluster_records else 3
+                    stabilities = {r.stability or "fluid" for r in cluster_records}
+                    if "stable" in stabilities:
+                        cluster_stability = "stable"
+                    elif "fluid" in stabilities:
+                        cluster_stability = "fluid"
+                    else:
+                        cluster_stability = "transient"
+
                     op = {
                         "operation": "NEW",
                         "content": re.sub(r"\s+", " ", summary).strip(),
                         "tags": merged_tags,
                         "memory_bank": merged_bank,
                         "confidence": avg_confidence,
+                        "importance": cluster_importance,
+                        "stability": cluster_stability,
                     }
 
                     success_ops = await self.process_memory_operations([op], user_id, skip_deduplication=True)
