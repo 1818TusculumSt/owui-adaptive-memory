@@ -454,6 +454,178 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(clusters, [])
 
 
+class TestMultiSignalMemory(unittest.TestCase):
+    def test_normalize_operation_importance_stability(self):
+        pipeline = make_pipeline()
+        op = pipeline._normalize_operation(
+            {
+                "operation": "NEW",
+                "content": "User is a software engineer",
+                "tags": ["identity"],
+                "memory_bank": "Work",
+                "confidence": 0.95,
+                "importance": 5,
+                "stability": "stable",
+            }
+        )
+        self.assertEqual(op["importance"], 5)
+        self.assertEqual(op["stability"], "stable")
+
+    def test_normalize_operation_importance_clamp(self):
+        pipeline = make_pipeline()
+        op = pipeline._normalize_operation(
+            {
+                "operation": "NEW",
+                "content": "User enjoys hiking on weekends",
+                "tags": ["identity"],
+                "memory_bank": "General",
+                "confidence": 0.9,
+                "importance": 99,
+            }
+        )
+        self.assertEqual(op["importance"], 5)
+
+    def test_normalize_operation_importance_default(self):
+        pipeline = make_pipeline()
+        op = pipeline._normalize_operation(
+            {
+                "operation": "NEW",
+                "content": "User enjoys hiking on weekends",
+                "tags": ["identity"],
+                "memory_bank": "General",
+                "confidence": 0.9,
+            }
+        )
+        self.assertIsNotNone(op)
+        self.assertEqual(op["importance"], 3)
+        self.assertEqual(op["stability"], "fluid")
+
+    def test_normalize_operation_importance_disabled(self):
+        pipeline = make_pipeline(enable_importance_scoring=False)
+        op = pipeline._normalize_operation(
+            {
+                "operation": "NEW",
+                "content": "User enjoys hiking on weekends",
+                "tags": ["identity"],
+                "memory_bank": "General",
+                "confidence": 0.9,
+                "importance": 5,
+            }
+        )
+        self.assertIsNotNone(op)
+        self.assertEqual(op["importance"], 3)
+
+    def test_build_short_preference_operation_has_defaults(self):
+        pipeline = make_pipeline()
+        op = pipeline._build_short_preference_operation("I love coffee")
+        self.assertIsNotNone(op)
+        self.assertEqual(op["importance"], 3)
+        self.assertEqual(op["stability"], "fluid")
+
+    def test_multi_signal_boost_stable(self):
+        pipeline = make_pipeline(retrieval_scoring_version="v5")
+        mem = types.SimpleNamespace(
+            id="1",
+            content=am.format_memory_content(
+                "User is a software engineer", ["identity"], "Work", 0.95,
+                importance=5, stability="stable",
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+        boosted = pipeline._apply_multi_signal_boost(0.8, mem)
+        self.assertGreater(boosted, 0.8)
+        self.assertLessEqual(boosted, 1.0)
+
+    def test_multi_signal_boost_transient_old_decays(self):
+        pipeline = make_pipeline(retrieval_scoring_version="v5")
+        mem = types.SimpleNamespace(
+            id="2",
+            content=am.format_memory_content(
+                "User is debugging today", ["behavior"], "Work", 0.7,
+                importance=1, stability="transient",
+            ),
+            created_at=datetime.now(timezone.utc) - timedelta(days=100),
+        )
+        boosted = pipeline._apply_multi_signal_boost(0.8, mem)
+        self.assertLess(boosted, 0.8)
+
+    def test_multi_signal_boost_v4_passthrough(self):
+        pipeline = make_pipeline(retrieval_scoring_version="v4")
+        mem = types.SimpleNamespace(
+            id="3",
+            content=am.format_memory_content("User likes coffee", ["x"], "General", 0.5),
+            created_at=datetime.now(timezone.utc),
+        )
+        boosted = pipeline._apply_multi_signal_boost(0.75, mem)
+        self.assertAlmostEqual(boosted, 0.75, places=2)
+
+    def test_multi_signal_boost_stability_decay_disabled(self):
+        pipeline = make_pipeline(
+            retrieval_scoring_version="v5",
+            enable_stability_decay=False,
+        )
+        mem_stable = types.SimpleNamespace(
+            id="4a",
+            content=am.format_memory_content(
+                "User is a dev", ["identity"], "Work", 0.9,
+                importance=3, stability="stable",
+            ),
+            created_at=datetime.now(timezone.utc) - timedelta(days=365),
+        )
+        mem_transient = types.SimpleNamespace(
+            id="4b",
+            content=am.format_memory_content(
+                "User is debugging", ["behavior"], "Work", 0.7,
+                importance=3, stability="transient",
+            ),
+            created_at=datetime.now(timezone.utc) - timedelta(days=365),
+        )
+        boosted_stable = pipeline._apply_multi_signal_boost(0.8, mem_stable)
+        boosted_transient = pipeline._apply_multi_signal_boost(0.8, mem_transient)
+        self.assertAlmostEqual(boosted_stable, boosted_transient, places=2)
+
+    def test_multi_signal_boost_clamped(self):
+        pipeline = make_pipeline(retrieval_scoring_version="v5")
+        mem = types.SimpleNamespace(
+            id="5",
+            content=am.format_memory_content(
+                "User is great", ["identity"], "Work", 1.0,
+                importance=5, stability="stable",
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+        boosted = pipeline._apply_multi_signal_boost(1.0, mem)
+        self.assertLessEqual(boosted, 1.0)
+        self.assertGreaterEqual(boosted, 0.0)
+
+    def test_relevance_prompt_candidate_has_metadata(self):
+        pipeline = make_pipeline()
+        mem = types.SimpleNamespace(
+            id="abc",
+            content=am.format_memory_content(
+                "User likes Python", ["preference"], "Work", 0.9,
+                importance=4, stability="fluid",
+                last_accessed="2025-06-20", access_count=3,
+            ),
+            created_at=datetime.now(timezone.utc) - timedelta(days=10),
+        )
+        scored = [(0.85, mem)]
+
+        async def fake_llm(system_prompt, user_prompt):
+            self.assertIn("importance=4", user_prompt)
+            self.assertIn("stability=fluid", user_prompt)
+            self.assertIn("accesses=3", user_prompt)
+            self.assertIn("age=10d", user_prompt)
+            return json.dumps([{"memory": "User likes Python", "id": "abc", "relevance": 0.9}])
+
+        result = asyncio.run(
+            pipeline._rank_memories_with_llm_relevance(
+                "Python", "user1", scored, fake_llm
+            )
+        )
+        self.assertEqual(len(result), 1)
+
+
 class TestMemoryPipelineFlow(unittest.TestCase):
     def test_identify_memories_normal_flow(self):
         pipeline = make_pipeline()

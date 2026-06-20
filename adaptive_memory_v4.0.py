@@ -4436,12 +4436,28 @@ class MemoryPipeline:
         if item.get("tags") and not tags:
             return None
 
+        importance = 3
+        if getattr(self.valves, "enable_importance_scoring", True):
+            raw_importance = item.get("importance")
+            if raw_importance is not None:
+                try:
+                    importance = max(1, min(5, int(raw_importance)))
+                except (TypeError, ValueError):
+                    importance = 3
+
+        stability = "fluid"
+        raw_stability = str(item.get("stability", "")).strip().lower()
+        if raw_stability in ("stable", "fluid", "transient"):
+            stability = raw_stability
+
         normalized_op = {
             "operation": operation,
             "content": content,
             "tags": tags,
             "memory_bank": self._normalize_memory_bank(item.get("memory_bank")),
             "confidence": confidence,
+            "importance": importance,
+            "stability": stability,
         }
 
         if operation == "UPDATE" and item.get("id"):
@@ -4464,6 +4480,8 @@ class MemoryPipeline:
                 "tags": ["preference"],
                 "memory_bank": self._normalize_memory_bank(self.valves.default_memory_bank),
                 "confidence": 0.95,
+                "importance": 3,
+                "stability": "fluid",
             }
         )
 
@@ -4825,6 +4843,13 @@ class MemoryPipeline:
                 ),
             )
 
+        # Apply multi-signal boost (v5 scoring) before sorting
+        if getattr(self.valves, "retrieval_scoring_version", "v4") == "v5":
+            scored_memories = [
+                (self._apply_multi_signal_boost(sim, mem), mem)
+                for sim, mem in scored_memories
+            ]
+
         # Sort by similarity
         scored_memories.sort(key=lambda x: x[0], reverse=True)
         self._log_retrieval_score_summary(user_id, session_id, scored_memories)
@@ -4876,6 +4901,57 @@ class MemoryPipeline:
             ),
         )
         return top_memories
+
+    def _apply_multi_signal_boost(
+        self,
+        vector_score: float,
+        memory: Any,
+        query_embedding: Optional[np.ndarray] = None,
+    ) -> float:
+        """Apply recency, importance, and access boosts to a vector similarity score.
+
+        Returns a boosted score still in [0, 1] range.
+        """
+        if getattr(self.valves, "retrieval_scoring_version", "v4") != "v5":
+            return vector_score
+
+        memory_record = self._get_memory_record(memory)
+        created_at = self._coerce_created_at(get_memory_value(memory, "created_at"))
+
+        recency_boost = 0.0
+        if created_at:
+            age_days = (datetime.now(timezone.utc) - created_at).days
+            decay_rates = {
+                "stable": 0.0,
+                "fluid": 0.003,
+                "transient": 0.015,
+            }
+            stability = memory_record.stability or "fluid"
+            importance = memory_record.importance or 3
+            decay_rate = decay_rates.get(stability, 0.005)
+            if getattr(self.valves, "enable_stability_decay", True):
+                effective_decay = decay_rate * (1 - (importance - 3) * 0.15)
+            else:
+                effective_decay = 0.003
+            recency_boost = max(0, 1 - (age_days * effective_decay))
+
+        importance_norm = ((memory_record.importance or 3) - 1) / 4
+        importance_boost = importance_norm
+
+        access_boost = min(0.2, (memory_record.access_count or 0) * 0.02)
+
+        w_recency = getattr(self.valves, "recency_boost_weight", 0.10)
+        w_importance = getattr(self.valves, "importance_weight", 0.15)
+        w_access = getattr(self.valves, "access_boost_weight", 0.05)
+
+        boosted = (
+            vector_score * (1 - w_recency - w_importance - w_access)
+            + recency_boost * w_recency
+            + importance_boost * w_importance
+            + access_boost * w_access
+        )
+
+        return min(1.0, max(0.0, boosted))
 
     def _rank_memories_with_vector_scores(
         self, scored_memories: List[Tuple[float, Any]]
@@ -4957,7 +5033,21 @@ class MemoryPipeline:
                 metadata.append(f"bank={memory_record.memory_bank}")
             if memory_record.tags:
                 metadata.append(f"tags={', '.join(memory_record.tags)}")
-            metadata.append(f"vector_similarity={similarity:.3f}")
+            metadata.append(f"similarity={similarity:.3f}")
+
+            created_at = get_memory_value(memory, "created_at")
+            normalized_created = self._coerce_created_at(created_at)
+            if normalized_created:
+                age_days = (datetime.now(timezone.utc) - normalized_created).days
+                metadata.append(f"age={age_days}d")
+
+            if memory_record.importance:
+                metadata.append(f"importance={memory_record.importance}")
+            if memory_record.stability:
+                metadata.append(f"stability={memory_record.stability}")
+            if memory_record.access_count:
+                metadata.append(f"accesses={memory_record.access_count}")
+
             prompt_lines.append(
                 f"{index}. ID: {memory_id} ({'; '.join(metadata)})\n"
                 f"Content: {memory_record.content}"
@@ -5301,6 +5391,8 @@ class MemoryPipeline:
                     confidence = self._normalize_confidence(
                         normalized_op.get("confidence"), default=1.0
                     )
+                    importance_value = normalized_op.get("importance", 3)
+                    stability_value = normalized_op.get("stability", "fluid")
 
                     dedup_embedding = None
                     skip_preference_dedupe = self._should_skip_dedupe_for_short_preference(content)
@@ -5326,7 +5418,13 @@ class MemoryPipeline:
                             )
                             continue
 
-                    final_content = format_memory_content(content, tags, bank, confidence)
+                    final_content = format_memory_content(
+                        content, tags, bank, confidence,
+                        importance=importance_value,
+                        stability=stability_value,
+                        last_accessed=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                        access_count=0,
+                    )
 
                     try:
                         mem_obj = None
@@ -7004,74 +7102,95 @@ Analyze the following related memories and provide a concise summary.""",
             default="""You are an automated JSON data extraction system. Your ONLY function is to identify user-specific, persistent facts, preferences, goals, relationships, or interests from the user's messages and output them STRICTLY as a JSON array of operations.
 
 **ABSOLUTE OUTPUT REQUIREMENT: FAILURE TO COMPLY WILL BREAK THE SYSTEM.**
-1.  Your **ENTIRE** response **MUST** be **ONLY** a valid JSON array starting with `[` and ending with `]`. 
-2.  **NO EXTRA TEXT**: Do **NOT** include **ANY** text, explanations, greetings, apologies, notes, or markdown formatting (like ```json) before or after the JSON array. 
-3.  **ARRAY ALWAYS**: Even if you find only one memory, it **MUST** be enclosed in an array: `[{"operation": ...}]`. Do **NOT** output a single JSON object `{...}`.
-4.  **EMPTY ARRAY**: If NO relevant user-specific memories are found, output **ONLY** an empty JSON array: `[]`.
+1. Your ENTIRE response MUST be ONLY a valid JSON array starting with `[` and ending with `]`.
+2. NO EXTRA TEXT: Do NOT include ANY text, explanations, greetings, apologies, notes, or markdown formatting before or after the JSON array.
+3. ARRAY ALWAYS: Even if you find only one memory, it MUST be enclosed in an array: `[{"operation": ...}]`.
+4. EMPTY ARRAY: If NO relevant user-specific memories are found, output ONLY an empty JSON array: `[]`.
 
 **JSON OBJECT STRUCTURE (Each element in the array):**
-*   Each element **MUST** be a JSON object: `{"operation": "NEW", "content": "...", "tags": ["..."], "memory_bank": "...", "confidence": float}`
-*   **confidence**: You **MUST** include a confidence score (float between 0.0 and 1.0) indicating certainty that the extracted text is a persistent user fact/preference. High confidence (0.8-1.0) for direct statements, lower (0.5-0.7) for inferences or less certain preferences.
-*   **memory_bank**: You **MUST** include a `memory_bank` field, choosing from: "General", "Personal", "Work". Default to "General" if unsure.
-*   **tags**: You **MUST** include a `tags` field with a list of relevant tags from: ["identity", "behavior", "preference", "goal", "relationship", "possession"].
+* Each element MUST be a JSON object with these fields:
+  - `"operation"`: "NEW", "UPDATE", or "DELETE"
+  - `"content"`: "..."
+  - `"tags"`: ["..."]
+  - `"memory_bank"`: "General" | "Personal" | "Work"
+  - `"confidence"`: float between 0.0 and 1.0
+  - `"importance"`: integer 1-5 (REQUIRED)
+  - `"stability"`: "stable" | "fluid" | "transient" (REQUIRED)
+
+* **importance**: You MUST include an importance score (integer 1-5):
+  - 5: Core identity (name, profession, long-term relationships, medical conditions)
+  - 4: Strong preferences, ongoing projects, important goals
+  - 3: Moderate preferences, habits, interests, current tools/workflows
+  - 2: Situational context, current tasks of the day, minor likes
+  - 1: Minor passing mentions, trivia about the user, one-off statements
+
+* **stability**: You MUST include a stability class:
+  - "stable": Unlikely to change over years (identity, permanent relationships, fundamental traits)
+  - "fluid": May change over months (preferences, projects, goals, tools)
+  - "transient": Likely to change over days/weeks (current task, today's mood, situational context)
+
+* **confidence**: You MUST include a confidence score (float between 0.0 and 1.0) indicating certainty that the extracted text is a persistent user fact/preference. High confidence (0.8-1.0) for direct statements, lower (0.5-0.7) for inferences.
+
+* **memory_bank**: You MUST include a `memory_bank` field, choosing from: "General", "Personal", "Work". Default to "General" if unsure.
+
+* **tags**: You MUST include a `tags` field with a list of relevant tags from: ["identity", "behavior", "preference", "goal", "relationship", "possession"].
 
 **INFORMATION TO EXTRACT (User-Specific ONLY):**
-*   **Explicit Preferences/Statements:** User states "I love X", "My favorite is Y", "I enjoy Z". Extract these verbatim with high confidence.
-*   **Identity:** Name, location, age, profession, etc. (high confidence)
-*   **Goals:** Aspirations, plans (medium/high confidence depending on certainty).
-*   **Relationships:** Mentions of family, friends, colleagues (high confidence).
-*   **Possessions:** Things owned or desired (medium/high confidence).
-*   **Behaviors/Interests:** Topics the user discusses or asks about (implying interest - medium confidence).
+* Explicit Preferences/Statements: User states "I love X", "My favorite is Y", "I enjoy Z". Extract these verbatim with high confidence.
+* Identity: Name, location, age, profession, etc. (high confidence, importance 4-5)
+* Goals: Aspirations, plans (medium-high confidence, importance 3-4)
+* Relationships: Mentions of family, friends, colleagues (high confidence, importance 4-5)
+* Possessions: Things owned or desired (medium-high confidence, importance 2-3)
+* Behaviors/Interests: Topics the user discusses or asks about (medium confidence, importance 2-3)
 
 **RULES (Reiteration - Critical):**
-+1. **JSON ARRAY ONLY**: `[`...`]` - Nothing else!
-+2. **CONFIDENCE REQUIRED**: Every object needs a `"confidence": float` field.
-+3. **MEMORY BANK REQUIRED**: Every object needs a `"memory_bank": "..."` field.
-+4. **TAGS REQUIRED**: Every object needs a `"tags": [...]` field.
-+5. **USER INFO ONLY**: Discard trivia, questions *to* the AI, temporary thoughts.
-
-**FAILURE EXAMPLES (DO NOT DO THIS):**
-*   `Okay, here is the JSON: [...]` <-- INVALID (extra text)
-*   ` ```json
-[{"operation": ...}]
-``` ` <-- INVALID (markdown)
-*   `{"memories": [...]}` <-- INVALID (not an array)
-*   `{"operation": ...}` <-- INVALID (not in an array)
-*   `[{"operation": ..., "content": ..., "tags": [...]}]` <-- INVALID (missing confidence/bank)
++1. JSON ARRAY ONLY: `[`...`]` - Nothing else!
++2. CONFIDENCE REQUIRED: Every object needs a `"confidence": float` field.
++3. IMPORTANCE REQUIRED: Every object needs an `"importance": integer` field (1-5).
++4. STABILITY REQUIRED: Every object needs a `"stability": string` field ("stable"/"fluid"/"transient").
++5. MEMORY BANK REQUIRED: Every object needs a `"memory_bank": "..."` field.
++6. TAGS REQUIRED: Every object needs a `"tags": [...]` field.
++7. USER INFO ONLY: Discard trivia, questions *to* the AI, temporary thoughts.
 
 **GOOD EXAMPLE OUTPUT (Strictly adhere to this):**
-```
 [
   {
     "operation": "NEW",
     "content": "User has been a software engineer for 8 years",
     "tags": ["identity", "behavior"],
     "memory_bank": "Work",
-    "confidence": 0.95
+    "confidence": 0.95,
+    "importance": 5,
+    "stability": "stable"
   },
   {
     "operation": "NEW",
     "content": "User has a cat named Whiskers",
     "tags": ["relationship", "possession"],
     "memory_bank": "Personal",
-    "confidence": 0.9
+    "confidence": 0.9,
+    "importance": 4,
+    "stability": "stable"
   },
   {
     "operation": "NEW",
     "content": "User prefers working remotely",
     "tags": ["preference", "behavior"],
     "memory_bank": "Work",
-    "confidence": 0.7
+    "confidence": 0.7,
+    "importance": 4,
+    "stability": "fluid"
   },
   {
     "operation": "NEW",
-    "content": "User's favorite book might be The Hitchhiker's Guide to the Galaxy",
-    "tags": ["preference"],
-    "memory_bank": "Personal",
-    "confidence": 0.6
+    "content": "User is currently debugging the Kubernetes cluster issue",
+    "tags": ["behavior"],
+    "memory_bank": "Work",
+    "confidence": 0.85,
+    "importance": 2,
+    "stability": "transient"
   }
 ]
-```
 
 Analyze the following user message(s) and provide **ONLY** the JSON array output. Double-check your response starts with `[` and ends with `]` and contains **NO** other text whatsoever.""",
             description="System prompt for memory identification",
@@ -7079,22 +7198,26 @@ Analyze the following user message(s) and provide **ONLY** the JSON array output
         memory_relevance_prompt: str = Field(
             default="""You are a memory retrieval assistant. Your task is to determine which memories are relevant to the current context of a conversation.
 
-IMPORTANT: **Do NOT mark general knowledge, trivia, or unrelated facts as relevant.** Only user-specific, persistent information should be rated highly.
+IMPORTANT: Do NOT mark general knowledge, trivia, or unrelated facts as relevant. Only user-specific, persistent information should be rated highly.
 
-Given the current user message and a set of memories, rate each memory's relevance on a scale from 0 to 1, where:
+Given the current user message and a set of candidate memories, rate each memory's relevance on a scale from 0 to 1, where:
 - 0 means completely irrelevant
 - 1 means highly relevant and directly applicable
 
-Consider:
-- Explicit mentions in the user message
-- Implicit connections to the user's personal info, preferences, goals, or relationships
-- Potential usefulness for answering questions **about the user**
-- Recency and importance of the memory
+Consider these signals in order of priority:
+1. Topical relevance to the user's current message
+2. Importance score (5 = core identity, 1 = minor passing mention)
+3. Recency (newer memories are generally more relevant than very old ones)
+4. Stability (stable memories like identity are permanently relevant; transient memories fade faster)
+5. Access frequency (memories referenced often are likely important)
 
 Examples:
-- "User likes coffee" → likely relevant if coffee is mentioned
-- "World War II started in 1939" → **irrelevant trivia, rate near 0**
-- "User's friend is named Sarah" → relevant if friend is mentioned
+- "User likes coffee" + user mentions coffee → highly relevant
+- "User's name is Sarah" + user talks about work project → may be irrelevant
+- "User is debugging Kubernetes" + user mentions containers → highly relevant
+- "World War II started in 1939" → irrelevant trivia, rate near 0 regardless of metadata
+- A stable/importance-5 identity memory from 2 years ago → still fully relevant
+- A transient/importance-2 memory from 200 days ago → likely less relevant
 
 Return your analysis as a JSON array with each memory's content, ID, and relevance score.
 Example: [{"memory": "User likes coffee", "id": "123", "relevance": 0.8}]
