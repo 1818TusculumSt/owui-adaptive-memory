@@ -931,6 +931,26 @@ class TestMultiSignalMemory(unittest.TestCase):
         )
         self.assertEqual(ops, [])
 
+    def test_quality_gate_case_insensitive_operation(self):
+        """The quality gate must catch general knowledge even when the LLM returns lowercase 'new'."""
+        pipeline = make_pipeline(
+            enable_extraction_quality_gate=True,
+            enable_short_preference_shortcut=False,
+        )
+
+        async def fake_llm(system_prompt, user_prompt):
+            return json.dumps([
+                {"operation": "new", "content": "The Earth is round", "tags": ["identity"], "memory_bank": "General", "confidence": 0.9, "importance": 1, "stability": "stable"},
+                {"operation": "New", "content": "Water boils at 100C", "tags": ["identity"], "memory_bank": "General", "confidence": 0.9, "importance": 1, "stability": "stable"},
+                {"operation": "NEW", "content": "User is a data scientist", "tags": ["identity"], "memory_bank": "Work", "confidence": 0.95, "importance": 5, "stability": "stable"},
+            ])
+
+        ops = asyncio.run(
+            pipeline.identify_memories("test", query_llm_func=fake_llm)
+        )
+        self.assertEqual(len(ops), 1)
+        self.assertIn("data scientist", ops[0]["content"])
+
     def test_quality_gate_catches_fallback_shortcut(self):
         """If the LLM returns [] but the shortcut triggers, the quality gate must still catch general knowledge."""
         pipeline = make_pipeline(

@@ -242,6 +242,19 @@ SUPPORTED_MEMORY_TAGS = {
     "possession",
     "summary",
 }
+
+GENERAL_KNOWLEDGE_MARKERS = (
+    "world war", "united nations", "the capital of",
+    "water boils", "the speed of light", "shakespeare",
+    "the earth is", "dna stands for",
+)
+
+TRANSIENT_MARKERS = (
+    "today i", "right now i", "at the moment", "this morning",
+    "currently working on", "just finished", "about to",
+    "going to", "gonna", "i'm about to",
+)
+
 MEMORY_STORAGE_PATTERN = re.compile(
     r"^\[Tags:\s*(?P<tags>[^\]]*)\]\s*(?P<content>.*?)\s*\[Memory Bank:\s*(?P<memory_bank>[^\]]+)\]\s*\[Confidence:\s*(?P<confidence>[^\]]+)\]"
     r"(?:\s*\[Importance:\s*(?P<importance>[^\]]*)\])?"
@@ -4419,19 +4432,9 @@ class MemoryPipeline:
             return operations
 
         filtered = []
-        general_knowledge_markers = [
-            "world war", "united nations", "the capital of",
-            "water boils", "the speed of light", "shakespeare",
-            "the earth is", "dna stands for",
-        ]
-        transient_markers = [
-            "today i", "right now i", "at the moment", "this morning",
-            "currently working on", "just finished", "about to",
-            "going to", "gonna", "i'm about to",
-        ]
 
         for op in operations:
-            if op.get("operation") != "NEW":
+            if str(op.get("operation", "")).upper().strip() != "NEW":
                 filtered.append(op)
                 continue
 
@@ -4441,14 +4444,14 @@ class MemoryPipeline:
 
             lowered = content.lower()
 
-            if any(marker in lowered for marker in general_knowledge_markers):
+            if any(marker in lowered for marker in GENERAL_KNOWLEDGE_MARKERS):
                 logger.info(
                     "memory_extraction_quality_rejected %s",
                     safe_log_context(reason="general_knowledge", content_chars=len(content)),
                 )
                 continue
 
-            if any(marker in lowered for marker in transient_markers):
+            if any(marker in lowered for marker in TRANSIENT_MARKERS):
                 if op.get("importance", 3) > 2:
                     op["importance"] = max(1, op.get("importance", 3) - 2)
                 op["stability"] = "transient"
@@ -8371,13 +8374,8 @@ Your output must be valid JSON only. No additional text.""",
                 return False
 
             if getattr(self.valves, "enable_extraction_quality_gate", True):
-                general_knowledge_markers = [
-                    "world war", "united nations", "the capital of",
-                    "water boils", "the speed of light", "shakespeare",
-                    "the earth is", "dna stands for",
-                ]
                 lowered = content.lower()
-                if any(marker in lowered for marker in general_knowledge_markers):
+                if any(marker in lowered for marker in GENERAL_KNOWLEDGE_MARKERS):
                     status = "❌ That looks like general knowledge, not a personal memory. Skipped."
                     status_dict = {"type": "status", "data": {"description": status, "done": True}}
                     if __event_emitter__:
