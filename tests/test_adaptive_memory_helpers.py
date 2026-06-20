@@ -625,6 +625,127 @@ class TestMultiSignalMemory(unittest.TestCase):
         )
         self.assertEqual(len(result), 1)
 
+    def test_contradiction_detection(self):
+        pipeline = make_pipeline()
+
+        async def fake_llm(system_prompt, user_prompt):
+            return json.dumps({"contradicts": True, "reason": "preference changed"})
+
+        contradicts, reason = asyncio.run(
+            pipeline._check_contradiction(
+                "I now prefer dark mode",
+                "User prefers light mode",
+                "mem-1",
+                query_llm_func=fake_llm,
+            )
+        )
+        self.assertTrue(contradicts)
+        self.assertEqual(reason, "preference changed")
+
+    def test_contradiction_non_contradiction(self):
+        pipeline = make_pipeline()
+
+        async def fake_llm(system_prompt, user_prompt):
+            return json.dumps({"contradicts": False, "reason": ""})
+
+        contradicts, reason = asyncio.run(
+            pipeline._check_contradiction(
+                "I also like tea",
+                "User likes coffee",
+                "mem-2",
+                query_llm_func=fake_llm,
+            )
+        )
+        self.assertFalse(contradicts)
+
+    def test_contradiction_no_llm_func(self):
+        pipeline = make_pipeline()
+        contradicts, reason = asyncio.run(
+            pipeline._check_contradiction(
+                "I prefer dark mode",
+                "User prefers light mode",
+                "mem-3",
+                query_llm_func=None,
+            )
+        )
+        self.assertFalse(contradicts)
+
+    def test_is_duplicate_returns_3tuple(self):
+        pipeline = make_pipeline(use_embeddings_for_deduplication=False)
+        result = asyncio.run(
+            pipeline._is_duplicate(
+                "User likes Python",
+                "user-a",
+                all_memories_override=[],
+            )
+        )
+        self.assertEqual(len(result), 3)
+        is_dupe, emb, near_match = result
+        self.assertFalse(is_dupe)
+        self.assertIsNone(emb)
+        self.assertIsNone(near_match)
+
+    def test_is_duplicate_text_match_returns_3tuple(self):
+        pipeline = make_pipeline(use_embeddings_for_deduplication=False)
+        mem = types.SimpleNamespace(
+            id="m1",
+            content=am.format_memory_content("User likes Python", ["preference"], "Work", 0.9),
+            created_at=datetime.now(timezone.utc),
+        )
+        result = asyncio.run(
+            pipeline._is_duplicate(
+                "User likes Python",
+                "user-a",
+                all_memories_override=[mem],
+            )
+        )
+        self.assertEqual(len(result), 3)
+        self.assertTrue(result[0])
+
+    def test_tiered_decay_pruning(self):
+        pipeline = make_pipeline(
+            pruning_strategy="tiered_decay",
+            max_total_memories=2,
+        )
+        old_transient = types.SimpleNamespace(
+            id="t1",
+            content=am.format_memory_content(
+                "User is debugging today", ["behavior"], "Work", 0.7,
+                importance=1, stability="transient",
+            ),
+            created_at=datetime.now(timezone.utc) - timedelta(days=100),
+        )
+        old_stable = types.SimpleNamespace(
+            id="s1",
+            content=am.format_memory_content(
+                "User is a software engineer", ["identity"], "Work", 0.95,
+                importance=5, stability="stable",
+            ),
+            created_at=datetime.now(timezone.utc) - timedelta(days=100),
+        )
+        recent = types.SimpleNamespace(
+            id="r1",
+            content=am.format_memory_content(
+                "User likes coffee", ["preference"], "Personal", 0.9,
+                importance=3, stability="fluid",
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+        all_mems = [old_transient, old_stable, recent]
+        deleted_ids = []
+
+        async def fake_delete(user_id, memory_id, **kwargs):
+            deleted_ids.append(memory_id)
+            return True
+
+        pipeline._delete_local_memory = fake_delete
+        deleted_count = asyncio.run(
+            pipeline._prune_old_memories("user-a", all_memories_override=all_mems)
+        )
+        self.assertEqual(deleted_count, 1)
+        self.assertIn("t1", deleted_ids)
+        self.assertNotIn("s1", deleted_ids)
+
 
 class TestMemoryPipelineFlow(unittest.TestCase):
     def test_identify_memories_normal_flow(self):

@@ -5337,6 +5337,7 @@ class MemoryPipeline:
         user_id: str,
         skip_deduplication: bool = False,
         user_valves: Any = None,
+        query_llm_func: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
         """Execute valid memory operations (NEW, UPDATE, DELETE)."""
         # Fetch full user object for Router DI (MockRequest)
@@ -5401,7 +5402,7 @@ class MemoryPipeline:
                         and not skip_deduplication
                         and not skip_preference_dedupe
                     ):
-                        is_dupe, dedup_embedding = await self._is_duplicate(
+                        is_dupe, dedup_embedding, near_match = await self._is_duplicate(
                             content,
                             user_id,
                             all_memories_override=all_user_memories,
@@ -5417,6 +5418,32 @@ class MemoryPipeline:
                                 ),
                             )
                             continue
+
+                        if (near_match is not None
+                            and getattr(self.valves, "enable_contradiction_detection", True)
+                            and query_llm_func):
+                            existing_record = self._get_memory_record(near_match)
+                            near_match_id = self._get_memory_id(near_match)
+                            contradicts, reason = await self._check_contradiction(
+                                content,
+                                existing_record.content,
+                                near_match_id,
+                                query_llm_func=query_llm_func,
+                                user_id=user_id,
+                            )
+                            if contradicts:
+                                logger.info(
+                                    "memory_contradiction_detected %s",
+                                    safe_log_context(
+                                        user_id=user_id,
+                                        memory_id=near_match_id,
+                                        operation="UPDATE",
+                                        reason="auto_promoted_from_contradiction",
+                                    ),
+                                )
+                                normalized_op["operation"] = "UPDATE"
+                                normalized_op["id"] = near_match_id
+                                kind = "UPDATE"
 
                     final_content = format_memory_content(
                         content, tags, bank, confidence,
@@ -5632,7 +5659,7 @@ class MemoryPipeline:
                             self.valves.deduplicate_memories
                             and not skip_preference_dedupe
                         ):
-                            is_dupe, new_embedding = await self._is_duplicate(
+                            is_dupe, new_embedding, _ = await self._is_duplicate(
                                 new_content,
                                 user_id,
                                 exclude_id=memory_id,
@@ -5809,25 +5836,76 @@ class MemoryPipeline:
 
         return success_ops
 
-    async def _is_duplicate(self, text: str, user_id: str, exclude_id: Optional[str] = None, all_memories_override: Optional[List[Any]] = None) -> Tuple[bool, Optional[np.ndarray]]:
-        """Check if the given text is a duplicate of existing memories.
-        
+    async def _check_contradiction(
+        self,
+        new_content: str,
+        existing_content: str,
+        existing_memory_id: str,
+        query_llm_func: Callable,
+        user_id: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Check if new_content contradicts existing_content.
+
         Returns:
-            Tuple of (is_duplicate: bool, embedding: Optional[np.ndarray])
+            Tuple of (contradicts: bool, reason: Optional[str])
+        """
+        prompt = (
+            "You are a contradiction detector. Given an existing memory about a user "
+            "and a new statement from the same user, determine if the new statement "
+            "directly contradicts the existing memory.\n\n"
+            "Rules:\n"
+            "- 'I prefer dark mode now' CONTRADICTS 'User prefers light mode'\n"
+            "- 'I moved to New York' CONTRADICTS 'User lives in Chicago'\n"
+            "- 'I also like tea' does NOT contradict 'User likes coffee'\n"
+            "- 'I'm learning Rust' does NOT contradict 'User knows Python'\n"
+            "- Minor rephrasings of the same fact are NOT contradictions\n\n"
+            "Return ONLY a JSON object: {\"contradicts\": true/false, \"reason\": \"...\"}\n"
+            "No other text."
+        )
+        user_prompt = (
+            f"Existing memory: {existing_content}\n"
+            f"New statement: {new_content}"
+        )
+
+        try:
+            response = await query_llm_func(prompt, user_prompt)
+            if response:
+                data = JSONParser.extract_and_parse(response)
+                if isinstance(data, dict) and data.get("contradicts"):
+                    return True, str(data.get("reason", "contradiction detected"))
+        except Exception as e:
+            logger.debug(
+                "contradiction_check_failed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    memory_id=existing_memory_id,
+                    operation="CONTRADICT",
+                    **{"error": summarize_error_for_log(e)},
+                ),
+            )
+
+        return False, None
+
+    async def _is_duplicate(self, text: str, user_id: str, exclude_id: Optional[str] = None, all_memories_override: Optional[List[Any]] = None) -> Tuple[bool, Optional[np.ndarray], Optional[Any]]:
+        """Check if the given text is a duplicate of existing memories.
+
+        Returns:
+            Tuple of (is_duplicate: bool, embedding: Optional[np.ndarray], near_match: Optional[Any])
             The embedding is returned so it can be cached after successful save.
+            near_match is set when a memory is similar enough for contradiction
+            checking but not similar enough to be a duplicate.
         """
         if not text or not self.valves.deduplicate_memories:
-            return False, None
-            
+            return False, None, None
+
         try:
-            # Get all existing memories for the user (or use override for optimization)
             if all_memories_override is not None:
                 all_memories = all_memories_override
             else:
                 all_memories = await get_memories_by_user_id_compat(user_id)
-                
+
             if not all_memories:
-                return False, None
+                return False, None, None
 
             user_obj = await self._get_user_object(user_id)
 
@@ -5846,8 +5924,11 @@ class MemoryPipeline:
                         ),
                     )
                     is_dup = await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
-                    return is_dup, None
-                    
+                    return is_dup, None, None
+
+                near_match_memory = None
+                contradiction_threshold = getattr(self.valves, "contradiction_similarity_threshold", 0.65)
+
                 for memory in all_memories:
                     memory_id = self._get_memory_id(memory)
                     if not memory_id:
@@ -5869,7 +5950,7 @@ class MemoryPipeline:
                                 reason="exact_match",
                             ),
                         )
-                        return True, new_embedding
+                        return True, new_embedding, None
 
                     memory_cache_key = self.embedding_manager.get_memory_cache_key(
                         user_id, memory_id
@@ -5894,7 +5975,7 @@ class MemoryPipeline:
                                 await self.embedding_manager.store_embedding_persistent(
                                     user_id, memory_id, raw_memory_content, existing_embedding
                                 )
-                    
+
                     if existing_embedding is not None:
                         similarity = self._cosine_similarity(new_embedding, existing_embedding)
                         if similarity >= self.valves.embedding_similarity_threshold:
@@ -5908,7 +5989,10 @@ class MemoryPipeline:
                                     similarity=f"{similarity:.3f}",
                                 ),
                             )
-                            return True, new_embedding
+                            return True, new_embedding, None
+                        if (similarity >= contradiction_threshold
+                            and near_match_memory is None):
+                            near_match_memory = memory
                     else:
                         logger.warning(
                             "memory_dedupe_degraded %s",
@@ -5922,17 +6006,17 @@ class MemoryPipeline:
                         )
             else:
                 is_dup = await self._check_text_similarity(text, all_memories, exclude_id=exclude_id)
-                return is_dup, None
-                        
-            return False, new_embedding if self.valves.use_embeddings_for_deduplication else None
-            
+                return is_dup, None, None
+
+            return False, new_embedding if self.valves.use_embeddings_for_deduplication else None, near_match_memory if self.valves.use_embeddings_for_deduplication else None
+
         except Exception as e:
             logger.error(
                 "memory_dedupe_failed %s %s",
                 safe_log_context(user_id=user_id, operation="DEDUPLICATE"),
                 summarize_error_for_log(e),
             )
-            return False, None
+            return False, None, None
 
     async def _check_text_similarity(self, text: str, all_memories: List[Any], exclude_id: str = None) -> bool:
         """Check for text-based similarity using difflib."""
@@ -6048,7 +6132,7 @@ class MemoryPipeline:
 
                     relevance_score = confidence - (age_days * 0.01)
                     scored_memories.append((relevance_score, m))
-                
+
                 # Sort by relevance score (lowest first)
                 sorted_memories = sorted(scored_memories, key=lambda x: x[0])
                 memories_to_delete = [m for _, m in sorted_memories[:num_to_delete]]
@@ -6058,6 +6142,52 @@ class MemoryPipeline:
                         user_id=user_id,
                         operation="PRUNE",
                         strategy="least_relevant",
+                        delete_count=num_to_delete,
+                    ),
+                )
+
+            elif self.valves.pruning_strategy == "tiered_decay":
+                scored_memories = []
+                now = datetime.now(timezone.utc)
+                decay_rates = {
+                    "stable": 0.0,
+                    "fluid": 0.003,
+                    "transient": 0.015,
+                }
+                for m in all_memories:
+                    memory_record = self._get_memory_record(m)
+                    confidence = memory_record.confidence or 1.0
+                    importance = memory_record.importance or 3
+                    stability = memory_record.stability or "fluid"
+                    access_count = memory_record.access_count or 0
+
+                    created_at = self._coerce_created_at(
+                        get_memory_value(m, "created_at")
+                    )
+                    if created_at:
+                        age_days = (now - created_at).days
+                    else:
+                        age_days = 9999
+
+                    decay_rate = decay_rates.get(stability, 0.005)
+                    effective_decay = decay_rate * (1 - (importance - 3) * 0.15)
+
+                    pruning_score = (
+                        confidence
+                        - (age_days * effective_decay)
+                        + (access_count * 0.02)
+                        + (importance * 0.05)
+                    )
+                    scored_memories.append((pruning_score, m))
+
+                sorted_memories = sorted(scored_memories, key=lambda x: x[0])
+                memories_to_delete = [m for _, m in sorted_memories[:num_to_delete]]
+                logger.info(
+                    "memory_prune_strategy_selected %s",
+                    safe_log_context(
+                        user_id=user_id,
+                        operation="PRUNE",
+                        strategy="tiered_decay",
                         delete_count=num_to_delete,
                     ),
                 )
@@ -8118,7 +8248,8 @@ Your output must be valid JSON only. No additional text.""",
             if ops:
                 # Process Operations (Save/Delete)
                 success_ops = await pipeline.process_memory_operations(
-                    ops, user_id, user_valves=user_valves
+                    ops, user_id, user_valves=user_valves,
+                    query_llm_func=self._query_llm,
                 )
                 
             if len(success_ops) > 0:
