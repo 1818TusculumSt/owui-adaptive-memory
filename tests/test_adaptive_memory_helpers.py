@@ -73,6 +73,29 @@ def make_valves(**overrides):
         "summarization_similarity_threshold": 0.7,
         "summarization_min_cluster_size": 2,
         "summarization_max_cluster_size": 8,
+        # Multi-Signal Memory valves (Phase 0-5)
+        "enable_importance_scoring": True,
+        "enable_stability_decay": True,
+        "enable_access_tracking": True,
+        "recency_boost_weight": 0.10,
+        "importance_weight": 0.15,
+        "access_boost_weight": 0.05,
+        "access_update_interval": 5,
+        "enable_contradiction_detection": True,
+        "contradiction_similarity_threshold": 0.65,
+        "enable_conversation_context": True,
+        "enable_neighbor_retrieval": True,
+        "neighbor_hop_similarity": 0.80,
+        "neighbor_penalty": 0.7,
+        "max_neighbors_per_memory": 2,
+        "enable_stale_detection_task": True,
+        "stale_detection_interval": 86400,
+        "stale_threshold_days": 90,
+        "stale_action": "summarize",
+        "enable_memory_acknowledgment": True,
+        "enable_memory_commands": True,
+        "enable_extraction_quality_gate": True,
+        "retrieval_scoring_version": "v5",
     }
     defaults.update(overrides)
     return types.SimpleNamespace(**defaults)
@@ -161,6 +184,131 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(record.tags, ["coding", "python"])
         self.assertEqual(record.memory_bank, "Work")
         self.assertEqual(record.confidence, 0.95)
+
+    def test_parse_stored_memory_new_fields(self):
+        record = am.parse_stored_memory(
+            "[Tags: identity] User is a software engineer "
+            "[Memory Bank: Work] [Confidence: 0.95] "
+            "[Importance: 5] [Stability: stable] "
+            "[LastAccessed: 2025-01-15] [AccessCount: 12]"
+        )
+        self.assertEqual(record.content, "User is a software engineer")
+        self.assertEqual(record.importance, 5)
+        self.assertEqual(record.stability, "stable")
+        self.assertEqual(record.last_accessed, "2025-01-15")
+        self.assertEqual(record.access_count, 12)
+
+    def test_parse_stored_memory_old_format_defaults(self):
+        record = am.parse_stored_memory(
+            "[Tags: coding] I like Python [Memory Bank: Work] [Confidence: 0.95]"
+        )
+        self.assertEqual(record.content, "I like Python")
+        self.assertEqual(record.importance, 3)
+        self.assertEqual(record.stability, "fluid")
+        self.assertIsNone(record.last_accessed)
+        self.assertEqual(record.access_count, 0)
+
+    def test_parse_stored_memory_importance_clamp(self):
+        record = am.parse_stored_memory(
+            "[Tags: x] test [Memory Bank: General] [Confidence: 0.5] [Importance: 99]"
+        )
+        self.assertEqual(record.importance, 5)
+        record_low = am.parse_stored_memory(
+            "[Tags: x] test [Memory Bank: General] [Confidence: 0.5] [Importance: 0]"
+        )
+        self.assertEqual(record_low.importance, 1)
+
+    def test_parse_stored_memory_invalid_stability_defaults(self):
+        for bad in ("unknown", "", "STABLE", "Fluid"):
+            record = am.parse_stored_memory(
+                f"[Tags: x] test [Memory Bank: General] [Confidence: 0.5] [Stability: {bad}]"
+            )
+            expected = "stable" if bad.lower() == "stable" else "fluid"
+            if bad.lower() in ("stable", "fluid"):
+                expected = bad.lower()
+            self.assertEqual(record.stability, expected, f"Failed for stability='{bad}'")
+
+    def test_format_memory_content_new_fields(self):
+        result = am.format_memory_content(
+            "User likes coffee", ["preference"], "Personal", 0.9,
+            importance=4, stability="fluid",
+            last_accessed="2025-06-20", access_count=3,
+        )
+        self.assertIn("[Importance: 4]", result)
+        self.assertIn("[Stability: fluid]", result)
+        self.assertIn("[LastAccessed: 2025-06-20]", result)
+        self.assertIn("[AccessCount: 3]", result)
+
+    def test_format_memory_content_backward_compat(self):
+        result = am.format_memory_content(
+            "User likes coffee", ["preference"], "Personal", 0.9
+        )
+        self.assertNotIn("[Importance:", result)
+        self.assertNotIn("[Stability:", result)
+        self.assertNotIn("[LastAccessed:", result)
+        self.assertNotIn("[AccessCount:", result)
+        self.assertEqual(
+            result,
+            "[Tags: preference] User likes coffee [Memory Bank: Personal] [Confidence: 0.90]",
+        )
+
+    def test_format_memory_content_importance_clamp(self):
+        result = am.format_memory_content(
+            "test", ["x"], "General", 0.5, importance=99
+        )
+        self.assertIn("[Importance: 5]", result)
+        result_low = am.format_memory_content(
+            "test", ["x"], "General", 0.5, importance=-3
+        )
+        self.assertIn("[Importance: 1]", result_low)
+
+    def test_format_memory_content_access_count_zero_omitted(self):
+        result = am.format_memory_content(
+            "test", ["x"], "General", 0.5, access_count=0
+        )
+        self.assertNotIn("[AccessCount:", result)
+
+    def test_roundtrip_format_parse(self):
+        original = am.format_memory_content(
+            "User is a software engineer",
+            ["identity", "behavior"],
+            "Work",
+            0.95,
+            importance=5,
+            stability="stable",
+            last_accessed="2025-01-15",
+            access_count=12,
+        )
+        record = am.parse_stored_memory(original)
+        self.assertEqual(record.content, "User is a software engineer")
+        self.assertEqual(record.tags, ["identity", "behavior"])
+        self.assertEqual(record.memory_bank, "Work")
+        self.assertEqual(record.confidence, 0.95)
+        self.assertEqual(record.importance, 5)
+        self.assertEqual(record.stability, "stable")
+        self.assertEqual(record.last_accessed, "2025-01-15")
+        self.assertEqual(record.access_count, 12)
+
+    def test_migrate_memory_to_new_format_old(self):
+        old = "[Tags: coding] I like Python [Memory Bank: Work] [Confidence: 0.95]"
+        migrated = am.migrate_memory_to_new_format(old)
+        record = am.parse_stored_memory(migrated)
+        self.assertEqual(record.content, "I like Python")
+        self.assertEqual(record.importance, 3)
+        self.assertEqual(record.stability, "fluid")
+        self.assertIn("[Importance: 3]", migrated)
+        self.assertIn("[Stability: fluid]", migrated)
+
+    def test_migrate_memory_to_new_format_already_new(self):
+        new = (
+            "[Tags: identity] User is a software engineer "
+            "[Memory Bank: Work] [Confidence: 0.95] "
+            "[Importance: 5] [Stability: stable]"
+        )
+        migrated = am.migrate_memory_to_new_format(new)
+        record = am.parse_stored_memory(migrated)
+        self.assertEqual(record.importance, 5)
+        self.assertEqual(record.stability, "stable")
 
     def test_secret_value_unwraps_secretstr(self):
         self.assertEqual(am.secret_value(MockSecretStr("abc123")), "abc123")

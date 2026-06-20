@@ -243,7 +243,12 @@ SUPPORTED_MEMORY_TAGS = {
     "summary",
 }
 MEMORY_STORAGE_PATTERN = re.compile(
-    r"^\[Tags:\s*(?P<tags>[^\]]*)\]\s*(?P<content>.*?)\s*\[Memory Bank:\s*(?P<memory_bank>[^\]]+)\]\s*\[Confidence:\s*(?P<confidence>[^\]]+)\]\s*$",
+    r"^\[Tags:\s*(?P<tags>[^\]]*)\]\s*(?P<content>.*?)\s*\[Memory Bank:\s*(?P<memory_bank>[^\]]+)\]\s*\[Confidence:\s*(?P<confidence>[^\]]+)\]"
+    r"(?:\s*\[Importance:\s*(?P<importance>[^\]]*)\])?"
+    r"(?:\s*\[Stability:\s*(?P<stability>[^\]]*)\])?"
+    r"(?:\s*\[LastAccessed:\s*(?P<last_accessed>[^\]]*)\])?"
+    r"(?:\s*\[AccessCount:\s*(?P<access_count>[^\]]*)\])?"
+    r"\s*$",
     re.DOTALL,
 )
 SENSITIVE_MEMORY_PATTERNS = [
@@ -361,6 +366,10 @@ class StoredMemoryRecord:
     tags: List[str] = field(default_factory=list)
     memory_bank: str = "General"
     confidence: Optional[float] = None
+    importance: int = 3
+    stability: str = "fluid"
+    last_accessed: Optional[str] = None
+    access_count: int = 0
 
 
 def normalize_memory_id(memory_id: Any) -> str:
@@ -621,11 +630,45 @@ def parse_stored_memory(memory_text: Any) -> StoredMemoryRecord:
     except (TypeError, ValueError):
         confidence = None
 
+    importance = 3
+    importance_raw = match.group("importance")
+    if importance_raw:
+        try:
+            importance = max(1, min(5, int(importance_raw.strip())))
+        except (TypeError, ValueError):
+            pass
+
+    stability = "fluid"
+    stability_raw = match.group("stability")
+    if stability_raw:
+        stability_clean = stability_raw.strip().lower()
+        if stability_clean in ("stable", "fluid", "transient"):
+            stability = stability_clean
+
+    last_accessed = None
+    la_raw = match.group("last_accessed")
+    if la_raw:
+        la_clean = la_raw.strip()
+        if la_clean:
+            last_accessed = la_clean
+
+    access_count = 0
+    ac_raw = match.group("access_count")
+    if ac_raw:
+        try:
+            access_count = int(ac_raw.strip())
+        except (TypeError, ValueError):
+            pass
+
     return StoredMemoryRecord(
         content=match.group("content").strip(),
         tags=tags,
         memory_bank=match.group("memory_bank").strip() or "General",
         confidence=confidence,
+        importance=importance,
+        stability=stability,
+        last_accessed=last_accessed,
+        access_count=access_count,
     )
 
 
@@ -634,14 +677,48 @@ def format_memory_content(
     tags: List[str],
     memory_bank: str,
     confidence: Optional[float],
+    importance: Optional[int] = None,
+    stability: Optional[str] = None,
+    last_accessed: Optional[str] = None,
+    access_count: Optional[int] = None,
 ) -> str:
     cleaned_content = re.sub(r"\s+", " ", str(content or "")).strip()
     cleaned_tags = [str(tag).strip().lower() for tag in tags if str(tag).strip()]
     tags_str = ", ".join(cleaned_tags) if cleaned_tags else "none"
     safe_confidence = 1.0 if confidence is None else float(confidence)
-    return (
+    base = (
         f"[Tags: {tags_str}] {cleaned_content} "
         f"[Memory Bank: {memory_bank}] [Confidence: {safe_confidence:.2f}]"
+    )
+    extra_parts: List[str] = []
+    if importance is not None:
+        extra_parts.append(f"[Importance: {max(1, min(5, int(importance)))}]")
+    if stability:
+        extra_parts.append(f"[Stability: {stability}]")
+    if last_accessed:
+        extra_parts.append(f"[LastAccessed: {last_accessed}]")
+    if access_count is not None and int(access_count) > 0:
+        extra_parts.append(f"[AccessCount: {int(access_count)}]")
+    if extra_parts:
+        return base + " " + " ".join(extra_parts)
+    return base
+
+
+def migrate_memory_to_new_format(memory_text: str) -> str:
+    """Ensure a memory string has all new-format fields with sensible defaults.
+    If the memory is already in new format, returns unchanged.
+    If in old format, appends default importance/stability/access fields.
+    """
+    record = parse_stored_memory(memory_text)
+    return format_memory_content(
+        content=record.content,
+        tags=record.tags,
+        memory_bank=record.memory_bank,
+        confidence=record.confidence,
+        importance=record.importance,
+        stability=record.stability,
+        last_accessed=record.last_accessed,
+        access_count=record.access_count,
     )
 
 
@@ -6692,9 +6769,9 @@ Analyze the following related memories and provide a concise summary.""",
             default=200,
             description="Maximum number of memories per user; prune oldest beyond this",
         )
-        pruning_strategy: Literal["fifo", "least_relevant"] = Field(
+        pruning_strategy: Literal["fifo", "least_relevant", "tiered_decay"] = Field(
             default="fifo",
-            description="Strategy for pruning memories when max_total_memories is exceeded: 'fifo' (oldest first) or 'least_relevant' (lowest relevance to current message first).",
+            description="Strategy for pruning memories when max_total_memories is exceeded: 'fifo' (oldest first), 'least_relevant' (lowest relevance to current message first), or 'tiered_decay' (stability/importance-aware decay).",
         )
         min_memory_length: int = Field(
             default=8,
@@ -6830,6 +6907,96 @@ Analyze the following related memories and provide a concise summary.""",
         )
         retry_delay: float = Field(
             default=1.0, description="Delay between retries (seconds)"
+        )
+
+        # Multi-Signal Memory (Phase 0-5)
+        enable_importance_scoring: bool = Field(
+            default=True,
+            description="Enable importance scoring (1-5) during memory extraction.",
+        )
+        enable_stability_decay: bool = Field(
+            default=True,
+            description="Enable stability-based differential decay for relevance and pruning.",
+        )
+        enable_access_tracking: bool = Field(
+            default=True,
+            description="Enable tracking of memory access counts and last-accessed timestamps.",
+        )
+        recency_boost_weight: float = Field(
+            default=0.10,
+            description="Weight applied to recency boost in relevance scoring (0-1). Higher = recency matters more.",
+        )
+        importance_weight: float = Field(
+            default=0.15,
+            description="Weight applied to importance in relevance scoring (0-1). Higher = importance matters more.",
+        )
+        access_boost_weight: float = Field(
+            default=0.05,
+            description="Weight applied to access count in relevance scoring (0-1).",
+        )
+        access_update_interval: int = Field(
+            default=5,
+            description="Only persist access stat updates every N retrievals per memory (reduces DB writes).",
+        )
+        enable_contradiction_detection: bool = Field(
+            default=True,
+            description="Detect contradictions between new and existing memories and auto-promote NEW to UPDATE when found.",
+        )
+        contradiction_similarity_threshold: float = Field(
+            default=0.65,
+            description="Cosine similarity threshold below which contradiction check is skipped (too dissimilar to contradict).",
+        )
+        enable_conversation_context: bool = Field(
+            default=True,
+            description="Include a brief conversation context summary in the extraction prompt to improve memory extraction quality.",
+        )
+        enable_neighbor_retrieval: bool = Field(
+            default=True,
+            description="When a memory is selected, pull in semantically adjacent memories even if they didn't match the query directly.",
+        )
+        neighbor_hop_similarity: float = Field(
+            default=0.80,
+            description="Cosine similarity threshold for a memory to be considered a neighbor of a selected memory.",
+        )
+        neighbor_penalty: float = Field(
+            default=0.7,
+            description="Multiplier applied to a neighbor's score (0-1). Lower = neighbors ranked lower.",
+        )
+        max_neighbors_per_memory: int = Field(
+            default=2,
+            description="Maximum neighbor memories to pull in per selected memory.",
+        )
+        enable_stale_detection_task: bool = Field(
+            default=True,
+            description="Enable background task that detects stale, low-importance memories for cleanup.",
+        )
+        stale_detection_interval: int = Field(
+            default=86400,
+            description="Interval in seconds between stale memory detection runs.",
+        )
+        stale_threshold_days: int = Field(
+            default=90,
+            description="Days since last access before a memory is considered stale.",
+        )
+        stale_action: Literal["log", "summarize", "delete"] = Field(
+            default="summarize",
+            description="Action to take on stale memories: 'log' (report only), 'summarize' (mark for summarization), or 'delete' (remove).",
+        )
+        enable_memory_acknowledgment: bool = Field(
+            default=True,
+            description="Instruct the LLM to naturally acknowledge relevant memories in its responses.",
+        )
+        enable_memory_commands: bool = Field(
+            default=True,
+            description="Enable /memories, /forget, and /remember slash commands.",
+        )
+        enable_extraction_quality_gate: bool = Field(
+            default=True,
+            description="Run a rule-based quality filter on extracted memories before saving.",
+        )
+        retrieval_scoring_version: str = Field(
+            default="v5",
+            description="Scoring algorithm version. 'v4' = original vector-only, 'v5' = multi-signal with recency/importance/access.",
         )
 
         # Prompts

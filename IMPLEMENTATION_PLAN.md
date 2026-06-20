@@ -20,6 +20,178 @@ This plan adds all six dimensions, feeding them into a unified multi-signal rele
 
 ---
 
+## Critical Corrections (Verified Against Source)
+
+> These corrections were discovered by auditing the 8277-line source file. They fix bugs that would cause **runtime crashes**, **unusable performance**, or **implementation confusion**. Apply these over the original plan text where applicable.
+
+### C1: `MEMORY_STORAGE_PATTERN` is at line 245, NOT ~570-600
+
+The plan says "find its definition, likely near line ~570-600." It is actually at **line 245**. The consuming `parse_stored_memory()` is at line 598. Any edits targeting "570-600" would land in the wrong place entirely.
+
+### C2: `MemoryPipeline` does NOT have `_query_llm()` — contradiction detection architecture is broken
+
+`_query_llm()` lives on `Filter` (line 7516). `MemoryPipeline` (line 3618) has no reference to it. The plan puts `_check_contradiction()` on `MemoryPipeline` and calls `self._query_llm()` — **this will crash with AttributeError**.
+
+**Fix:** Add a `query_llm_func: Optional[Callable] = None` parameter to `process_memory_operations()` (same pattern as `identify_memories()` and `get_relevant_memories()`). Thread it through to `_check_contradiction()`. In `outlet()` (line 7830), pass `query_llm_func=self._query_llm` when calling `process_memory_operations()`.
+
+```python
+# process_memory_operations() — updated signature:
+async def process_memory_operations(
+    self,
+    operations: List[Dict[str, Any]],
+    user_id: str,
+    skip_deduplication: bool = False,
+    user_valves: Any = None,
+    query_llm_func: Optional[Callable] = None,  # NEW
+) -> List[Dict[str, Any]]:
+
+# _check_contradiction() — use the passed func, not self._query_llm:
+response = await query_llm_func(prompt, user_prompt)
+
+# outlet() call site (line 7830) — pass the LLM func:
+success_ops = await pipeline.process_memory_operations(
+    ops, user_id, user_valves=user_valves,
+    query_llm_func=self._query_llm,  # NEW
+)
+```
+
+### C3: `_session_contexts` is on `Filter` but accessed in `identify_memories()` which is on `MemoryPipeline`
+
+The plan adds `self._session_contexts` to `Filter.__init__` (correct) but then accesses `self._session_contexts` inside `identify_memories()` (line 4394) which is a `MemoryPipeline` method — **this will crash**.
+
+**Fix:** Pass session context as a parameter to `identify_memories()` instead:
+
+```python
+# identify_memories() — add parameter:
+async def identify_memories(
+    self, user_message: str,
+    context_memories: Optional[List[Dict[str, Any]]] = None,
+    query_llm_func: Optional[Callable] = None,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    session_context: str = "",  # NEW — passed from Filter.outlet()
+) -> ...:
+
+# In outlet() — pass the context:
+ops = await pipeline.identify_memories(
+    user_message,
+    context_memories=context_memories,
+    query_llm_func=self._query_llm,
+    user_id=user_id,
+    session_id=session_id,
+    session_context=self._session_contexts.get(session_id, ""),  # NEW
+)
+```
+
+### C4: Neighbor retrieval would compute N×N embeddings — performance disaster
+
+`_find_memory_neighbors()` calls `self.embedding_manager.get_embedding()` for **every memory in the store** for **every selected memory**. With 200 memories and 5 selected, that's up to 1000 embedding API calls per retrieval. **This will make the system unusably slow.**
+
+**Fix:** Reuse the embeddings already computed during the vector search phase. In `get_relevant_memories()`, cache embeddings in a dict as they're computed, then pass that cache to `_find_memory_neighbors()`:
+
+```python
+async def _find_memory_neighbors(
+    self,
+    selected_memory: Any,
+    all_memories: List[Any],
+    user_obj: Any,
+    embedding_cache: Dict[str, np.ndarray],  # NEW — reuse computed embeddings
+    max_neighbors: int = 2,
+) -> List[Tuple[float, Any]]:
+    selected_id = self._get_memory_id(selected_memory)
+    selected_emb = embedding_cache.get(selected_id)
+    if selected_emb is None:
+        selected_emb = await self.embedding_manager.get_embedding(
+            self._get_memory_record(selected_memory).content, user=user_obj
+        )
+        if selected_emb is None:
+            return []
+        embedding_cache[selected_id] = selected_emb
+
+    neighbors = []
+    for other_memory in all_memories:
+        other_id = self._get_memory_id(other_memory)
+        if not other_id or other_id == selected_id:
+            continue
+
+        # Reuse cached embedding if available
+        other_emb = embedding_cache.get(other_id)
+        if other_emb is None:
+            other_content = self._get_memory_record(other_memory).content
+            if not other_content:
+                continue
+            other_emb = await self.embedding_manager.get_embedding(
+                other_content, user=user_obj
+            )
+            if other_emb is None:
+                continue
+            embedding_cache[other_id] = other_emb
+
+        sim = self._cosine_similarity(selected_emb, other_emb)
+        if sim >= self.valves.neighbor_hop_similarity:
+            neighbors.append((sim * self.valves.neighbor_penalty, other_memory))
+
+    neighbors.sort(key=lambda x: x[0], reverse=True)
+    return neighbors[:max_neighbors]
+```
+
+### C5: `_is_duplicate()` has 8 return statements — all must become 3-tuples
+
+The plan says "modify the return signature" but doesn't list all return sites. There are **8 return statements** in `_is_duplicate()` (lines 5645, 5655, 5674, 5697, 5736, 5750, 5752, 5760) and **2 call sites** (lines 5235, 5460). All 8 returns must be updated to `(bool, Optional[np.ndarray], Optional[Any])`.
+
+The 2 call sites must be updated:
+- Line 5235: `is_dupe, dedup_embedding = await self._is_duplicate(...)` → `is_dupe, dedup_embedding, near_match = await self._is_duplicate(...)`
+- Line 5460: `is_dupe, new_embedding = await self._is_duplicate(...)` → `is_dupe, new_embedding, _ = await self._is_duplicate(...)`
+
+### C6: `neighbor_penalty` valve is defined but never used in the plan's code
+
+The plan defines `neighbor_penalty: float = Field(default=0.7)` but the `_find_memory_neighbors()` implementation never applies it. **Fix:** Multiply neighbor similarity by `neighbor_penalty` when scoring (shown in C4 above).
+
+### C7: Stale detection loop only logs — it doesn't actually clean up
+
+`_detect_stale_memories_loop()` detects stale memories and emits a notification, but never deletes or summarizes them. This makes the feature useless. **Fix:** Either (a) auto-summarize stale clusters, or (b) delete low-importance stale memories, or (c) mark them for summarization in the next summarization cycle. Recommended: mark them by appending a `[StaleMark: true]` tag so the summarization loop picks them up.
+
+### C8: `_inlet_emit_status()` signature change must be shown fully
+
+Current signature (line 7491):
+```python
+async def _inlet_emit_status(self, __event_emitter__, user_valves: "Filter.UserValves", count: int) -> None:
+```
+
+The plan's proposed signature uses `**kwargs`-style trailing params but doesn't show the full migration. All call sites of `_inlet_emit_status()` must be found and updated. Search for `self._inlet_emit_status(` to find them.
+
+### C9: Feature flag overlap — `enable_stability_decay` vs `retrieval_scoring_version`
+
+The plan has two overlapping gates on `_apply_multi_signal_boost()`:
+- `enable_stability_decay` (Phase 0) — gates the entire boost method
+- `retrieval_scoring_version` (Phase 5B) — gates whether to call the boost method
+
+**Fix:** `retrieval_scoring_version="v4"` should be the master switch. `enable_stability_decay` should gate only the decay calculation within the boost, not the entire method. This way:
+- `v4` = no boost at all (original behavior)
+- `v5` + `enable_stability_decay=False` = boost with recency/importance/access but no stability-based differential decay
+- `v5` + `enable_stability_decay=True` = full multi-signal boost with stability-weighted decay
+
+### C10: `migrate_memory_to_new_format()` is defined but never called
+
+The plan defines this helper but never specifies where to invoke it. **Fix:** Call it lazily — in `_get_memory_record()`, if parsing yields default importance/stability (indicating old format), optionally migrate. Or better: call it in `_update_memory_access_stats()` and `process_memory_operations()` when touching old memories, so migration happens naturally over time without a bulk migration script.
+
+### C11: Boost weights are too aggressive — 50% non-vector
+
+The plan's weights: `w_recency=0.15`, `w_importance=0.25`, `w_access=0.10` sum to 0.50, meaning vector similarity contributes only 50% of the final score. This could surface low-relevance but important/recent memories.
+
+**Fix:** Reduce to `w_recency=0.10`, `w_importance=0.15`, `w_access=0.05` (sum=0.30, vector=0.70). This keeps vector similarity dominant while still boosting on metadata. Update the default valves accordingly.
+
+### C12: Test framework is `unittest`, not pytest — test strategy must match
+
+The existing tests use `unittest.TestCase` with `asyncio.run()`, not pytest fixtures. The test helper functions are `make_valves()`, `make_pipeline()`, `FakeEmbeddingManager` in `tests/test_adaptive_memory_helpers.py`. New tests must follow this pattern. The `make_valves()` helper must be extended with defaults for all new valves.
+
+### C13: `process_memory_operations()` is called from two sites, not just `outlet()`
+
+- Line 7830: `outlet()` → `pipeline.process_memory_operations(ops, user_id, user_valves=user_valves)` — needs `query_llm_func=self._query_llm`
+- Line 6246: Inside `MemoryPipeline` itself → `self.process_memory_operations([op], user_id, skip_deduplication=True)` — internal call for UPDATE auto-promotion; may or may not need `query_llm_func` depending on whether contradiction detection runs in that path
+
+---
+
 ## Phase 0: Extended Storage Layer
 
 ### Why first
@@ -56,9 +228,9 @@ class StoredMemoryRecord:
     access_count: int = 0
 ```
 
-#### 0.2: Extend `MEMORY_STORAGE_PATTERN` (find its definition, likely near line ~570-600)
+#### 0.2: Extend `MEMORY_STORAGE_PATTERN` (line 245 — NOT 570-600)
 
-The current regex pattern must be extended to optionally match the new fields. Locate the pattern and add:
+The current regex pattern must be extended to optionally match the new fields. The pattern is at **line 245** (verified):
 
 ```python
 MEMORY_STORAGE_PATTERN = re.compile(
@@ -181,11 +353,11 @@ enable_access_tracking: bool = Field(
     description="Enable tracking of memory access counts and last-accessed timestamps.",
 )
 recency_boost_weight: float = Field(
-    default=0.15,
+    default=0.10,
     description="Weight applied to recency boost in relevance scoring (0-1). Higher = recency matters more.",
 )
 importance_weight: float = Field(
-    default=0.25,
+    default=0.15,
     description="Weight applied to importance in relevance scoring (0-1). Higher = importance matters more.",
 )
 ```
@@ -413,12 +585,15 @@ contradiction_similarity_threshold: float = Field(
 
 #### 1B.2: New method `_check_contradiction()` in `MemoryPipeline`
 
+> **Critical:** `MemoryPipeline` does NOT have `_query_llm()`. The LLM query function must be threaded through as a parameter (see Correction C2).
+
 ```python
 async def _check_contradiction(
     self,
     new_content: str,
     existing_content: str,
     existing_memory_id: str,
+    query_llm_func: Callable,  # NEW — passed from process_memory_operations()
     user_id: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Check if new_content contradicts existing_content.
@@ -445,7 +620,7 @@ async def _check_contradiction(
     )
     
     try:
-        response = await self._query_llm(prompt, user_prompt)
+        response = await query_llm_func(prompt, user_prompt)  # NOT self._query_llm
         if response:
             data = JSONParser.extract_and_parse(response)
             if isinstance(data, dict) and data.get("contradicts"):
@@ -456,7 +631,9 @@ async def _check_contradiction(
     return False, None
 ```
 
-#### 1B.3: Modify `_is_duplicate()` to return near-matches (line ~5637)
+#### 1B.3: Modify `_is_duplicate()` to return near-matches (line 5637)
+
+> **Critical (C5):** There are **8 return statements** in `_is_duplicate()` that must all be updated to 3-tuple `(bool, Optional[np.ndarray], Optional[Any])`. Lines: 5645, 5655, 5674, 5697, 5736, 5750, 5752, 5760. There are **2 call sites** that must be updated: line 5235 and line 5460.
 
 Modify the return signature to include the near-match memory object:
 
@@ -470,17 +647,42 @@ async def _is_duplicate(
     checking but not similar enough to be a duplicate.
     """
     # ... existing dedup logic ...
+    # ALL 8 return statements must be updated, e.g.:
+    #   return False, None        → return False, None, None
+    #   return True, new_embedding → return True, new_embedding, None
     
     # When an embedding match is in the "contradiction zone":
-    if similarity >= self.valves.contradiction_similarity_threshold and similarity < self.valves.embedding_similarity_threshold:
+    if (similarity >= self.valves.contradiction_similarity_threshold
+        and similarity < self.valves.embedding_similarity_threshold):
         near_match = memory  # store for contradiction check
+        return False, new_embedding, near_match
     
-    return is_dupe, embedding, near_match
+    return False, new_embedding, None
 ```
 
-**Important:** All existing callers of `_is_duplicate()` must be updated to accept the new third return value.
+**All 8 return statements and their new forms:**
+
+| Line | Current | New |
+|------|---------|-----|
+| 5645 | `return False, None` | `return False, None, None` |
+| 5655 | `return False, None` | `return False, None, None` |
+| 5674 | `return is_dup, None` | `return is_dup, None, None` |
+| 5697 | `return True, new_embedding` | `return True, new_embedding, None` |
+| 5736 | `return True, new_embedding` | `return True, new_embedding, None` |
+| 5750 | `return is_dup, None` | `return is_dup, None, None` |
+| 5752 | `return False, new_embedding if ... else None` | `return False, (new_embedding if ... else None), None` |
+| 5760 | `return False, None` | `return False, None, None` |
+
+**Call sites to update:**
+
+| Line | Current | New |
+|------|---------|-----|
+| 5235 | `is_dupe, dedup_embedding = await self._is_duplicate(...)` | `is_dupe, dedup_embedding, near_match = await self._is_duplicate(...)` |
+| 5460 | `is_dupe, new_embedding = await self._is_duplicate(...)` | `is_dupe, new_embedding, _ = await self._is_duplicate(...)` |
 
 #### 1B.4: Inject contradiction check in `process_memory_operations()` NEW path
+
+> **Critical:** `process_memory_operations()` must accept `query_llm_func` parameter (see Correction C2). Update the signature at line 5167 to add `query_llm_func: Optional[Callable] = None`.
 
 After dedup check, before save:
 
@@ -492,10 +694,13 @@ if self.valves.deduplicate_memories and not skip_deduplication:
         # ... existing skip logic ...
         continue
     
-    if near_match and self.valves.enable_contradiction_detection:
+    if near_match and self.valves.enable_contradiction_detection and query_llm_func:
         existing_content = self._get_memory_record(near_match).content
+        near_match_id = self._get_memory_id(near_match)
         contradicts, reason = await self._check_contradiction(
-            content, existing_content, self._get_memory_id(near_match), user_id
+            content, existing_content, near_match_id,
+            query_llm_func=query_llm_func,  # NEW — thread the LLM func
+            user_id=user_id,
         )
         if contradicts:
             logger.info(
@@ -515,7 +720,10 @@ if self.valves.deduplicate_memories and not skip_deduplication:
 
 #### 1B.5: Update all `_is_duplicate()` call sites
 
-Search the file for `self._is_duplicate(` and update each call to handle the new third return value.
+There are exactly **2 call sites** (verified, see C5):
+
+- **Line 5235** (NEW-operation dedup): `is_dupe, dedup_embedding = await self._is_duplicate(...)` → `is_dupe, dedup_embedding, near_match = await self._is_duplicate(...)`
+- **Line 5460** (UPDATE-operation dedup): `is_dupe, new_embedding = await self._is_duplicate(...)` → `is_dupe, new_embedding, _ = await self._is_duplicate(...)`
 
 ### 1C: Conversation Context in Extraction
 
@@ -536,13 +744,17 @@ Add a dict to the `Filter` class (line ~7140 area, near `self.seen_users`):
 self._session_contexts: Dict[str, str] = {}  # session_id -> 1-sentence context summary
 ```
 
-#### 1C.3: Update `identify_memories()` user prompt (line ~4430)
+#### 1C.3: Update `identify_memories()` user prompt (line 4394)
 
-After building the user prompt, append conversation context if available:
+> **Critical:** `identify_memories()` is on `MemoryPipeline`, which does NOT have `_session_contexts`. Pass it as a parameter from `outlet()` (see Correction C3).
+
+Add `session_context: str = ""` to the method signature, then after building the user prompt:
 
 ```python
+# Add to identify_memories() signature:
+#   session_context: str = "",  # NEW — passed from Filter.outlet()
+
 # After existing context_lines logic:
-session_context = self._session_contexts.get(session_id, "") if session_id else ""
 if session_context and self.valves.enable_conversation_context:
     user_prompt += f"\n\nConversation Context (what this conversation is about): {session_context}"
 ```
@@ -641,6 +853,8 @@ Your output must be valid JSON only. No additional text.
 
 #### 2B.1: New method `_apply_multi_signal_boost()` in `MemoryPipeline`
 
+> **Note:** Weight defaults are `w_recency=0.10`, `w_importance=0.15`, `w_access=0.05` (sum=0.30, vector=0.70). See Correction C11. The `enable_stability_decay` flag gates only the stability-weighted decay calculation, NOT the entire method (see Correction C9).
+
 ```python
 def _apply_multi_signal_boost(
     self,
@@ -652,13 +866,10 @@ def _apply_multi_signal_boost(
     
     Returns a boosted score still in [0, 1] range.
     """
-    if not self.valves.enable_stability_decay:
-        return vector_score
-    
     memory_record = self._get_memory_record(memory)
     created_at = self._coerce_created_at(get_memory_value(memory, "created_at"))
     
-    # Recency boost
+    # Recency boost (stability-weighted decay)
     recency_boost = 0.0
     if created_at:
         age_days = (datetime.now(timezone.utc) - created_at).days
@@ -670,8 +881,11 @@ def _apply_multi_signal_boost(
         stability = memory_record.stability or "fluid"
         importance = memory_record.importance or 3
         decay_rate = decay_rates.get(stability, 0.005)
-        # Importance slows decay: importance=5 halves the decay, importance=1 doubles it
-        effective_decay = decay_rate * (1 - (importance - 3) * 0.15)
+        if self.valves.enable_stability_decay:  # gates only the decay calculation
+            # Importance slows decay: importance=5 halves the decay, importance=1 doubles it
+            effective_decay = decay_rate * (1 - (importance - 3) * 0.15)
+        else:
+            effective_decay = decay_rate  # flat decay, no stability/importance modulation
         recency_boost = max(0, 1 - (age_days * effective_decay))
     
     # Importance boost
@@ -681,10 +895,10 @@ def _apply_multi_signal_boost(
     # Access boost
     access_boost = min(0.2, (memory_record.access_count or 0) * 0.02)
     
-    # Weighted combination
+    # Weighted combination — vector similarity stays dominant (70%)
     w_recency = self.valves.recency_boost_weight
     w_importance = self.valves.importance_weight
-    w_access = 0.10  # fixed small weight
+    w_access = self.valves.access_boost_weight
     
     boosted = (
         vector_score * (1 - w_recency - w_importance - w_access)
@@ -714,7 +928,7 @@ if boosted_sim >= self.valves.vector_similarity_threshold:
 
 ```python
 access_boost_weight: float = Field(
-    default=0.10,
+    default=0.05,
     description="Weight applied to access count in relevance scoring (0-1).",
 )
 access_update_interval: int = Field(
@@ -807,12 +1021,15 @@ max_neighbors_per_memory: int = Field(
 
 #### 2D.2: New method `_find_memory_neighbors()` in `MemoryPipeline`
 
+> **Critical:** The original plan computes N×N embeddings — a performance disaster. This version reuses a cached embedding dict (see Correction C4). Also applies `neighbor_penalty` (Correction C6).
+
 ```python
 async def _find_memory_neighbors(
     self,
     selected_memory: Any,
     all_memories: List[Any],
     user_obj: Any,
+    embedding_cache: Dict[str, np.ndarray],  # NEW — reuse computed embeddings
     max_neighbors: int = 2,
 ) -> List[Tuple[float, Any]]:
     """Find memories semantically adjacent to the selected memory.
@@ -1048,6 +1265,10 @@ stale_threshold_days: int = Field(
     default=90,
     description="Days since last access before a memory is considered stale.",
 )
+stale_action: Literal["log", "summarize", "delete"] = Field(
+    default="summarize",
+    description="Action to take on stale memories: 'log' (report only), 'summarize' (mark for summarization), or 'delete' (remove).",
+)
 ```
 
 #### 3C.2: New background task
@@ -1115,6 +1336,38 @@ async def _detect_stale_memories_loop(self):
                                 stale_count=len(stale_ids),
                             ),
                         )
+                        # Trigger summarization for stale memories
+                        # rather than just logging — see Correction C7
+                        if self.valves.stale_action == "summarize":
+                            # Mark stale memories so cluster_and_summarize prioritizes them
+                            for memory in memories:
+                                if self._get_memory_id(memory) in stale_ids:
+                                    record = self._get_memory_record(memory)
+                                    if "stale" not in (record.tags or []):
+                                        updated = format_memory_content(
+                                            content=record.content,
+                                            tags=(record.tags or []) + ["stale"],
+                                            memory_bank=record.memory_bank,
+                                            confidence=record.confidence,
+                                            importance=record.importance,
+                                            stability=record.stability,
+                                            last_accessed=record.last_accessed,
+                                            access_count=record.access_count,
+                                        )
+                                        mid = self._get_memory_id(memory)
+                                        await update_memory_by_id_and_user_id_compat(
+                                            memory_id=mid, user_id=user_id, content=updated
+                                        )
+                        elif self.valves.stale_action == "delete":
+                            for mid in stale_ids:
+                                await delete_memory_by_id_and_user_id_compat(mid, user_id)
+                            logger.info(
+                                "stale_memories_deleted %s",
+                                safe_log_context(
+                                    user_id=user_id, operation="STALE_DELETE",
+                                    deleted_count=len(stale_ids),
+                                ),
+                            )
                         # Emit notification
                         self.notification_queue.append(
                             f"Found {len(stale_ids)} stale memories for cleanup."
@@ -1189,11 +1442,14 @@ enable_memory_acknowledgment: bool = Field(
 
 ### 4B: Richer Status Messages
 
-#### 4B.1: Modify `_inlet_emit_status()` (line ~7491)
+#### 4B.1: Modify `_inlet_emit_status()` (line 7491)
+
+> **Current signature** (verified): `async def _inlet_emit_status(self, __event_emitter__, user_valves: "Filter.UserValves", count: int) -> None:`
 
 ```python
-async def _inlet_emit_status(self, __event_emitter__, user_valves, count, 
-                              high_importance=0, contradictions=0, updates=0):
+async def _inlet_emit_status(self, __event_emitter__, user_valves, count: int,
+                              high_importance: int = 0, contradictions: int = 0,
+                              updates: int = 0) -> None:
     if user_valves.show_status:
         parts = []
         if count > 0:
@@ -1477,8 +1733,8 @@ All new valves to add to the `Valves` class:
 enable_importance_scoring: bool = Field(default=True)
 enable_stability_decay: bool = Field(default=True)
 enable_access_tracking: bool = Field(default=True)
-recency_boost_weight: float = Field(default=0.15)
-importance_weight: float = Field(default=0.25)
+recency_boost_weight: float = Field(default=0.10)   # C11: reduced from 0.15
+importance_weight: float = Field(default=0.15)       # C11: reduced from 0.25
 
 # ── Phase 1B: Contradiction Detection ──
 enable_contradiction_detection: bool = Field(default=True)
@@ -1488,7 +1744,7 @@ contradiction_similarity_threshold: float = Field(default=0.65)
 enable_conversation_context: bool = Field(default=True)
 
 # ── Phase 2C: Access Tracking ──
-access_boost_weight: float = Field(default=0.10)
+access_boost_weight: float = Field(default=0.05)     # C11: reduced from 0.10
 access_update_interval: int = Field(default=5)
 
 # ── Phase 2D: Neighbor Retrieval ──
@@ -1501,6 +1757,7 @@ max_neighbors_per_memory: int = Field(default=2)
 enable_stale_detection_task: bool = Field(default=True)
 stale_detection_interval: int = Field(default=86400)
 stale_threshold_days: int = Field(default=90)
+stale_action: Literal["log", "summarize", "delete"] = Field(default="summarize")  # C7
 
 # ── Phase 4A: Memory Acknowledgment ──
 enable_memory_acknowledgment: bool = Field(default=True)
@@ -1529,66 +1786,103 @@ pruning_strategy: Literal["fifo", "least_relevant", "tiered_decay"] = Field(
 
 ```
 1. Phase 0: Storage Layer         ← BLOCKING DEPENDENCY FOR ALL BELOW
-   ├── 0.1 StoredMemoryRecord extension
-   ├── 0.2 MEMORY_STORAGE_PATTERN update
-   ├── 0.3 parse_stored_memory() update
-   ├── 0.4 format_memory_content() update
-   ├── 0.5 New Valves
-   └── 0.6 Backward compat helper
-   
-2. Phase 1A + 2A + 2B             ← Can be done together, quick wins
-   ├── 1A.1 Rewrite memory_identification_prompt
-   ├── 1A.2 Update _normalize_operation()
-   ├── 1A.3 Update _build_short_preference_operation()
-   ├── 1A.4 Update process_memory_operations() save path
-   ├── 2A.1 Feed metadata to LLM relevance scorer
-   ├── 2A.2 Update memory_relevance_prompt
-   ├── 2B.1 _apply_multi_signal_boost()
-   └── 2B.2 Apply boost in get_relevant_memories()
+   ├── 0.1 StoredMemoryRecord extension (line 359)
+   ├── 0.2 MEMORY_STORAGE_PATTERN update (line 245 — NOT 570)
+   ├── 0.3 parse_stored_memory() update (line 598)
+   ├── 0.4 format_memory_content() update (line 632)
+   ├── 0.5 New Valves (line 6473)
+   └── 0.6 Backward compat helper + lazy migration (C10)
 
-3. Phase 1B: Contradiction Detection
+2. Phase 1A + 2A + 2B             ← Can be done together, quick wins
+   ├── 1A.1 Rewrite memory_identification_prompt (line 6836)
+   ├── 1A.2 Update _normalize_operation() (line 4337)
+   ├── 1A.3 Update _build_short_preference_operation() (line 4375)
+   ├── 1A.4 Update process_memory_operations() save path (line 5221)
+   ├── 2A.1 Feed metadata to LLM relevance scorer (line 4588)
+   ├── 2A.2 Update memory_relevance_prompt (line 6912)
+   ├── 2B.1 _apply_multi_signal_boost() — new method
+   └── 2B.2 Apply boost in get_relevant_memories() (line 4588)
+
+3. Phase 1B: Contradiction Detection  ← Requires query_llm_func threading (C2)
    ├── 1B.1 New Valves
-   ├── 1B.2 _check_contradiction()
-   ├── 1B.3 Modify _is_duplicate() return signature
-   └── 1B.4 Inject in process_memory_operations()
+   ├── 1B.2 _check_contradiction() — takes query_llm_func param, NOT self._query_llm
+   ├── 1B.3 Modify _is_duplicate() — 8 return statements + 2 call sites (C5)
+   ├── 1B.4 Inject in process_memory_operations() — add query_llm_func param
+   ├── 1B.5 Update _is_duplicate() call sites (lines 5235, 5460)
+   └── Update outlet() call (line 7830) — pass query_llm_func=self._query_llm
 
 4. Phase 3A: Tiered Decay
-   ├── 3A.1 New pruning strategy option
-   └── 3A.2 Implement in _prune_old_memories()
+   ├── 3A.1 New pruning strategy option (line 6695)
+   └── 3A.2 Implement in _prune_old_memories() (line 5796)
 
 5. Phase 2C + 2D: Access Tracking + Neighbors
    ├── 2C.1 New Valves
-   ├── 2C.2 Track in _inlet_inject_memories()
-   ├── 2C.3 _update_memory_access_stats()
+   ├── 2C.2 Track in _inlet_inject_memories() (line 7451)
+   ├── 2C.3 _update_memory_access_stats() — new method
    ├── 2D.1 New Valves
-   ├── 2D.2 _find_memory_neighbors()
-   └── 2D.3 Expand get_relevant_memories() final ranking
+   ├── 2D.2 _find_memory_neighbors() — uses embedding_cache (C4), applies neighbor_penalty (C6)
+   └── 2D.3 Expand get_relevant_memories() final ranking — pass embedding_cache
 
 6. Phase 4: Conversation Layer
-   ├── 4A Acknowledgment
-   ├── 4B Richer Status
-   └── 4C Memory Commands
+   ├── 4A Acknowledgment (line 7290)
+   ├── 4B Richer Status (line 7491)
+   └── 4C Memory Commands (line 7622)
 
-7. Phase 1C: Conversation Context
-   ├── Session tracking
-   └── Inject in identify_memories()
+7. Phase 1C: Conversation Context  ← Requires session_context param (C3)
+   ├── Session tracking in Filter.__init__ (line 7132)
+   ├── Add session_context param to identify_memories() (line 4394)
+   └── Pass from outlet() (line 7718)
 
 8. Phase 3B: Smarter Summarization
-   ├── Count trigger
-   ├── Decay-score clustering
+   ├── Count trigger (line 7900)
+   ├── Decay-score clustering (line 5952)
    └── Preserve metadata in summaries
 
-9. Phase 3C: Stale Detection
-   └── Background loop
+9. Phase 3C: Stale Detection  ← Now actually acts on stale memories (C7)
+   ├── Background loop — registers in TaskManager.start_tasks() (line 6347)
+   └── stale_action: log | summarize | delete
 
 10. Phase 5: Quality & Robustness
     ├── 5A Extraction quality gate
-    └── 5B A/B testing scaffolding
+    └── 5B A/B testing scaffolding — v4/v5 master switch (C9)
 ```
 
 ---
 
 ## Testing Strategy
+
+> **Framework:** `unittest` (NOT pytest). Run via `python -m unittest discover -s tests`. Tests use `asyncio.run()` for async, `unittest.TestCase` classes, and shared helpers from `tests/test_adaptive_memory_helpers.py`: `make_valves(**overrides)`, `make_pipeline(**overrides)`, `FakeEmbeddingManager`. The `make_valves()` helper must be extended with defaults for all new valves.
+
+### Test Helpers to Update First
+
+In `tests/test_adaptive_memory_helpers.py`, extend `make_valves()` with all new valve defaults:
+
+```python
+# Add to make_valves() defaults:
+enable_importance_scoring=True,
+enable_stability_decay=True,
+enable_access_tracking=True,
+recency_boost_weight=0.10,
+importance_weight=0.15,
+access_boost_weight=0.05,
+access_update_interval=5,
+enable_contradiction_detection=True,
+contradiction_similarity_threshold=0.65,
+enable_conversation_context=True,
+enable_neighbor_retrieval=True,
+neighbor_hop_similarity=0.80,
+neighbor_penalty=0.7,
+max_neighbors_per_memory=2,
+enable_stale_detection_task=True,
+stale_detection_interval=86400,
+stale_threshold_days=90,
+stale_action="summarize",
+enable_memory_acknowledgment=True,
+enable_memory_commands=True,
+enable_extraction_quality_gate=True,
+retrieval_scoring_version="v5",
+pruning_strategy="fifo",  # keep existing default for backward compat tests
+```
 
 ### Unit Tests to Add
 
@@ -1596,21 +1890,27 @@ pruning_strategy: Literal["fifo", "least_relevant", "tiered_decay"] = Field(
 |---|---|
 | `test_stored_memory_record_new_fields` | New fields parse correctly with defaults |
 | `test_format_memory_content_new_fields` | New fields appear in output string |
+| `test_format_memory_content_backward_compat` | Calling without new kwargs produces old format |
 | `test_old_format_parse` | Old-format memories parse correctly (backward compat) |
 | `test_roundtrip_format_parse` | format → parse returns identical record |
 | `test_importance_clamp` | Importance <1 clamped to 1, >5 to 5 |
 | `test_stability_enum` | Invalid stability values default to "fluid" |
 | `test_multi_signal_boost_stable` | Stable importance-5 memory gets zero decay |
 | `test_multi_signal_boost_transient` | Transient importance-1 memory decays fast |
-| `test_recency_boost_zero` | boost disabled returns original score |
-| `test_contradiction_detection` | Contradictory pair detected |
+| `test_multi_signal_boost_v4_passthrough` | `retrieval_scoring_version="v4"` skips boost |
+| `test_recency_boost_disabled` | `enable_stability_decay=False` uses flat decay |
+| `test_contradiction_detection` | Contradictory pair detected (with fake `query_llm_func`) |
 | `test_contradiction_non_contradiction` | Non-contradictory pair passes |
+| `test_contradiction_no_llm_func` | Missing `query_llm_func` skips contradiction check gracefully |
 | `test_tiered_decay_pruning` | Low-importance transient memories pruned first |
-| `test_neighbor_retrieval` | Neighbor memory included in results |
+| `test_neighbor_retrieval` | Neighbor memory included in results (with embedding cache) |
+| `test_neighbor_retrieval_uses_cache` | Embeddings are reused, not recomputed |
 | `test_access_update_throttle` | Access write only at configured interval |
 | `test_memory_command_memories` | /memories command returns formatted list |
 | `test_memory_command_forget` | /forget keyword deletes matching memory |
+| `test_memory_command_remember` | /remember saves a new memory directly |
 | `test_extraction_quality_gate` | General knowledge filtered, transient downgraded |
+| `test_is_duplicate_3tuple` | `_is_duplicate()` returns 3-tuple at all return paths |
 
 ### Integration Tests
 
@@ -1626,32 +1926,46 @@ pruning_strategy: Literal["fifo", "least_relevant", "tiered_decay"] = Field(
 
 ---
 
-## File Location Quick Reference
+## File Location Quick Reference (Verified)
 
-| Component | Approximate Line | Action |
+| Component | Exact Line | Action |
 |---|---|---|
-| `StoredMemoryRecord` | ~359 | Add fields |
-| `MEMORY_STORAGE_PATTERN` | ~570-600 | Extend regex |
-| `parse_stored_memory()` | ~598 | Parse new fields |
-| `format_memory_content()` | ~632 | Pack new fields |
-| `Valves` class | ~6473 | Add 20+ new valves |
-| `memory_identification_prompt` | ~6836 | Rewrite (importance + stability) |
-| `memory_relevance_prompt` | ~6912 | Rewrite (multi-signal) |
-| `summarization_memory_prompt` | ~6624 | Minor update |
-| `_normalize_operation()` | ~4337 | Accept new fields |
-| `_build_short_preference_operation()` | ~4370 | Default new fields |
-| `identify_memories()` | ~4380 | Add conversation context |
-| `get_relevant_memories()` | ~4588 | Multi-signal boost + neighbors |
-| `_inlet_inject_memories()` | ~7451 | Access tracking |
-| `_format_relevant_memories()` | ~7290 | Acknowledgment instruction |
-| `_prune_old_memories()` | ~5796 | Tiered decay |
-| `cluster_and_summarize()` | ~5860+ | Decay-sort + inherit metadata |
-| `process_memory_operations()` | ~5167 | Pass new fields on save |
-| `_is_duplicate()` | ~5637 | Return near-match for contradiction |
-| `inlet()` | ~7622 | Intercept memory commands |
-| `outlet()` | ~7718 | Track session context, emit richer status |
-| `_summarize_old_memories_loop()` | ~7900 | Count-based trigger |
-| `Filter.__init__` / startup | ~7140 | `_session_contexts` dict, stale task |
+| `MEMORY_STORAGE_PATTERN` | **245** | Extend regex (was incorrectly listed as ~570-600) |
+| `StoredMemoryRecord` | 359 | Add fields |
+| `parse_stored_memory()` | 598 | Parse new fields |
+| `format_memory_content()` | 632 | Pack new fields |
+| `get_memory_value()` | 519 | Module-level helper (used by many new methods) |
+| `truncate_text()` | 648 | Used in memory commands |
+| `_get_memory_id()` | 3637 | Returns memory ID |
+| `_get_memory_record()` | 3640 | Returns parsed StoredMemoryRecord |
+| `_coerce_created_at()` | 4044 | Used in recency boost + stale detection |
+| `_normalize_operation()` | 4337 | Accept new fields |
+| `_build_short_preference_operation()` | 4375 | Default new fields |
+| `identify_memories()` | 4394 | Add `session_context` param (C3) |
+| `get_relevant_memories()` | 4588 | Multi-signal boost + neighbors |
+| `_cosine_similarity()` | 5022 | Used in neighbor retrieval |
+| `process_memory_operations()` | 5167 | Add `query_llm_func` param (C2), pass new fields on save |
+| `_is_duplicate()` | 5637 | Return 3-tuple (C5: 8 return statements, 2 call sites at 5235 & 5460) |
+| `_prune_old_memories()` | 5796 | Tiered decay |
+| `cluster_and_summarize()` | 5952 | Decay-sort + inherit metadata |
+| `Valves` class | 6473 | Add 20+ new valves (nested in `Filter`) |
+| `TaskManager.start_tasks()` | 6347 | Register stale detection task (line ~6376 area) |
+| `summarization_memory_prompt` | 6624 | Minor update |
+| `pruning_strategy` Literal | 6695 | Add `"tiered_decay"` option |
+| `memory_format` valve | 6801 | Already has `["bullet", "paragraph", "numbered"]` |
+| `memory_identification_prompt` | 6836 | Rewrite (importance + stability) |
+| `memory_relevance_prompt` | 6912 | Rewrite (multi-signal) |
+| `Filter.__init__` | 7132 | `_session_contexts` dict |
+| `self.seen_users` | 7145 | Used by stale detection loop |
+| `_format_relevant_memories()` | 7290 | Acknowledgment instruction |
+| `_emit_queued_notifications()` | 7317 | Used by stale detection |
+| `_inlet_inject_memories()` | 7451 | Access tracking |
+| `_inlet_emit_status()` | 7491 | Richer status (4-param → add kwargs) |
+| `_query_llm()` | 7516 | On `Filter` — passed as `query_llm_func` to pipeline |
+| `inlet()` | 7622 | Intercept memory commands |
+| `outlet()` | 7718 | Track session context, emit richer status, pass `query_llm_func` |
+| `outlet()` → `process_memory_operations()` call | 7830 | Add `query_llm_func=self._query_llm` (C2) |
+| `_summarize_old_memories_loop()` | 7900 | Count-based trigger |
 
 ---
 
@@ -1659,11 +1973,38 @@ pruning_strategy: Literal["fifo", "least_relevant", "tiered_decay"] = Field(
 
 - [ ] Old-format memories (without new fields) parse correctly with defaults
 - [ ] `format_memory_content()` called without new kwargs produces old format
-- [ ] `_is_duplicate()` callers handle new 3-tuple return
+- [ ] `_is_duplicate()` all 8 return statements updated to 3-tuple (C5)
+- [ ] `_is_duplicate()` both call sites (lines 5235, 5460) updated to unpack 3 values (C5)
+- [ ] `process_memory_operations()` accepts `query_llm_func=None` (backward compatible) (C2)
+- [ ] `identify_memories()` accepts `session_context=""` (backward compatible) (C3)
+- [ ] `make_valves()` test helper extended with all new valve defaults (C12)
 - [ ] Existing valves keep same defaults; behavior unchanged with new valves off
-- [ ] `retrieval_scoring_version="v4"` disables all new scoring and uses old behavior
-- [ ] All existing tests pass
+- [ ] `retrieval_scoring_version="v4"` disables all new scoring and uses old behavior (C9)
+- [ ] All existing tests pass (`python -m unittest discover -s tests`)
 - [ ] New valves are additive (no renamed or removed valves)
+- [ ] `py_compile` passes for all modified files
+
+---
+
+## Rollback Strategy
+
+Every new feature is gated by a feature flag. To roll back any phase:
+
+| Problem | Flag to flip | Effect |
+|---|---|---|
+| Multi-signal scoring degrades quality | `retrieval_scoring_version="v4"` | Reverts to vector-only scoring |
+| Stability decay too aggressive | `enable_stability_decay=False` | Uses flat decay, no stability/importance modulation |
+| Contradiction detection wrong | `enable_contradiction_detection=False` | NEW ops no longer auto-promote to UPDATE |
+| Neighbor retrieval too slow/noisy | `enable_neighbor_retrieval=False` | No one-hop expansion |
+| Access tracking writes too much | `enable_access_tracking=False` | No access stat persistence |
+| Stale detection unwanted | `enable_stale_detection_task=False` | Background loop stops |
+| Memory commands interfere | `enable_memory_commands=False` | Slash commands pass through to LLM |
+| Extraction quality gate too strict | `enable_extraction_quality_gate=False` | All extracted memories pass through |
+| Memory acknowledgment unwanted | `enable_memory_acknowledgment=False` | No acknowledgment instruction in injection |
+| Conversation context confuses extraction | `enable_conversation_context=False` | No context summary in extraction prompt |
+| Tiered decay pruning wrong | `pruning_strategy="fifo"` | Reverts to oldest-first pruning |
+
+**Full panic rollback:** Set `retrieval_scoring_version="v4"` and `pruning_strategy="fifo"`. This disables all new scoring and pruning behavior while keeping the storage format backward-compatible.
 
 ---
 
