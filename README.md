@@ -1,6 +1,6 @@
 # 🧠 Adaptive Memory for Open WebUI
 
-> Persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, and optional Mem0 mirroring.
+> Persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, multi-signal relevance scoring, contradiction detection, and optional Mem0 mirroring.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -28,17 +28,34 @@
 User message → inlet()
   ├─ Load existing memories
   ├─ Reconcile Mem0 (if enabled)
-  ├─ Select relevant memories via embeddings + optional LLM scoring
-  └─ Inject context into system prompt
+  ├─ Select relevant memories via vector search + multi-signal boost (v5)
+  │   ├─ Recency/importance/access weight boost
+  │   └─ One-hop neighbor retrieval (semantically adjacent memories)
+  ├─ Track access stats (throttled DB writes)
+  ├─ Inject context into system prompt (+ acknowledgment instruction)
+  └─ Emit rich status (high-importance count)
        ↓
     LLM responds
        ↓
   outlet()
   ├─ Ask configured LLM to propose memory operations (NEW / UPDATE / DELETE)
+  │   └─ LLM now provides importance (1-5) and stability (stable/fluid/transient)
+  ├─ Run extraction quality gate (reject general knowledge, downgrade transient)
   ├─ Gate UPDATE/DELETE against user's current message intent
+  ├─ Check contradiction against near-match memories (auto-promote NEW → UPDATE)
   ├─ Deduplicate, filter secrets, apply quality checks
+  ├─ Update session context summary for next turn
   ├─ Save to Open WebUI, sync vectors, mirror to Mem0 (if configured)
-  └─ Emit status if user valve `show_status` is on
+  └─ Emit status if user valve show_status is on
+
+Background:
+  ├─ Summarization loop → decay-score sorted clusters, metadata inheritance
+  └─ Stale detection loop → mark/summarize/delete old low-importance memories
+
+Slash commands (inlet):
+  ├─ /memories    → list all memories with importance stars
+  ├─ /forget kw   → delete a specific memory by keyword
+  └─ /remember ... → save a new memory directly
 ```
 
 ## ⚙️ Valve Reference
@@ -62,7 +79,7 @@ User message → inlet()
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `recent_messages_n` | `5` | Recent user messages included in the extraction prompt |
-| `memory_identification_prompt` | *(long prompt)* | System prompt for the extraction LLM |
+| `memory_identification_prompt` | *(long prompt)* | System prompt for the extraction LLM — now requires `importance` (1-5) and `stability` (`stable`/`fluid`/`transient`) |
 | `enable_json_stripping` | `True` | Strip markdown fences and extra text from LLM JSON response |
 | `enable_fallback_regex` | `True` | Fallback regex extraction if JSON parsing fails |
 | `enable_short_preference_shortcut` | `True` | Bypass the LLM for short preference statements (e.g. "I like X") |
@@ -87,6 +104,33 @@ User message → inlet()
 | `enable_relationship_memories` | `True` | Allow `relationship` tag memories |
 | `enable_possession_memories` | `True` | Allow `possession` tag memories |
 
+### 🏆 Multi-Signal Memory (Phases 0-5)
+
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `enable_importance_scoring` | `True` | Enable importance scoring (1-5) during memory extraction |
+| `enable_stability_decay` | `True` | Enable stability-based differential decay for relevance and pruning |
+| `enable_access_tracking` | `True` | Track memory access counts and last-accessed timestamps |
+| `recency_boost_weight` | `0.10` | Weight for recency in relevance scoring (vector similarity is ~70%) |
+| `importance_weight` | `0.15` | Weight for importance in relevance scoring |
+| `access_boost_weight` | `0.05` | Weight for access frequency in relevance scoring |
+| `access_update_interval` | `5` | Only persist access stat updates every N retrievals per memory |
+| `enable_contradiction_detection` | `True` | Detect contradictions between new and existing memories; auto-promote NEW to UPDATE |
+| `contradiction_similarity_threshold` | `0.65` | Min cosine similarity before contradiction check is attempted |
+| `enable_conversation_context` | `True` | Include a brief conversation context summary in the extraction prompt |
+| `enable_neighbor_retrieval` | `True` | Pull in semantically adjacent memories even if they didn't match the query directly |
+| `neighbor_hop_similarity` | `0.80` | Cosine similarity threshold for a memory to be considered a neighbor |
+| `neighbor_penalty` | `0.7` | Score multiplier (0-1) applied to neighbor memories |
+| `max_neighbors_per_memory` | `2` | Max neighbor memories to pull in per selected memory |
+| `enable_stale_detection_task` | `True` | Background task that detects stale, low-importance memories |
+| `stale_detection_interval` | `86400` | Seconds between stale memory detection runs |
+| `stale_threshold_days` | `90` | Days since last access before a memory is considered stale |
+| `stale_action` | `summarize` | Action on stale memories: `log` / `summarize` / `delete` |
+| `enable_memory_acknowledgment` | `True` | Instruct the LLM to naturally acknowledge relevant memories |
+| `enable_memory_commands` | `True` | Enable `/memories`, `/forget`, and `/remember` slash commands |
+| `enable_extraction_quality_gate` | `True` | Run a rule-based quality filter on extracted memories before saving |
+| `retrieval_scoring_version` | `v5` | `v4` = original vector-only, `v5` = multi-signal with recency/importance/access |
+
 ### 🔍 Retrieval & Injection
 
 | Valve | Default | Description |
@@ -97,9 +141,9 @@ User message → inlet()
 | `use_llm_for_relevance` | `True` | Use an additional LLM call for relevance scoring |
 | `top_n_memories` | `5` | Max candidates sent to the LLM relevance scorer |
 | `llm_skip_relevance_threshold` | `0.93` | If all vector scores exceed this, skip the LLM relevance call |
-| `memory_relevance_prompt` | *(prompt)* | System prompt for the relevance-scoring LLM |
+| `memory_relevance_prompt` | *(prompt)* | System prompt for the relevance-scoring LLM — now includes importance/recency/stability/access metadata |
 | `max_injected_memory_length` | `300` | Truncate injected memory text to this length |
-| `memory_format` | `bullet` | `bullet` or `numbered` |
+| `memory_format` | `bullet` | `bullet` / `paragraph` / `numbered` |
 | `show_memories` | `True` | Show memory context in the injected prompt label |
 
 ### 🗂️ Deduplication
@@ -116,7 +160,7 @@ User message → inlet()
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `max_total_memories` | `200` | Maximum memories per user |
-| `pruning_strategy` | `fifo` | `fifo` or `least_relevant` |
+| `pruning_strategy` | `fifo` | `fifo` / `least_relevant` / `tiered_decay` (importance & stability-aware) |
 | `enable_summarization_task` | `True` | Run background memory summarization |
 | `summarization_interval` | `7200` | Seconds between summarization runs |
 | `summarization_strategy` | `hybrid` | `embeddings` / `tags` / `hybrid` clustering |
@@ -158,9 +202,12 @@ User message → inlet()
 
 | Valve | Default | Description |
 |-------|---------|-------------|
+| `enable_summarization_task` | `True` | Run background memory summarization |
+| `enable_stale_detection_task` | `True` | Detect stale, low-importance memories for cleanup |
 | `enable_error_logging_task` | `True` | Periodic error counter snapshots |
-| `error_logging_interval` | `1800` | Seconds between error counter logs |
 | `enable_vector_cleanup_task` | `True` | Clean up orphaned vectors |
+| `stale_detection_interval` | `86400` | Seconds between stale memory detection runs |
+| `error_logging_interval` | `1800` | Seconds between error counter logs |
 | `vector_cleanup_interval` | `7200` | Seconds between vector cleanup runs |
 | `enable_debug_logging` | `False` | Enable DEBUG-level safe breadcrumbs |
 | `debug_error_counter_logs` | `False` | Include error counter snapshots in debug output |
@@ -171,15 +218,87 @@ User message → inlet()
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `True` | Enable memory for this user |
-| `show_status` | `True` | Show memory-saved status message after each response |
+| `show_status` | `True` | Show memory-saved status message after each response (now includes high-importance count) |
 | `mem0_user_id_override` | `""` | Per-user Mem0 user ID |
+
+## 📐 Storage Format
+
+Each memory is stored as a single text field. All metadata is packed and unpacked via regex for backward compatibility:
+
+```
+[Tags: identity, behavior] User is a software engineer [Memory Bank: Work] [Confidence: 0.95]
+```
+
+With multi-signal features enabled, memories include additional fields:
+
+```
+[Tags: identity, behavior] User is a software engineer [Memory Bank: Work] [Confidence: 0.95] [Importance: 5] [Stability: stable] [LastAccessed: 2025-01-15] [AccessCount: 12]
+```
+
+| Field | Range | Description |
+|-------|-------|-------------|
+| `Importance` | 1-5 | 5=core identity, 4=strong preference, 3=moderate, 2=situational, 1=trivia |
+| `Stability` | stable/fluid/transient | `stable`=years, `fluid`=months, `transient`=days/weeks |
+| `LastAccessed` | ISO date | Updated on retrieval (throttled per `access_update_interval`) |
+| `AccessCount` | int | How many times the memory has been retrieved |
+
+> All new fields are optional — old-format memories parse correctly with defaults. The `migrate_memory_to_new_format()` helper lazily upgrades old memories when they're touched.
+
+## 🔍 Relevance Scoring: v4 vs v5
+
+| Aspect | v4 (original) | v5 (multi-signal) |
+|--------|---------------|-------------------|
+| Vector similarity | 100% weight | ~70% weight |
+| Recency (age) | ignored | 10% weight, decay rate modulated by stability class |
+| Importance | ignored | 15% weight |
+| Access frequency | ignored | 5% weight |
+| Decay | uniform | stable=0%, fluid=0.003/day, transient=0.015/day |
+| Importance modulation | none | importance slows decay (5=halved, 1=doubled) |
+
+Set `retrieval_scoring_version="v4"` to revert to original behavior.
+
+## 🔄 Contradiction Detection
+
+When a new memory is similar (but not identical) to an existing one, the system checks for contradiction:
+
+```
+Existing: "User prefers light mode"
+New: "I now prefer dark mode"
+→ Contradiction detected → auto-promoted to UPDATE (replaces old memory)
+
+Existing: "User likes coffee"
+New: "I also like tea"
+→ No contradiction → saved as NEW
+```
+
+The check uses a separate LLM call with a focused contradiction-detection prompt. Controlled by `enable_contradiction_detection` and `contradiction_similarity_threshold`.
+
+## 🗂️ Pruning Strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `fifo` | Removes oldest memories first |
+| `least_relevant` | Scores by `confidence - (age × 0.01)`, removes lowest scores |
+| `tiered_decay` | Scores by `confidence - (age × decay_rate) + (access × 0.02) + (importance × 0.05)`. Stable/important/frequently-accessed memories are preserved; transient/old/rarely-accessed memories are pruned first |
+
+## 💬 Slash Commands
+
+When `enable_memory_commands` is `True`, users can manage memories directly in chat:
+
+| Command | Example | Behavior |
+|---------|---------|----------|
+| `/memories` | `/memories` | Lists up to 20 memories with importance stars, age, and memory bank |
+| `/forget` | `/forget Kubernetes` | Deletes memories matching the keyword |
+| `/remember` | `/remember I prefer dark mode` | Saves a direct memory (skips LLM extraction) |
+
+These commands are intercepted in the inlet pipeline and do not reach the LLM.
 
 ## 🛡️ Mutation Safety
 
 The LLM can propose `NEW`, `UPDATE`, and `DELETE` operations. Destructive operations are gated:
 
 - **🗑️ DELETE** — only allowed when the user's *current message* explicitly asks to forget, delete, remove, or stop remembering
-- **✏️ UPDATE** — only allowed when the user's *current message* explicitly asks to correct, change, replace, or revise
+- **✏️ UPDATE** — only allowed when the user's *current message* explicitly asks to correct, change, replace, or revise, or when contradiction detection auto-promotes
 
 > 🔒 Instructions buried in recalled memory text, quoted text, or prompt-injection attempts are ignored. Ambiguous messages default to no destructive action. This is intentionally conservative.
 
@@ -190,6 +309,7 @@ The LLM can propose `NEW`, `UPDATE`, and `DELETE` operations. Destructive operat
 | 🤫 **Secret filtering** | Blocks API keys, bearer tokens, passwords, private keys, DB URLs with credentials, SSNs, and Luhn-validated credit card numbers before storage. Heuristic, not full DLP. |
 | 🔏 **Safe logging** | All logged identifiers are hashed. Raw user messages, memory contents, prompts, completions, and API keys are never logged. |
 | 🧱 **Memory injection** | Recalled memories are injected as untrusted factual context, not instructions, reducing prompt-injection blast radius. |
+| ✅ **Extraction quality gate** | Rule-based filter rejects general knowledge statements and downgrades transient content before saving. |
 
 ## 📁 Sidecar Files
 
@@ -222,6 +342,8 @@ python -m py_compile adaptive_memory_v4.0.py tests/adaptive_memory_loader.py \
 python -m unittest discover -s tests
 git diff --check
 ```
+
+Current: **109 tests** (up from 70).
 
 ## 📄 License
 
