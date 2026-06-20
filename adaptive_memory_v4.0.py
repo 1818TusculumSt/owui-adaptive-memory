@@ -4705,7 +4705,12 @@ class MemoryPipeline:
                     ops_count=0,
                 ),
             )
-            return [fallback_operation] if fallback_operation else []
+            if fallback_operation:
+                filtered_fb = self._validate_extraction_quality(
+                    [fallback_operation], user_message
+                )
+                return filtered_fb if filtered_fb else []
+            return []
 
         except Exception as e:
             self.error_manager.increment("json_parse_errors")
@@ -4720,7 +4725,10 @@ class MemoryPipeline:
                 summarize_error_for_log(e),
             )
             if fallback_operation:
-                return [fallback_operation]
+                filtered_fallback = self._validate_extraction_quality(
+                    [fallback_operation], user_message
+                )
+                return filtered_fallback if filtered_fallback else []
             self.error_manager.increment("llm_call_errors")
             logger.error(
                 "memory_extraction_failed %s %s",
@@ -8361,6 +8369,20 @@ Your output must be valid JSON only. No additional text.""",
             content = message[len("/remember "):].strip()
             if not content:
                 return False
+
+            if getattr(self.valves, "enable_extraction_quality_gate", True):
+                general_knowledge_markers = [
+                    "world war", "united nations", "the capital of",
+                    "water boils", "the speed of light", "shakespeare",
+                    "the earth is", "dna stands for",
+                ]
+                lowered = content.lower()
+                if any(marker in lowered for marker in general_knowledge_markers):
+                    status = "❌ That looks like general knowledge, not a personal memory. Skipped."
+                    status_dict = {"type": "status", "data": {"description": status, "done": True}}
+                    if __event_emitter__:
+                        await __event_emitter__(status_dict)
+                    return True
 
             final = format_memory_content(
                 content=content,

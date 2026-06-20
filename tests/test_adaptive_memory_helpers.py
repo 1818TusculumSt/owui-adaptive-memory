@@ -931,6 +931,61 @@ class TestMultiSignalMemory(unittest.TestCase):
         )
         self.assertEqual(ops, [])
 
+    def test_quality_gate_catches_fallback_shortcut(self):
+        """If the LLM returns [] but the shortcut triggers, the quality gate must still catch general knowledge."""
+        pipeline = make_pipeline(
+            enable_extraction_quality_gate=True,
+        )
+
+        async def fake_llm(system_prompt, user_prompt):
+            return "[]"
+
+        ops = asyncio.run(
+            pipeline.identify_memories(
+                "I like the speed of light",
+                query_llm_func=fake_llm,
+            )
+        )
+        self.assertEqual(ops, [])
+
+    def test_quality_gate_rejects_remember_command_general_knowledge(self):
+        """The /remember command should also reject general knowledge."""
+        f = am.Filter()
+        f.valves = make_valves(
+            enable_extraction_quality_gate=True,
+            enable_memory_commands=True,
+        )
+
+        async def fake_insert(user_id, content):
+            return types.SimpleNamespace(id="m1", content=content)
+
+        original = am.insert_new_memory_compat
+        am.insert_new_memory_compat = fake_insert
+
+        try:
+            general_pairs = [
+                ("/remember World War II started in 1939", True),
+                ("/remember The Earth is round", True),
+                ("/remember I prefer dark mode", False),
+            ]
+
+            for cmd, should_reject in general_pairs:
+                with self.subTest(cmd=cmd):
+                    statuses = []
+                    async def emitter(d):
+                        statuses.append(d)
+
+                    was_handled = asyncio.run(
+                        f._handle_memory_command(cmd, "u1", emitter, [])
+                    )
+                    self.assertTrue(was_handled)
+                    if should_reject:
+                        self.assertIn("general knowledge", statuses[0]["data"]["description"].lower())
+                    else:
+                        self.assertIn("Saved", statuses[0]["data"]["description"])
+        finally:
+            am.insert_new_memory_compat = original
+
 
 class TestMemoryPipelineFlow(unittest.TestCase):
     def test_identify_memories_normal_flow(self):
