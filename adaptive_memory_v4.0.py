@@ -4883,6 +4883,39 @@ class MemoryPipeline:
             top_memories = self._rank_memories_with_vector_scores(scored_memories)
         
         RETRIEVAL_LATENCY.observe(time.perf_counter() - start_time)
+
+        # Neighbor retrieval: expand with semantically adjacent memories
+        if (getattr(self.valves, "enable_neighbor_retrieval", True)
+            and top_memories
+            and len(top_memories) < self.valves.related_memories_n):
+            embedding_cache: Dict[str, Any] = {}
+            max_neighbors = getattr(self.valves, "max_neighbors_per_memory", 2)
+            final_memories = []
+            seen_ids = set()
+
+            for memory in top_memories:
+                mem_id = self._get_memory_id(memory)
+                if mem_id and mem_id not in seen_ids:
+                    final_memories.append(memory)
+                    seen_ids.add(mem_id)
+
+                if len(final_memories) >= self.valves.related_memories_n:
+                    break
+
+                neighbors = await self._find_memory_neighbors(
+                    memory, all_memories, user_obj,
+                    embedding_cache=embedding_cache,
+                    max_neighbors=max_neighbors,
+                )
+                for neighbor_sim, neighbor_mem in neighbors:
+                    neighbor_id = self._get_memory_id(neighbor_mem)
+                    if (neighbor_id and neighbor_id not in seen_ids
+                        and len(final_memories) < self.valves.related_memories_n):
+                        final_memories.append(neighbor_mem)
+                        seen_ids.add(neighbor_id)
+
+            top_memories = final_memories[: self.valves.related_memories_n]
+
         logger.info(
             "memory_retrieval_completed %s",
             safe_log_context(
@@ -4952,6 +4985,100 @@ class MemoryPipeline:
         )
 
         return min(1.0, max(0.0, boosted))
+
+    async def _update_memory_access_stats(
+        self, user_id: str, memory_id: str, memory: Any
+    ) -> None:
+        """Increment access count and update last-accessed timestamp on a memory."""
+        if not getattr(self.valves, "enable_access_tracking", True):
+            return
+        try:
+            memory_record = self._get_memory_record(memory)
+            new_access_count = (memory_record.access_count or 0) + 1
+            interval = getattr(self.valves, "access_update_interval", 5)
+
+            if new_access_count % interval != 0:
+                return
+
+            updated_content = format_memory_content(
+                content=memory_record.content,
+                tags=memory_record.tags,
+                memory_bank=memory_record.memory_bank,
+                confidence=memory_record.confidence,
+                importance=memory_record.importance,
+                stability=memory_record.stability,
+                last_accessed=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                access_count=new_access_count,
+            )
+
+            await update_memory_by_id_and_user_id_compat(
+                memory_id=memory_id,
+                user_id=user_id,
+                content=updated_content,
+            )
+        except Exception as e:
+            logger.debug(
+                "memory_access_update_skipped %s",
+                safe_log_context(user_id=user_id, memory_id=memory_id,
+                                 **{"error": summarize_error_for_log(e)}),
+            )
+
+    async def _find_memory_neighbors(
+        self,
+        selected_memory: Any,
+        all_memories: List[Any],
+        user_obj: Any,
+        embedding_cache: Dict[str, Any],
+        max_neighbors: int = 2,
+    ) -> List[Tuple[float, Any]]:
+        """Find memories semantically adjacent to the selected memory.
+
+        Returns list of (similarity_score, memory) tuples, sorted highest-first.
+        Reuses embedding_cache to avoid recomputing embeddings.
+        """
+        selected_id = self._get_memory_id(selected_memory)
+        if not selected_id:
+            return []
+
+        selected_emb = embedding_cache.get(selected_id)
+        if selected_emb is None:
+            selected_content = self._get_memory_record(selected_memory).content
+            if not selected_content:
+                return []
+            selected_emb = await self.embedding_manager.get_embedding(
+                selected_content, user=user_obj
+            )
+            if selected_emb is None:
+                return []
+            embedding_cache[selected_id] = selected_emb
+
+        neighbors = []
+        neighbor_penalty = getattr(self.valves, "neighbor_penalty", 0.7)
+        hop_threshold = getattr(self.valves, "neighbor_hop_similarity", 0.80)
+
+        for other_memory in all_memories:
+            other_id = self._get_memory_id(other_memory)
+            if not other_id or other_id == selected_id:
+                continue
+
+            other_emb = embedding_cache.get(other_id)
+            if other_emb is None:
+                other_content = self._get_memory_record(other_memory).content
+                if not other_content:
+                    continue
+                other_emb = await self.embedding_manager.get_embedding(
+                    other_content, user=user_obj
+                )
+                if other_emb is None:
+                    continue
+                embedding_cache[other_id] = other_emb
+
+            sim = self._cosine_similarity(selected_emb, other_emb)
+            if sim >= hop_threshold:
+                neighbors.append((sim * neighbor_penalty, other_memory))
+
+        neighbors.sort(key=lambda x: x[0], reverse=True)
+        return neighbors[:max_neighbors]
 
     def _rank_memories_with_vector_scores(
         self, scored_memories: List[Tuple[float, Any]]
@@ -8112,6 +8239,15 @@ Your output must be valid JSON only. No additional text.""",
         injected_count = self._inlet_inject_memories(
             body["messages"], relevant_memories, user_id=user_id, session_id=session_id
         )
+
+        # 3b. Update access stats for retrieved memories
+        if relevant_memories and getattr(self.valves, "enable_access_tracking", True):
+            for memory in relevant_memories:
+                mem_id = extract_memory_id(memory)
+                if mem_id:
+                    asyncio.create_task(
+                        pipeline._update_memory_access_stats(user_id, mem_id, memory)
+                    )
 
         # 4. Status updates
         await self._inlet_emit_status(

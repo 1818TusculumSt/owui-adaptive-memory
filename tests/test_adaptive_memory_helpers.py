@@ -84,7 +84,7 @@ def make_valves(**overrides):
         "enable_contradiction_detection": True,
         "contradiction_similarity_threshold": 0.65,
         "enable_conversation_context": True,
-        "enable_neighbor_retrieval": True,
+        "enable_neighbor_retrieval": False,
         "neighbor_hop_similarity": 0.80,
         "neighbor_penalty": 0.7,
         "max_neighbors_per_memory": 2,
@@ -745,6 +745,80 @@ class TestMultiSignalMemory(unittest.TestCase):
         self.assertEqual(deleted_count, 1)
         self.assertIn("t1", deleted_ids)
         self.assertNotIn("s1", deleted_ids)
+
+    def test_access_update_throttle(self):
+        pipeline = make_pipeline(enable_access_tracking=True, access_update_interval=3)
+
+        mem = types.SimpleNamespace(
+            id="a1",
+            content=am.format_memory_content(
+                "User likes Python", ["preference"], "Work", 0.9,
+                importance=3, stability="fluid",
+                access_count=2,
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+
+        update_calls = []
+
+        async def fake_update(memory_id, user_id, content):
+            update_calls.append((memory_id, content))
+
+        am.update_memory_by_id_and_user_id_compat = fake_update
+
+        try:
+            asyncio.run(pipeline._update_memory_access_stats("u1", "a1", mem))
+            self.assertEqual(len(update_calls), 1)
+            self.assertIn("[AccessCount: 3]", update_calls[0][1])
+        finally:
+            del am.update_memory_by_id_and_user_id_compat
+
+    def test_access_update_skipped_below_interval(self):
+        pipeline = make_pipeline(enable_access_tracking=True, access_update_interval=5)
+
+        mem = types.SimpleNamespace(
+            id="a2",
+            content=am.format_memory_content(
+                "User likes coffee", ["preference"], "Personal", 0.9,
+                access_count=0,
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+
+        update_calls = []
+
+        async def fake_update(memory_id, user_id, content):
+            update_calls.append((memory_id, content))
+
+        am.update_memory_by_id_and_user_id_compat = fake_update
+
+        try:
+            asyncio.run(pipeline._update_memory_access_stats("u1", "a2", mem))
+            self.assertEqual(len(update_calls), 0)
+        finally:
+            del am.update_memory_by_id_and_user_id_compat
+
+    def test_access_tracking_disabled(self):
+        pipeline = make_pipeline(enable_access_tracking=False)
+
+        mem = types.SimpleNamespace(
+            id="a3",
+            content=am.format_memory_content("test", ["identity"], "General", 0.9),
+            created_at=datetime.now(timezone.utc),
+        )
+
+        update_calls = []
+
+        async def fake_update(memory_id, user_id, content):
+            update_calls.append((memory_id, content))
+
+        am.update_memory_by_id_and_user_id_compat = fake_update
+
+        try:
+            asyncio.run(pipeline._update_memory_access_stats("u1", "a3", mem))
+            self.assertEqual(len(update_calls), 0)
+        finally:
+            del am.update_memory_by_id_and_user_id_compat
 
 
 class TestMemoryPipelineFlow(unittest.TestCase):
