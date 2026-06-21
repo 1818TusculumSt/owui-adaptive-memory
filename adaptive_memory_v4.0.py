@@ -4824,10 +4824,10 @@ class MemoryPipeline:
             return []
 
         scored_memories = []
+        dim_mismatches = 0
+        cached_count = 0
+        missing_count = 0
 
-        # Batch embedding for memories without cached embeddings
-        # This assumes all_memories are custom objects or dicts.
-        # OpenWebUI Memories are SQLModel objects usually.
         mem_objects = []
         texts_to_embed = []
         ids_to_embed = []
@@ -4843,28 +4843,41 @@ class MemoryPipeline:
             memory_cache_key = self.embedding_manager.get_memory_cache_key(
                 user_id, mem_id
             )
-            # Check in-memory cache first
             cached_emb = await self.embedding_manager.cache.get(memory_cache_key)
             if cached_emb is not None:
-                sim = self._cosine_similarity(query_embedding, cached_emb)
-                if sim >= self.valves.vector_similarity_threshold:
-                    scored_memories.append((sim, mem))
-            else:
-                # Check persistent cache
-                persistent_emb = await self.embedding_manager.load_embedding_persistent(user_id, mem_id)
-                if persistent_emb is not None:
-                    # Cache in memory for this session
-                    await self.embedding_manager.cache.set(
-                        memory_cache_key, persistent_emb
-                    )
-                    sim = self._cosine_similarity(query_embedding, persistent_emb)
+                try:
+                    shape_ok = cached_emb.shape == query_embedding.shape
+                except (AttributeError, TypeError):
+                    shape_ok = True
+                if shape_ok:
+                    sim = self._cosine_similarity(query_embedding, cached_emb)
                     if sim >= self.valves.vector_similarity_threshold:
                         scored_memories.append((sim, mem))
                 else:
-                    # Need to generate embedding
+                    dim_mismatches += 1
+                cached_count += 1
+            else:
+                persistent_emb = await self.embedding_manager.load_embedding_persistent(user_id, mem_id)
+                if persistent_emb is not None:
+                    await self.embedding_manager.cache.set(
+                        memory_cache_key, persistent_emb
+                    )
+                    try:
+                        shape_ok = persistent_emb.shape == query_embedding.shape
+                    except (AttributeError, TypeError):
+                        shape_ok = True
+                    if shape_ok:
+                        sim = self._cosine_similarity(query_embedding, persistent_emb)
+                        if sim >= self.valves.vector_similarity_threshold:
+                            scored_memories.append((sim, mem))
+                    else:
+                        dim_mismatches += 1
+                    cached_count += 1
+                else:
                     mem_objects.append(mem)
                     texts_to_embed.append(mem_content)
                     ids_to_embed.append(mem_id)
+                    missing_count += 1
 
         if texts_to_embed:
             logger.info(
@@ -4883,12 +4896,16 @@ class MemoryPipeline:
             )
             for i, emb in enumerate(new_embeddings):
                 if emb is not None:
-                    # Update in-memory cache
                     memory_cache_key = self.embedding_manager.get_memory_cache_key(
                         user_id, ids_to_embed[i]
                     )
                     await self.embedding_manager.cache.set(memory_cache_key, emb)
-                    # Score
+                    try:
+                        if emb.shape != query_embedding.shape:
+                            dim_mismatches += 1
+                            continue
+                    except (AttributeError, TypeError):
+                        pass
                     sim = self._cosine_similarity(query_embedding, emb)
                     if sim >= self.valves.vector_similarity_threshold:
                         scored_memories.append((sim, mem_objects[i]))
@@ -4982,6 +4999,12 @@ class MemoryPipeline:
 
             top_memories = final_memories[: self.valves.related_memories_n]
 
+        extra_log: Dict[str, Any] = {}
+        if dim_mismatches:
+            extra_log["dimension_mismatches"] = dim_mismatches
+            extra_log["query_embedding_dim"] = str(query_embedding.shape)
+        if missing_count:
+            extra_log["missing_embeddings"] = missing_count
         logger.info(
             "memory_retrieval_completed %s",
             safe_log_context(
@@ -4997,6 +5020,7 @@ class MemoryPipeline:
                 vector_candidates=len(scored_memories),
                 retrieved_count=len(top_memories),
                 latency_ms=int((time.perf_counter() - start_time) * 1000),
+                **extra_log,
             ),
         )
         return top_memories
@@ -5381,7 +5405,14 @@ class MemoryPipeline:
 
     def _cosine_similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
         if v1.shape != v2.shape:
-            logger.debug(f"Cosine similarity dimension mismatch: {v1.shape} vs {v2.shape}")
+            logger.warning(
+                "embedding_dimension_mismatch %s",
+                safe_log_context(
+                    operation="COSINE_SIM",
+                    query_dim=str(v1.shape),
+                    memory_dim=str(v2.shape),
+                ),
+            )
             return 0.0
         norm1 = np.linalg.norm(v1)
         norm2 = np.linalg.norm(v2)
