@@ -33,7 +33,7 @@ def make_valves(**overrides):
         "similarity_threshold": 0.95,
         "embedding_similarity_threshold": 0.75,
         "vector_similarity_threshold": 0.1,
-        "relevance_threshold": 0.4,
+        "relevance_threshold": 0.25,
         "related_memories_n": 10,
         "llm_skip_relevance_threshold": 0.93,
         "top_n_memories": 5,

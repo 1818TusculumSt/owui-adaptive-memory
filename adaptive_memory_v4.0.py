@@ -7310,7 +7310,7 @@ Analyze the following related memories and provide a concise summary.""",
             description="Number of related memories to consider",
         )
         relevance_threshold: float = Field(
-            default=0.40,
+            default=0.25,
             description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring",
         )
         memory_threshold: float = Field(
