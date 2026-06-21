@@ -8172,41 +8172,34 @@ Your output must be valid JSON only. No additional text.""",
         high_importance: int = 0,
         relevant_memories: List[Any] = None,
     ) -> None:
-        """Emit status notifications about recalled memories."""
+        """Emit status notifications about recalled memories with inline summaries."""
         if user_valves.show_status:
             if count > 0:
                 parts = [f"🧠 Recalled {count} {'memory' if count == 1 else 'memories'}"]
                 if high_importance > 0:
                     parts.append(f"{high_importance} high-importance")
+                description = " · ".join(parts)
+
+                if relevant_memories:
+                    summaries: List[str] = []
+                    for mem in relevant_memories:
+                        content = get_memory_value(mem, "content", "")
+                        record = parse_stored_memory(content)
+                        if record.content:
+                            truncated = truncate_text(record.content, 80)
+                            summaries.append(f'"{truncated}"')
+                    if summaries:
+                        description += "\n  " + "\n  ".join(summaries)
+
                 status_dict = {
                     "type": "status",
                     "data": {
-                        "description": " · ".join(parts) + ".",
+                        "description": description,
                         "done": True,
                     },
                 }
                 if __event_emitter__:
                     await __event_emitter__(status_dict)
-
-            if relevant_memories and __event_emitter__:
-                memory_summaries: List[str] = []
-                for i, mem in enumerate(relevant_memories, start=1):
-                    content = get_memory_value(mem, "content", "")
-                    record = parse_stored_memory(content)
-                    if record.content:
-                        truncated = truncate_text(record.content, 200)
-                        memory_summaries.append(f"{i}. {truncated}")
-                if memory_summaries:
-                    await __event_emitter__({
-                        "type": "source",
-                        "data": {
-                            "document": ["\n\n".join(memory_summaries)],
-                            "metadata": [{"source": "adaptive-memory-recall"}],
-                            "source": {
-                                "name": f"Recalled {count} {'memory' if count == 1 else 'memories'}",
-                            },
-                        },
-                    })
 
             await self._emit_queued_notifications(__event_emitter__)
 
@@ -8737,6 +8730,19 @@ Your output must be valid JSON only. No additional text.""",
                 if count > 0:
                     suffix = "memory" if count == 1 else "memories"
                     description = f"🧠 Saved {count} {suffix}."
+
+                    if success_ops:
+                        lines: List[str] = []
+                        for op in success_ops:
+                            kind = op.get("operation", "UNKNOWN")
+                            content = op.get("content", "")
+                            if content:
+                                truncated = truncate_text(str(content), 80)
+                                lines.append(f"[{kind}] \"{truncated}\"")
+                            else:
+                                lines.append(f"[{kind}]")
+                        if lines:
+                            description += "\n  " + "\n  ".join(lines)
                 else:
                     description = "No memories saved."
 
@@ -8746,29 +8752,7 @@ Your output must be valid JSON only. No additional text.""",
                 }
                 if __event_emitter__:
                     await __event_emitter__(status_dict)
-
-                if success_ops and __event_emitter__:
-                    op_summaries: List[str] = []
-                    for i, op in enumerate(success_ops, start=1):
-                        kind = op.get("operation", "UNKNOWN")
-                        content = op.get("content", "")
-                        if content:
-                            truncated = truncate_text(str(content), 200)
-                            op_summaries.append(f"{i}. [{kind}] {truncated}")
-                        else:
-                            op_summaries.append(f"{i}. [{kind}]")
-                    if op_summaries:
-                        await __event_emitter__({
-                            "type": "source",
-                            "data": {
-                                "document": ["\n\n".join(op_summaries)],
-                                "metadata": [{"source": "adaptive-memory-save"}],
-                                "source": {
-                                    "name": f"Saved {count} {'memory' if count == 1 else 'memories'}",
-                                },
-                            },
-                        })
-                elif not __event_emitter__:
+                else:
                     logger.warning(
                         "owui_status_emit_skipped %s",
                         safe_log_context(
