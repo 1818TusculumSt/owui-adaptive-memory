@@ -6036,6 +6036,17 @@ class MemoryPipeline:
                             default=existing_record.confidence or 1.0,
                         )
 
+                        importance_value = normalized_op.get("importance", 3)
+                        stability_value = normalized_op.get("stability", "fluid")
+                        for tag in tags:
+                            floor = TAG_IMPORTANCE_FLOOR.get(tag)
+                            if floor is not None:
+                                importance_value = max(importance_value, floor)
+                            floor_stability = TAG_STABILITY_FLOOR.get(tag)
+                            if floor_stability is not None:
+                                if STABILITY_RANK.get(floor_stability, 1) > STABILITY_RANK.get(stability_value, 1):
+                                    stability_value = floor_stability
+
                         new_embedding = None
                         skip_preference_dedupe = self._should_skip_dedupe_for_short_preference(
                             new_content
@@ -6064,8 +6075,8 @@ class MemoryPipeline:
 
                         final_content = format_memory_content(
                             new_content, tags, bank, confidence,
-                            importance=normalized_op.get("importance", 3),
-                            stability=normalized_op.get("stability", "fluid"),
+                            importance=importance_value,
+                            stability=stability_value,
                             last_accessed=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                             access_count=normalized_op.get("access_count", 0),
                         )
