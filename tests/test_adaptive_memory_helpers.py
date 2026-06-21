@@ -136,6 +136,9 @@ class FakeEmbeddingManager:
     ):
         return None
 
+    async def preload_user_embeddings(self, user_id, memory_ids):
+        return None
+
 
 def make_queue_db_path():
     fd, path = tempfile.mkstemp(

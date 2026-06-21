@@ -1099,6 +1099,37 @@ class EmbeddingManager:
 
     def get_memory_cache_key(self, user_id: str, memory_id: Any) -> str:
         return build_embedding_cache_key(user_id, memory_id)
+
+    async def preload_user_embeddings(
+        self, user_id: str, memory_ids: List[str]
+    ) -> None:
+        """Batch-load all stored embeddings for a user into the in-memory cache."""
+        if not memory_ids:
+            return
+        async with self._get_lock(user_id):
+            try:
+                await asyncio.to_thread(
+                    self._migrate_legacy_cache_if_needed_sync, user_id
+                )
+                records = await asyncio.to_thread(
+                    self._load_all_embeddings_sqlite_sync, user_id, memory_ids
+                )
+                for memory_id_str, record in records.items():
+                    if self._is_record_compatible(record):
+                        emb = self._record_to_embedding(record)
+                        if emb is not None:
+                            cache_key = build_embedding_cache_key(user_id, memory_id_str)
+                            await self.cache.set(cache_key, emb)
+            except Exception as e:
+                logger.warning(
+                    "embedding_cache_preload_failed %s %s",
+                    safe_log_context(
+                        user_id=user_id,
+                        operation="CACHE_PRELOAD",
+                        memory_count=len(memory_ids),
+                    ),
+                    summarize_error_for_log(e),
+                )
     
     async def cleanup(self):
         """Clean up resources like the shared HTTP session."""
@@ -1491,6 +1522,29 @@ class EmbeddingManager:
             if row is None:
                 return None
             return dict(row)
+
+    def _load_all_embeddings_sqlite_sync(
+        self, user_id: str, memory_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch-load all stored embeddings for given memory IDs in one query."""
+        result: Dict[str, Dict[str, Any]] = {}
+        if not memory_ids:
+            return result
+        normalized_ids = [normalize_memory_id(mid) for mid in memory_ids]
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self._connect_cache_db() as conn:
+            self._ensure_cache_db_schema(conn)
+            rows = conn.execute(
+                f"""
+                SELECT memory_id, embedding_json, model, provider, timestamp
+                FROM embeddings
+                WHERE user_id = ? AND memory_id IN ({placeholders})
+                """,
+                (user_id, *normalized_ids),
+            ).fetchall()
+            for row in rows:
+                result[row["memory_id"]] = dict(row)
+        return result
 
     def _delete_embedding_sqlite_sync(self, user_id: str, memory_id: str) -> None:
         memory_id_str = normalize_memory_id(memory_id)
@@ -4827,6 +4881,16 @@ class MemoryPipeline:
         dim_mismatches = 0
         cached_count = 0
         missing_count = 0
+
+        # Batch preload all stored embeddings into the in-memory cache
+        all_memory_ids: List[str] = []
+        for mem in all_memories:
+            mem_id = self._get_memory_id(mem)
+            if mem_id:
+                all_memory_ids.append(str(mem_id))
+        await self.embedding_manager.preload_user_embeddings(
+            user_id, all_memory_ids
+        )
 
         mem_objects = []
         texts_to_embed = []
