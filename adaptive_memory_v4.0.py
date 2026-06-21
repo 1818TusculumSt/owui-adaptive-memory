@@ -7374,7 +7374,7 @@ Analyze the following related memories and provide a concise summary.""",
             description="Number of related memories to consider",
         )
         relevance_threshold: float = Field(
-            default=0.25,
+            default=0.35,
             description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring",
         )
         memory_threshold: float = Field(
@@ -7382,7 +7382,7 @@ Analyze the following related memories and provide a concise summary.""",
             description="Threshold for similarity when comparing memories (0-1)",
         )
         vector_similarity_threshold: float = Field(
-            default=0.10,
+            default=0.15,
             description="Minimum cosine similarity for broad initial vector candidate filtering (0-1)",
         )
         llm_skip_relevance_threshold: float = Field(
