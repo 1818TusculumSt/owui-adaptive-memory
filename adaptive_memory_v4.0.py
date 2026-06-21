@@ -5871,7 +5871,11 @@ class MemoryPipeline:
                                 continue
 
                         final_content = format_memory_content(
-                            new_content, tags, bank, confidence
+                            new_content, tags, bank, confidence,
+                            importance=normalized_op.get("importance", 3),
+                            stability=normalized_op.get("stability", "fluid"),
+                            last_accessed=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                            access_count=normalized_op.get("access_count", 0),
                         )
                         updated_memory = await update_memory_by_id_and_user_id_compat(
                             memory_id, user_id, final_content
