@@ -289,6 +289,15 @@ TRANSIENT_MARKERS = (
     "going to", "gonna", "i'm about to",
 )
 
+IDENTITY_CONTENT_PATTERNS = (
+    re.compile(r"\b(?:my\s+)?name\s+is\b", re.IGNORECASE),
+    re.compile(r"\b(?:i\s+(?:was\s+)?born|i(?:'?m|'?ve\s+been)\s+from|i\s+(?:am|grew\s+up)\s+(?:from|in))\b", re.IGNORECASE),
+    re.compile(r"\b(?:my\s+birthplace|birth\s*(?:place|date|day)|born\s+(?:in|on))\b", re.IGNORECASE),
+    re.compile(r"\b(?:i\s+(?:am|work\s+as)\s+a\s+|my\s+(?:job|profession|occupation))\b", re.IGNORECASE),
+    re.compile(r"\b(?:my\s+(?:wife|husband|partner|spouse|mother|father|son|daughter|child(?:ren)?))\b", re.IGNORECASE),
+    re.compile(r"\b(?:i\s+(?:live|reside|stay)\s+(?:in|at|near))\b", re.IGNORECASE),
+)
+
 MEMORY_STORAGE_PATTERN = re.compile(
     r"^\[Tags:\s*(?P<tags>[^\]]*)\]\s*(?P<content>.*?)\s*\[Memory Bank:\s*(?P<memory_bank>[^\]]+)\]\s*\[Confidence:\s*(?P<confidence>[^\]]+)\]"
     r"(?:\s*\[Importance:\s*(?P<importance>[^\]]*)\])?"
@@ -4557,6 +4566,20 @@ class MemoryPipeline:
                     op["importance"] = max(1, op.get("importance", 3) - 2)
                 op["stability"] = "transient"
 
+            tags = [str(t).strip().lower() for t in (op.get("tags") or [])]
+            if "identity" in tags and op.get("importance", 3) < 4:
+                if any(pattern.search(content) for pattern in IDENTITY_CONTENT_PATTERNS):
+                    op["importance"] = max(op.get("importance", 3), 4)
+                    op["stability"] = "stable"
+                    logger.info(
+                        "memory_extraction_quality_elevated %s",
+                        safe_log_context(
+                            reason="identity_content_detected",
+                            content_chars=len(content),
+                            new_importance=op["importance"],
+                        ),
+                    )
+
             filtered.append(op)
 
         return filtered
@@ -5900,6 +5923,8 @@ class MemoryPipeline:
                                 operation="CREATE",
                                 memory_bank=bank,
                                 confidence=f"{confidence:.2f}",
+                                importance=importance_value,
+                                stability=stability_value,
                             ),
                         )
                         self._log_memory_save_user_id(user_id, memory_id)
