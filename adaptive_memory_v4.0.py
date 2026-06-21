@@ -5036,6 +5036,16 @@ class MemoryPipeline:
             and top_memories
             and len(top_memories) < self.valves.related_memories_n):
             embedding_cache: Dict[str, Any] = {}
+            for mem in all_memories:
+                mem_id = self._get_memory_id(mem)
+                if not mem_id:
+                    continue
+                cache_key = self.embedding_manager.get_memory_cache_key(
+                    user_id, str(mem_id)
+                )
+                cached = await self.embedding_manager.cache.get(cache_key)
+                if cached is not None:
+                    embedding_cache[str(mem_id)] = cached
             max_neighbors = getattr(self.valves, "max_neighbors_per_memory", 2)
             final_memories = []
             seen_ids = set()
