@@ -289,14 +289,31 @@ TRANSIENT_MARKERS = (
     "going to", "gonna", "i'm about to",
 )
 
-IDENTITY_CONTENT_PATTERNS = (
-    re.compile(r"\b(?:my\s+)?name\s+is\b", re.IGNORECASE),
-    re.compile(r"\b(?:i\s+(?:was\s+)?born|i(?:'?m|'?ve\s+been)\s+from|i\s+(?:am|grew\s+up)\s+(?:from|in))\b", re.IGNORECASE),
-    re.compile(r"\b(?:my\s+birthplace|birth\s*(?:place|date|day)|born\s+(?:in|on))\b", re.IGNORECASE),
-    re.compile(r"\b(?:i\s+(?:am|work\s+as)\s+a\s+|my\s+(?:job|profession|occupation))\b", re.IGNORECASE),
-    re.compile(r"\b(?:my\s+(?:wife|husband|partner|spouse|mother|father|son|daughter|child(?:ren)?))\b", re.IGNORECASE),
-    re.compile(r"\b(?:i\s+(?:live|reside|stay)\s+(?:in|at|near))\b", re.IGNORECASE),
-)
+TAG_IMPORTANCE_FLOOR: Dict[str, int] = {
+    "identity": 4,
+    "relationship": 4,
+    "goal": 3,
+    "preference": 3,
+    "possession": 3,
+    "behavior": 2,
+    "summary": 3,
+}
+
+STABILITY_RANK: Dict[str, int] = {
+    "transient": 0,
+    "fluid": 1,
+    "stable": 2,
+}
+
+TAG_STABILITY_FLOOR: Dict[str, str] = {
+    "identity": "stable",
+    "relationship": "stable",
+    "goal": "fluid",
+    "preference": "fluid",
+    "possession": "fluid",
+    "behavior": "fluid",
+    "summary": "fluid",
+}
 
 MEMORY_STORAGE_PATTERN = re.compile(
     r"^\[Tags:\s*(?P<tags>[^\]]*)\]\s*(?P<content>.*?)\s*\[Memory Bank:\s*(?P<memory_bank>[^\]]+)\]\s*\[Confidence:\s*(?P<confidence>[^\]]+)\]"
@@ -4566,20 +4583,6 @@ class MemoryPipeline:
                     op["importance"] = max(1, op.get("importance", 3) - 2)
                 op["stability"] = "transient"
 
-            tags = [str(t).strip().lower() for t in (op.get("tags") or [])]
-            if "identity" in tags and op.get("importance", 3) < 4:
-                if any(pattern.search(content) for pattern in IDENTITY_CONTENT_PATTERNS):
-                    op["importance"] = max(op.get("importance", 3), 4)
-                    op["stability"] = "stable"
-                    logger.info(
-                        "memory_extraction_quality_elevated %s",
-                        safe_log_context(
-                            reason="identity_content_detected",
-                            content_chars=len(content),
-                            new_importance=op["importance"],
-                        ),
-                    )
-
             filtered.append(op)
 
         return filtered
@@ -4622,6 +4625,18 @@ class MemoryPipeline:
         raw_stability = str(item.get("stability", "")).strip().lower()
         if raw_stability in ("stable", "fluid", "transient"):
             stability = raw_stability
+
+        for tag in tags:
+            floor = TAG_IMPORTANCE_FLOOR.get(tag)
+            if floor is not None:
+                importance = max(importance, floor)
+
+            floor_stability = TAG_STABILITY_FLOOR.get(tag)
+            if floor_stability is not None:
+                llm_rank = STABILITY_RANK.get(stability, 1)
+                floor_rank = STABILITY_RANK.get(floor_stability, 1)
+                if floor_rank > llm_rank:
+                    stability = floor_stability
 
         normalized_op = {
             "operation": operation,

@@ -500,8 +500,8 @@ class TestMultiSignalMemory(unittest.TestCase):
             }
         )
         self.assertIsNotNone(op)
-        self.assertEqual(op["importance"], 3)
-        self.assertEqual(op["stability"], "fluid")
+        self.assertEqual(op["importance"], 4)
+        self.assertEqual(op["stability"], "stable")
 
     def test_normalize_operation_importance_disabled(self):
         pipeline = make_pipeline(enable_importance_scoring=False)
@@ -516,7 +516,8 @@ class TestMultiSignalMemory(unittest.TestCase):
             }
         )
         self.assertIsNotNone(op)
-        self.assertEqual(op["importance"], 3)
+        self.assertEqual(op["importance"], 4)
+        self.assertEqual(op["stability"], "stable")
 
     def test_build_short_preference_operation_has_defaults(self):
         pipeline = make_pipeline()
