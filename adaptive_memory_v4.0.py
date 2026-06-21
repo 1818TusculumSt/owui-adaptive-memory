@@ -8812,16 +8812,6 @@ Your output must be valid JSON only. No additional text.""",
                 if count > 0:
                     suffix = "memory" if count == 1 else "memories"
                     description = f"🧠 Saved {count} {suffix}."
-
-                    if success_ops:
-                        summaries: List[str] = []
-                        for op in success_ops:
-                            content = op.get("content", "")
-                            if content:
-                                truncated = truncate_text(str(content), 80)
-                                summaries.append(f"\u201c{truncated}\u201d")
-                        if summaries:
-                            description += " \u2014 " + ", ".join(summaries)
                 else:
                     description = "No memories saved."
 
