@@ -32,7 +32,7 @@ def make_valves(**overrides):
         "use_embeddings_for_deduplication": False,
         "similarity_threshold": 0.95,
         "embedding_similarity_threshold": 0.75,
-        "vector_similarity_threshold": 0.2,
+        "vector_similarity_threshold": 0.1,
         "relevance_threshold": 0.4,
         "related_memories_n": 10,
         "llm_skip_relevance_threshold": 0.93,

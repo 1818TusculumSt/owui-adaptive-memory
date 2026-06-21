@@ -7318,7 +7318,7 @@ Analyze the following related memories and provide a concise summary.""",
             description="Threshold for similarity when comparing memories (0-1)",
         )
         vector_similarity_threshold: float = Field(
-            default=0.20,
+            default=0.10,
             description="Minimum cosine similarity for broad initial vector candidate filtering (0-1)",
         )
         llm_skip_relevance_threshold: float = Field(
@@ -8209,23 +8209,10 @@ Your output must be valid JSON only. No additional text.""",
                 parts = [f"🧠 Recalled {count} {'memory' if count == 1 else 'memories'}"]
                 if high_importance > 0:
                     parts.append(f"{high_importance} high-importance")
-                description = " · ".join(parts)
-
-                if relevant_memories:
-                    summaries: List[str] = []
-                    for mem in relevant_memories:
-                        content = get_memory_value(mem, "content", "")
-                        record = parse_stored_memory(content)
-                        if record.content:
-                            truncated = truncate_text(record.content, 80)
-                            summaries.append(f'&ldquo;{truncated}&rdquo;')
-                    if summaries:
-                        description += " &mdash; " + ", ".join(summaries)
-
                 status_dict = {
                     "type": "status",
                     "data": {
-                        "description": description,
+                        "description": " · ".join(parts) + ".",
                         "done": True,
                     },
                 }
@@ -8768,9 +8755,9 @@ Your output must be valid JSON only. No additional text.""",
                             content = op.get("content", "")
                             if content:
                                 truncated = truncate_text(str(content), 80)
-                                summaries.append(f"&ldquo;{truncated}&rdquo;")
+                                summaries.append(f"\u201c{truncated}\u201d")
                         if summaries:
-                            description += " &mdash; " + ", ".join(summaries)
+                            description += " \u2014 " + ", ".join(summaries)
                 else:
                     description = "No memories saved."
 
