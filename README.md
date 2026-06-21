@@ -347,4 +347,4 @@ Current: **109 tests** (up from 70).
 
 ## 📄 License
 
-MIT · Forked from [gramanoid/owui-adaptive-memory](https://github.com/gramanoid/owui-adaptive-memory)
+MIT · Forked from [alackmann/owui-adaptive-memory](https://github.com/alackmann/owui-adaptive-memory)
