@@ -8386,6 +8386,24 @@ Your output must be valid JSON only. No additional text.""",
                         await __event_emitter__(status_dict)
                     return True
 
+            dup_note = ""
+            if getattr(self.valves, "deduplicate_memories", True) and all_memories:
+                normalized_content = re.sub(r"\s+", " ", content).strip().lower()
+                for existing in all_memories:
+                    existing_text = get_memory_value(existing, "content", "")
+                    if not existing_text:
+                        continue
+                    record = parse_stored_memory(str(existing_text))
+                    if not record.content:
+                        continue
+                    normalized_existing = re.sub(r"\s+", " ", record.content).strip().lower()
+                    similarity = difflib.SequenceMatcher(
+                        None, normalized_content, normalized_existing
+                    ).ratio()
+                    if similarity >= getattr(self.valves, "similarity_threshold", 0.95):
+                        dup_note = " ⚠ Very similar memory already exists."
+                        break
+
             final = format_memory_content(
                 content=content,
                 tags=["preference"],
@@ -8398,7 +8416,7 @@ Your output must be valid JSON only. No additional text.""",
             )
             try:
                 await insert_new_memory_compat(user_id, final)
-                status = f"💾 Saved memory: \"{truncate_text(content, 100)}\""
+                status = f"💾 Saved memory: \"{truncate_text(content, 100)}\"{dup_note}"
             except Exception as e:
                 status = f"❌ Failed to save memory"
 

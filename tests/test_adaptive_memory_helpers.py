@@ -1006,6 +1006,45 @@ class TestMultiSignalMemory(unittest.TestCase):
         finally:
             am.insert_new_memory_compat = original
 
+    def test_remember_dedup_warns_on_near_duplicate(self):
+        """The /remember command should warn if the content is very similar to an existing memory."""
+        f = am.Filter()
+        f.valves = make_valves(
+            enable_extraction_quality_gate=True,
+            enable_memory_commands=True,
+            deduplicate_memories=True,
+            similarity_threshold=0.85,
+        )
+
+        async def fake_insert(user_id, content):
+            return types.SimpleNamespace(id="m1", content=content)
+
+        original = am.insert_new_memory_compat
+        am.insert_new_memory_compat = fake_insert
+
+        try:
+            statuses = []
+            async def emitter(d):
+                statuses.append(d)
+
+            existing_mem = types.SimpleNamespace(
+                id="ex1",
+                content=am.format_memory_content("User is a Bustelo coffee drinker", ["preference"], "General", 0.9),
+                created_at=datetime.now(timezone.utc),
+            )
+
+            was_handled = asyncio.run(
+                f._handle_memory_command(
+                    "/remember I'm a Bustelo coffee drinker",
+                    "u1", emitter, [existing_mem]
+                )
+            )
+            self.assertTrue(was_handled)
+            self.assertIn("Saved", statuses[0]["data"]["description"])
+            self.assertIn("similar memory already exists", statuses[0]["data"]["description"].lower())
+        finally:
+            am.insert_new_memory_compat = original
+
 
 class TestMemoryPipelineFlow(unittest.TestCase):
     def test_identify_memories_normal_flow(self):
