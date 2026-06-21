@@ -7275,11 +7275,11 @@ Analyze the following related memories and provide a concise summary.""",
 
         # Memory processing settings
         related_memories_n: int = Field(
-            default=5,
+            default=10,
             description="Number of related memories to consider",
         )
         relevance_threshold: float = Field(
-            default=0.60,
+            default=0.40,
             description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring",
         )
         memory_threshold: float = Field(
@@ -8170,6 +8170,7 @@ Your output must be valid JSON only. No additional text.""",
     async def _inlet_emit_status(
         self, __event_emitter__, user_valves: "Filter.UserValves", count: int,
         high_importance: int = 0,
+        relevant_memories: List[Any] = None,
     ) -> None:
         """Emit status notifications about recalled memories."""
         if user_valves.show_status:
@@ -8186,6 +8187,26 @@ Your output must be valid JSON only. No additional text.""",
                 }
                 if __event_emitter__:
                     await __event_emitter__(status_dict)
+
+            if relevant_memories and __event_emitter__:
+                memory_summaries: List[str] = []
+                for i, mem in enumerate(relevant_memories, start=1):
+                    content = get_memory_value(mem, "content", "")
+                    record = parse_stored_memory(content)
+                    if record.content:
+                        truncated = truncate_text(record.content, 200)
+                        memory_summaries.append(f"{i}. {truncated}")
+                if memory_summaries:
+                    await __event_emitter__({
+                        "type": "source",
+                        "data": {
+                            "document": ["\n\n".join(memory_summaries)],
+                            "metadata": [{"source": "adaptive-memory-recall"}],
+                            "source": {
+                                "name": f"Recalled {count} {'memory' if count == 1 else 'memories'}",
+                            },
+                        },
+                    })
 
             await self._emit_queued_notifications(__event_emitter__)
 
@@ -8523,6 +8544,7 @@ Your output must be valid JSON only. No additional text.""",
         await self._inlet_emit_status(
             __event_emitter__, user_valves, len(relevant_memories),
             high_importance=high_importance,
+            relevant_memories=relevant_memories,
         )
 
         logger.info(
@@ -8724,7 +8746,29 @@ Your output must be valid JSON only. No additional text.""",
                 }
                 if __event_emitter__:
                     await __event_emitter__(status_dict)
-                else:
+
+                if success_ops and __event_emitter__:
+                    op_summaries: List[str] = []
+                    for i, op in enumerate(success_ops, start=1):
+                        kind = op.get("operation", "UNKNOWN")
+                        content = op.get("content", "")
+                        if content:
+                            truncated = truncate_text(str(content), 200)
+                            op_summaries.append(f"{i}. [{kind}] {truncated}")
+                        else:
+                            op_summaries.append(f"{i}. [{kind}]")
+                    if op_summaries:
+                        await __event_emitter__({
+                            "type": "source",
+                            "data": {
+                                "document": ["\n\n".join(op_summaries)],
+                                "metadata": [{"source": "adaptive-memory-save"}],
+                                "source": {
+                                    "name": f"Saved {count} {'memory' if count == 1 else 'memories'}",
+                                },
+                            },
+                        })
+                elif not __event_emitter__:
                     logger.warning(
                         "owui_status_emit_skipped %s",
                         safe_log_context(
