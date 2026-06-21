@@ -210,6 +210,31 @@ class JSONParser:
     """Robust JSON parsing utilities."""
 
     @staticmethod
+    def _extract_balanced(text: str, start_pos: int, opener: str, closer: str) -> Optional[str]:
+        depth = 0
+        in_string = False
+        escape = False
+        for i, ch in enumerate(text[start_pos:], start=start_pos):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    return text[start_pos : i + 1]
+        return None
+
+    @staticmethod
     def extract_and_parse(text: str) -> Union[List, Dict, None]:
         if not text:
             return None
@@ -224,11 +249,20 @@ class JSONParser:
             with contextlib.suppress(json.JSONDecodeError):
                 return json.loads(json_match.group(1))
 
-        # 3. Extract from raw brackets
-        bracket_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", text)
-        if bracket_match:
-            with contextlib.suppress(json.JSONDecodeError):
-                return json.loads(bracket_match.group(1))
+        # 3. Extract using balanced bracket matching (handles LLM commentary around JSON)
+        for opener, closer in (("[", "]"), ("{", "}")):
+            pos = 0
+            while True:
+                start = text.find(opener, pos)
+                if start == -1:
+                    break
+                candidate = JSONParser._extract_balanced(text, start, opener, closer)
+                if candidate is not None:
+                    with contextlib.suppress(json.JSONDecodeError):
+                        result = json.loads(candidate)
+                        if isinstance(result, (list, dict)):
+                            return result
+                pos = start + 1
 
         return None
 
@@ -4474,6 +4508,19 @@ class MemoryPipeline:
             if confidence_match:
                 with contextlib.suppress(ValueError):
                     op["confidence"] = float(confidence_match.group("confidence"))
+
+            importance_match = re.search(
+                r'"importance"\s*:\s*(?P<importance>\d+)', body
+            )
+            if importance_match:
+                with contextlib.suppress(ValueError):
+                    op["importance"] = int(importance_match.group("importance"))
+
+            stability_match = re.search(
+                r'"stability"\s*:\s*"(?P<stability>stable|fluid|transient)"', body
+            )
+            if stability_match:
+                op["stability"] = stability_match.group("stability")
 
             operations.append(op)
         return operations
