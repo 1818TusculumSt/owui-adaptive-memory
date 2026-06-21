@@ -23,7 +23,6 @@ import difflib
 import time
 import os
 import hashlib
-import html
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
@@ -7799,7 +7798,6 @@ Your output must be valid JSON only. No additional text.""",
         self.seen_users = set()  # Track active users for background tasks
         self.notification_queue = []  # Queue for background task notifications
         self._session_contexts: Dict[str, str] = {}  # session_id -> context summary
-        self._pending_recall_html: Optional[str] = None  # recall details for expandable UI
         self._tasks_started = False
         self._valve_hash = None  # Track valve changes
         self._llm_session: Optional[aiohttp.ClientSession] = None
@@ -8174,38 +8172,34 @@ Your output must be valid JSON only. No additional text.""",
         high_importance: int = 0,
         relevant_memories: List[Any] = None,
     ) -> None:
-        """Emit status and store recall details for expandable UI in outlet."""
+        """Emit status about recalled memories."""
         if user_valves.show_status:
             if count > 0:
                 parts = [f"🧠 Recalled {count} {'memory' if count == 1 else 'memories'}"]
                 if high_importance > 0:
                     parts.append(f"{high_importance} high-importance")
+                description = " · ".join(parts)
+
+                if relevant_memories:
+                    summaries: List[str] = []
+                    for mem in relevant_memories:
+                        content = get_memory_value(mem, "content", "")
+                        record = parse_stored_memory(content)
+                        if record.content:
+                            truncated = truncate_text(record.content, 80)
+                            summaries.append(f'&ldquo;{truncated}&rdquo;')
+                    if summaries:
+                        description += " &mdash; " + ", ".join(summaries)
+
                 status_dict = {
                     "type": "status",
                     "data": {
-                        "description": " · ".join(parts) + ".",
+                        "description": description,
                         "done": True,
                     },
                 }
                 if __event_emitter__:
                     await __event_emitter__(status_dict)
-
-            if relevant_memories:
-                lines: List[str] = []
-                for mem in relevant_memories:
-                    content = get_memory_value(mem, "content", "")
-                    record = parse_stored_memory(content)
-                    if record.content:
-                        lines.append(f'<li>{html.escape(record.content)}</li>')
-                if lines:
-                    self._pending_recall_html = (
-                        f'<details type="memory-recall">\n'
-                        f'<summary>🧠 Recalled {count} {"memory" if count == 1 else "memories"}</summary>\n\n'
-                        f'<ul>\n{"".join(lines)}\n</ul>\n'
-                        f'</details>'
-                    )
-            else:
-                self._pending_recall_html = None
 
             await self._emit_queued_notifications(__event_emitter__)
 
@@ -8738,17 +8732,14 @@ Your output must be valid JSON only. No additional text.""",
                     description = f"🧠 Saved {count} {suffix}."
 
                     if success_ops:
-                        lines_short: List[str] = []
+                        summaries: List[str] = []
                         for op in success_ops:
-                            kind = op.get("operation", "UNKNOWN")
                             content = op.get("content", "")
                             if content:
                                 truncated = truncate_text(str(content), 80)
-                                lines_short.append(f"[{kind}] \"{truncated}\"")
-                            else:
-                                lines_short.append(f"[{kind}]")
-                        if lines_short:
-                            description += "\n  " + "\n  ".join(lines_short)
+                                summaries.append(f"&ldquo;{truncated}&rdquo;")
+                        if summaries:
+                            description += " &mdash; " + ", ".join(summaries)
                 else:
                     description = "No memories saved."
 
@@ -8768,51 +8759,6 @@ Your output must be valid JSON only. No additional text.""",
                             reason="event_emitter_missing",
                         ),
                     )
-
-            # Append expandable memory details to the assistant message
-            detail_blocks: List[str] = []
-
-            recall_html = self._pending_recall_html
-            self._pending_recall_html = None
-            if recall_html:
-                detail_blocks.append(recall_html)
-
-            if success_ops:
-                save_lines: List[str] = []
-                for op in success_ops:
-                    kind = op.get("operation", "UNKNOWN")
-                    content = op.get("content", "")
-                    if content:
-                        save_lines.append(f'<li>[{kind}] {html.escape(str(content))}</li>')
-                    else:
-                        save_lines.append(f'<li>[{kind}]</li>')
-                if save_lines:
-                    save_count = len(success_ops)
-                    detail_blocks.append(
-                        f'<details type="memory-save">\n'
-                        f'<summary>🧠 Saved {save_count} {"memory" if save_count == 1 else "memories"}</summary>\n\n'
-                        f'<ul>\n{"".join(save_lines)}\n</ul>\n'
-                        f'</details>'
-                    )
-
-            if detail_blocks and isinstance(messages, list):
-                assistant_idx = None
-                for i in range(len(messages) - 1, -1, -1):
-                    if isinstance(messages[i], dict) and messages[i].get("role") == "assistant":
-                        assistant_idx = i
-                        break
-
-                if assistant_idx is not None:
-                    existing = extract_message_text(messages[assistant_idx].get("content", ""))
-                    details_html = "\n".join(detail_blocks)
-                    new_content = f"{existing}\n\n{details_html}"
-                    messages[assistant_idx]["content"] = new_content
-
-                    if __event_emitter__:
-                        await __event_emitter__({
-                            "type": "replace",
-                            "data": {"content": new_content},
-                        })
 
         logger.info(
             "owui_entry_completed %s",
