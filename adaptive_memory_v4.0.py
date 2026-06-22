@@ -5791,6 +5791,15 @@ class MemoryPipeline:
         normalized = self._RE_EXTRA_SPACES.sub(" ", normalized).strip()
         return normalized
 
+    _RE_PARAPHRASE_WRAPPERS = re.compile(
+        r"\b(expressed|stated|mentioned|noted|indicated|shared|revealed|described|"
+        r"explained|declared|reported|conveyed|communicated|said|told)\s+that\s+",
+        re.IGNORECASE,
+    )
+
+    def _strip_paraphrase_wrappers(self, text: str) -> str:
+        return self._RE_PARAPHRASE_WRAPPERS.sub("", text)
+
     # --- Memory Operations ---
     async def process_memory_operations(
         self,
@@ -6418,7 +6427,13 @@ class MemoryPipeline:
                     if not raw_memory_content:
                         continue
 
-                    if self._normalize_text(text) == self._normalize_text(raw_memory_content):
+                    norm_new = self._normalize_text(
+                        self._strip_paraphrase_wrappers(text)
+                    )
+                    norm_existing = self._normalize_text(
+                        self._strip_paraphrase_wrappers(raw_memory_content)
+                    )
+                    if norm_new == norm_existing:
                         logger.info(
                             "memory_dedupe_duplicate_found %s",
                             safe_log_context(
