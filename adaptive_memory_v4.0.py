@@ -5158,6 +5158,11 @@ class MemoryPipeline:
 
             top_memories = final_memories[: self.valves.related_memories_n]
 
+        if getattr(self.valves, "deduplicate_retrieved_memories", True):
+            top_memories = await self._deduplicate_retrieved_memories(
+                user_id, top_memories, user_obj
+            )
+
         extra_log: Dict[str, Any] = {}
         if dim_mismatches:
             extra_log["dimension_mismatches"] = dim_mismatches
@@ -5183,6 +5188,79 @@ class MemoryPipeline:
             ),
         )
         return top_memories
+
+    async def _deduplicate_retrieved_memories(
+        self,
+        user_id: str,
+        top_memories: List[Any],
+        user_obj: Optional[Dict[str, Any]] = None,
+    ) -> List[Any]:
+        if not getattr(self.valves, "deduplicate_retrieved_memories", True):
+            return top_memories
+        if len(top_memories) <= 1:
+            return top_memories
+
+        threshold = self.valves.embedding_similarity_threshold
+
+        deduped: List[Any] = []
+        deduped_embeddings: List[np.ndarray] = []
+
+        for memory in top_memories:
+            mem_id = self._get_memory_id(memory)
+            if not mem_id:
+                deduped.append(memory)
+                continue
+
+            cache_key = self.embedding_manager.get_memory_cache_key(
+                user_id, str(mem_id)
+            )
+            emb = await self.embedding_manager.cache.get(cache_key)
+            if emb is None:
+                emb = await self.embedding_manager.load_embedding_persistent(
+                    user_id, str(mem_id)
+                )
+
+            if emb is None:
+                deduped.append(memory)
+                continue
+
+            is_duplicate = False
+            for existing_emb in deduped_embeddings:
+                try:
+                    sim = self._cosine_similarity(emb, existing_emb)
+                    if sim >= threshold:
+                        is_duplicate = True
+                        logger.debug(
+                            "memory_retrieval_dedup %s",
+                            safe_log_context(
+                                user_id=user_id,
+                                memory_id=mem_id,
+                                operation="RETRIEVE",
+                                reason="near_duplicate_removed",
+                                similarity=f"{sim:.3f}",
+                            ),
+                        )
+                        break
+                except Exception:
+                    continue
+
+            if not is_duplicate:
+                deduped.append(memory)
+                deduped_embeddings.append(emb)
+
+        if len(deduped) < len(top_memories):
+            logger.info(
+                "memory_retrieval_dedup_completed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    operation="RETRIEVE",
+                    reason="dedup_applied",
+                    before_count=len(top_memories),
+                    after_count=len(deduped),
+                ),
+            )
+
+        return deduped
 
     def _apply_multi_signal_boost(
         self,
@@ -7521,6 +7599,14 @@ Analyze the following related memories and provide a concise summary.""",
             default=0.75,
             description="Threshold (0-1) for considering two memories duplicates when using embedding similarity.",
         )
+        deduplicate_retrieved_memories: bool = Field(
+            default=True,
+            description="Deduplicate retrieved memories before injection, removing near-duplicates (similarity >= embedding_similarity_threshold) from the final context",
+        )
+        outlet_dedup_window_seconds: float = Field(
+            default=10.0,
+            description="Minimum seconds between processing the same user message hash in the outlet. Prevents duplicate memory extraction when streaming triggers multiple outlet calls for the same response.",
+        )
         similarity_threshold: float = Field(
             default=0.95,
             description="Threshold for detecting similar memories (0-1) using text or embeddings",
@@ -8004,6 +8090,7 @@ Your output must be valid JSON only. No additional text.""",
         self._tasks_started = False
         self._valve_hash = None  # Track valve changes
         self._llm_session: Optional[aiohttp.ClientSession] = None
+        self._outlet_processed_messages: Dict[str, float] = {}  # msg_hash -> timestamp, for outlet dedup
 
         logger.info("Adaptive Memory Filter v4.0.2 initialized")
 
@@ -8793,6 +8880,32 @@ Your output must be valid JSON only. No additional text.""",
         recent_user_messages = self._get_recent_user_messages(messages)
         user_message = "\n".join(recent_user_messages).strip()
         retrieval_query = recent_user_messages[-1] if recent_user_messages else ""
+
+        if user_message and session_id:
+            msg_hash = hashlib.sha256(
+                f"{session_id}:{user_message}".encode()
+            ).hexdigest()
+            now = time.time()
+            window = getattr(self.valves, "outlet_dedup_window_seconds", 10.0)
+            last_seen = self._outlet_processed_messages.get(msg_hash)
+            if last_seen and (now - last_seen) < window:
+                logger.info(
+                    "owui_entry_skipped %s",
+                    self._entry_log_context(
+                        body, __user__, "OUTLET",
+                        "outlet_streaming_dedup",
+                        since_last_ms=f"{(now - last_seen)*1000:.0f}",
+                    ),
+                )
+                return body
+            self._outlet_processed_messages[msg_hash] = now
+            # Cleanup stale entries (> 10x window)
+            stale_keys = [
+                k for k, ts in self._outlet_processed_messages.items()
+                if now - ts > window * 10
+            ]
+            for k in stale_keys:
+                del self._outlet_processed_messages[k]
 
         if retrieval_query.startswith("/"):
             logger.info(
