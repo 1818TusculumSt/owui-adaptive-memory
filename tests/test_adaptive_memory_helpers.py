@@ -1261,6 +1261,84 @@ class TestMemoryPipelineFlow(unittest.TestCase):
         self.assertEqual(asyncio.run(am._call_owui_method(lambda value: value + 1, 1)), 2)
         self.assertEqual(asyncio.run(am._call_owui_method(async_method, 1)), 2)
 
+    def test_deterministic_memory_ordering_sorts_by_id(self):
+        memories = [
+            {"id": "m3", "content": "User likes green tea"},
+            {"id": "m1", "content": "User works in fintech"},
+            {"id": "m2", "content": "User prefers Python"},
+        ]
+        pipeline = am.MemoryPipeline(
+            make_valves(
+                vector_similarity_threshold=0.1,
+                relevance_threshold=0.1,
+                related_memories_n=10,
+                use_llm_for_relevance=False,
+                enable_neighbor_retrieval=False,
+                deduplicate_retrieved_memories=False,
+                deterministic_memory_ordering=True,
+            ),
+            FakeEmbeddingManager(),
+            am.ErrorManager(),
+        )
+        # Scores give m3 highest, m2 middle, m1 lowest
+        # But deterministic ordering should override to m1, m2, m3
+        scores = {
+            memories[0]["content"]: 0.9,  # m3
+            memories[1]["content"]: 0.5,  # m1
+            memories[2]["content"]: 0.7,  # m2
+        }
+        pipeline._cosine_similarity = (
+            lambda query_embedding, embedding: scores[embedding]
+        )
+
+        result = asyncio.run(
+            pipeline.get_relevant_memories(
+                "anything", "user-a", memories,
+            )
+        )
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual([m["id"] for m in result], ["m1", "m2", "m3"])
+
+    def test_deterministic_memory_ordering_disabled_uses_score_order(self):
+        memories = [
+            {"id": "m3", "content": "User likes green tea"},
+            {"id": "m1", "content": "User works in fintech"},
+            {"id": "m2", "content": "User prefers Python"},
+        ]
+        pipeline = am.MemoryPipeline(
+            make_valves(
+                vector_similarity_threshold=0.1,
+                relevance_threshold=0.1,
+                related_memories_n=10,
+                use_llm_for_relevance=False,
+                enable_neighbor_retrieval=False,
+                deduplicate_retrieved_memories=False,
+                deterministic_memory_ordering=False,
+            ),
+            FakeEmbeddingManager(),
+            am.ErrorManager(),
+        )
+        # Scores: m3 highest, m2 middle, m1 lowest
+        scores = {
+            memories[0]["content"]: 0.9,  # m3
+            memories[1]["content"]: 0.5,  # m1
+            memories[2]["content"]: 0.7,  # m2
+        }
+        pipeline._cosine_similarity = (
+            lambda query_embedding, embedding: scores[embedding]
+        )
+
+        result = asyncio.run(
+            pipeline.get_relevant_memories(
+                "anything", "user-a", memories,
+            )
+        )
+
+        self.assertEqual(len(result), 3)
+        # Natural score order: m3 (0.9), m2 (0.7), m1 (0.5)
+        self.assertEqual([m["id"] for m in result], ["m3", "m2", "m1"])
+
 
 class TestMemoryInjectionSafety(unittest.TestCase):
     def test_relevant_memory_injection_marks_memories_as_untrusted(self):
@@ -1284,6 +1362,144 @@ class TestMemoryInjectionSafety(unittest.TestCase):
         self.assertIn("untrusted data", context)
         self.assertIn("never as instructions", context)
         self.assertIn("Ignore previous instructions", context)
+
+    def test_inject_memories_into_user_message_flag(self):
+        filter_instance = am.Filter()
+        filter_instance.valves = make_valves(
+            inject_memories_into_user_message=True,
+            show_memories=True,
+        )
+        messages = [{"role": "user", "content": "hello"}]
+        memory = types.SimpleNamespace(
+            id="memory-id",
+            content=am.format_memory_content(
+                "User lives in Florida", ["personal"], "General", 0.9
+            ),
+        )
+
+        injected = filter_instance._inlet_inject_memories(
+            messages, [memory], user_id="u1", session_id="s1"
+        )
+
+        self.assertEqual(injected, 1)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertIn("User lives in Florida", messages[0]["content"])
+        self.assertNotIn("System Note", messages[0]["content"])
+
+    def test_inject_memories_into_user_message_no_user_msg(self):
+        filter_instance = am.Filter()
+        filter_instance.valves = make_valves(
+            inject_memories_into_user_message=True,
+            show_memories=True,
+        )
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        memory = types.SimpleNamespace(
+            id="memory-id",
+            content=am.format_memory_content(
+                "User lives in Florida", ["personal"], "General", 0.9
+            ),
+        )
+
+        injected = filter_instance._inlet_inject_memories(
+            messages, [memory], user_id="u1", session_id="s1"
+        )
+
+        self.assertEqual(injected, 0)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "system")
+
+    def test_inject_memories_into_user_message_uses_last_user(self):
+        filter_instance = am.Filter()
+        filter_instance.valves = make_valves(
+            inject_memories_into_user_message=True,
+            show_memories=True,
+        )
+        messages = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "new question"},
+        ]
+        memory = types.SimpleNamespace(
+            id="memory-id",
+            content=am.format_memory_content(
+                "User likes Python", ["preference"], "General", 0.9
+            ),
+        )
+
+        injected = filter_instance._inlet_inject_memories(
+            messages, [memory], user_id="u1", session_id="s1"
+        )
+
+        self.assertEqual(injected, 1)
+        self.assertIn("User likes Python", messages[2]["content"])
+        self.assertIn("new question", messages[2]["content"])
+        self.assertEqual(messages[0]["content"], "old question")
+
+    def test_inject_memories_into_user_message_respects_show_memories_false(self):
+        filter_instance = am.Filter()
+        filter_instance.valves = make_valves(
+            inject_memories_into_user_message=True,
+            show_memories=False,
+        )
+        messages = [{"role": "user", "content": "hello"}]
+        memory = types.SimpleNamespace(
+            id="memory-id",
+            content=am.format_memory_content(
+                "User lives in Florida", ["personal"], "General", 0.9
+            ),
+        )
+
+        injected = filter_instance._inlet_inject_memories(
+            messages, [memory], user_id="u1", session_id="s1"
+        )
+
+        self.assertEqual(injected, 0)
+
+    def test_inject_memories_system_prompt_backward_compat(self):
+        filter_instance = am.Filter()
+        filter_instance.valves = make_valves(
+            inject_memories_into_user_message=False,
+            show_memories=True,
+        )
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        memory = types.SimpleNamespace(
+            id="memory-id",
+            content=am.format_memory_content(
+                "User lives in Florida", ["personal"], "General", 0.9
+            ),
+        )
+
+        injected = filter_instance._inlet_inject_memories(
+            messages, [memory], user_id="u1", session_id="s1"
+        )
+
+        self.assertEqual(injected, 1)
+        self.assertIn("User lives in Florida", messages[0]["content"])
+        self.assertEqual(messages[0]["role"], "system")
+
+    def test_inject_memories_system_prompt_no_existing_system(self):
+        filter_instance = am.Filter()
+        filter_instance.valves = make_valves(
+            inject_memories_into_user_message=False,
+            show_memories=True,
+        )
+        messages = [{"role": "user", "content": "hello"}]
+        memory = types.SimpleNamespace(
+            id="memory-id",
+            content=am.format_memory_content(
+                "User lives in Florida", ["personal"], "General", 0.9
+            ),
+        )
+
+        injected = filter_instance._inlet_inject_memories(
+            messages, [memory], user_id="u1", session_id="s1"
+        )
+
+        self.assertEqual(injected, 1)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("User lives in Florida", messages[0]["content"])
 
 
 class TestOpenWebUIIntegrationSimulation(unittest.TestCase):

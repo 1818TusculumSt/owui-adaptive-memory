@@ -5163,6 +5163,12 @@ class MemoryPipeline:
                 user_id, top_memories, user_obj
             )
 
+        # Cache-friendly: sort by stable ID so same selection produces identical prompt text
+        if getattr(self.valves, "deterministic_memory_ordering", True):
+            top_memories.sort(
+                key=lambda m: str(extract_memory_id(m) or "")
+            )
+
         extra_log: Dict[str, Any] = {}
         if dim_mismatches:
             extra_log["dimension_mismatches"] = dim_mismatches
@@ -7636,6 +7642,17 @@ Analyze the following related memories and provide a concise summary.""",
         show_memories: bool = Field(
             default=True, description="Show relevant memories in context"
         )
+        inject_memories_into_user_message: bool = Field(
+            default=True,
+            description="Inject memories into the last user message instead of the system prompt. "
+            "Preserves a stable prompt prefix for better DeepSeek/OpenCode prompt caching.",
+        )
+        deterministic_memory_ordering: bool = Field(
+            default=True,
+            description="Sort retrieved memories by ID before injection. "
+            "Same memories per request produce identical prompt text, "
+            "improving prompt cache hit rates.",
+        )
         log_user_id_on_memory_save: bool = Field(
             default=False,
             description="Log hashed Open WebUI user_id and memory_id whenever a memory save or update succeeds. Useful for admin debugging without exposing raw identifiers.",
@@ -8439,8 +8456,37 @@ Your output must be valid JSON only. No additional text.""",
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> int:
-        """Inject relevant memories into the system prompt."""
+        """Inject relevant memories into the system prompt or last user message."""
         injected_count = 0
+
+        # Cache-friendly branch: inject into the last user message instead of system prompt
+        if getattr(self.valves, "inject_memories_into_user_message", False):
+            if relevant_memories and self.valves.show_memories:
+                context_text = self._format_relevant_memories(relevant_memories)
+                if context_text:
+                    for i in range(len(messages) - 1, -1, -1):
+                        if messages[i].get("role") == "user":
+                            messages[i]["content"] = (
+                                f"{context_text}\n\n{messages[i]['content']}"
+                            )
+                            injected_count = len(relevant_memories)
+                            break
+            logger.info(
+                "memory_injection_completed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    session_id=session_id,
+                    operation="INJECT",
+                    injected_count=injected_count,
+                    retrieved_count=len(relevant_memories),
+                    target="user_message",
+                    untrusted_context=injected_count > 0,
+                    show_memories=getattr(self.valves, "show_memories", True),
+                ),
+            )
+            return injected_count
+
+        # Legacy branch: inject into the system prompt
         if relevant_memories and self.valves.show_memories:
             context_text = self._format_relevant_memories(relevant_memories)
 

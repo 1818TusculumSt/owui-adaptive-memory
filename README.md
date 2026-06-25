@@ -32,7 +32,7 @@ User message → inlet()
   │   ├─ Recency/importance/access weight boost
   │   └─ One-hop neighbor retrieval (semantically adjacent memories)
   ├─ Track access stats (throttled DB writes)
-  ├─ Inject context into system prompt (+ acknowledgment instruction)
+  ├─ Inject context into last user message (stable prefix for prompt caching)
   └─ Emit rich status (high-importance count)
        ↓
     LLM responds
@@ -145,6 +145,8 @@ Slash commands (inlet):
 | `max_injected_memory_length` | `300` | Truncate injected memory text to this length |
 | `memory_format` | `bullet` | `bullet` / `paragraph` / `numbered` |
 | `show_memories` | `True` | Show memory context in the injected prompt label |
+| `inject_memories_into_user_message` | `True` | Inject memories into the last user message instead of the system prompt — preserves a stable prefix for prompt caching (DeepSeek, OpenCode, etc.) |
+| `deterministic_memory_ordering` | `True` | Sort recalled memories by ID before injection — same selection produces identical prompt text, improving cache hit rates |
 
 ### 🗂️ Deduplication
 
