@@ -156,7 +156,7 @@ _raw_logger.propagate = False
 
 class AMAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        return f"[AM v4.0.2] {msg}", kwargs
+        return f"[AM v4.1.0] {msg}", kwargs
 
 logger = AMAdapter(_raw_logger, {})
 
@@ -8104,7 +8104,7 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter v4.0.2")
+        logger.info("Initializing Adaptive Memory Filter v4.1.0")
         self.valves = self.Valves()
         self._apply_logging_level()
         self.error_manager = ErrorManager()
@@ -8124,7 +8124,7 @@ Your output must be valid JSON only. No additional text.""",
         self._llm_session: Optional[aiohttp.ClientSession] = None
         self._outlet_processed_messages: Dict[str, float] = {}  # msg_hash -> timestamp, for outlet dedup
 
-        logger.info("Adaptive Memory Filter v4.0.2 initialized")
+        logger.info("Adaptive Memory Filter v4.1.0 initialized")
 
     def _apply_logging_level(self) -> None:
         _raw_logger.setLevel(
