@@ -7733,7 +7733,7 @@ Analyze the following related memories and provide a concise summary.""",
             description="Include a brief conversation context summary in the extraction prompt to improve memory extraction quality.",
         )
         enable_neighbor_retrieval: bool = Field(
-            default=True,
+            default=False,
             description="When a memory is selected, pull in semantically adjacent memories even if they didn't match the query directly.",
         )
         neighbor_hop_similarity: float = Field(
