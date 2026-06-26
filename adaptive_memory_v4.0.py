@@ -8012,7 +8012,7 @@ Analyze the following related memories and provide a concise summary.""",
             description="Emit detailed error counter logs at DEBUG level (set to True for troubleshooting).",
         )
 
-        # Legacy / Inactive (kept for backward compatibility)
+        # Legacy Valves — kept for backward compatibility, not wired to behavior
 
         save_relevance_threshold: float = Field(
             default=0.8,
