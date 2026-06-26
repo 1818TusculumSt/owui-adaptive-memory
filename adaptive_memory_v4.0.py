@@ -8016,17 +8016,17 @@ Analyze the following related memories and provide a concise summary.""",
 
         save_relevance_threshold: float = Field(
             default=0.8,
-            description="Minimum relevance score (based on relevance calculation method) to save a memory",
+            description="[legacy — no effect] Minimum relevance score (based on relevance calculation method) to save a memory",
         )
 
         memory_threshold: float = Field(
             default=0.6,
-            description="Threshold for similarity when comparing memories (0-1)",
+            description="[legacy — no effect] Threshold for similarity when comparing memories (0-1)",
         )
 
         cache_ttl_seconds: int = Field(
             default=86400,
-            description="Cache time-to-live in seconds (default 24 hours)",
+            description="[legacy — no effect] Cache time-to-live in seconds (default 24 hours)",
         )
 
         memory_merge_prompt: str = Field(
@@ -8043,41 +8043,41 @@ Rules for merging:
 
 Return your result as a JSON array of strings, with each string being a merged memory.
 Your output must be valid JSON only. No additional text.""",
-            description="System prompt for merging memories",
+            description="[legacy — no effect] System prompt for merging memories",
         )
 
         enable_date_update_task: bool = Field(
             default=True,
-            description="Enable or disable the background date update task",
+            description="[legacy — no effect] Enable or disable the background date update task",
         )
 
         date_update_interval: int = Field(
             default=3600,
-            description="Interval in seconds between date information updates",
+            description="[legacy — no effect] Interval in seconds between date information updates",
         )
 
         enable_model_discovery_task: bool = Field(
             default=True,
-            description="Enable or disable the background model discovery task",
+            description="[legacy — no effect] Enable or disable the background model discovery task",
         )
 
         model_discovery_interval: int = Field(
-            default=7200, description="Interval in seconds between model discovery runs"
+            default=7200, description="[legacy — no effect] Interval in seconds between model discovery runs"
         )
 
         enable_error_counter_guard: bool = Field(
             default=True,
-            description="Enable guard to temporarily disable LLM/embedding features if specific error rates spike.",
+            description="[legacy — no effect] Enable guard to temporarily disable LLM/embedding features if specific error rates spike.",
         )
 
         error_guard_threshold: int = Field(
             default=5,
-            description="Number of errors within the window required to activate the guard.",
+            description="[legacy — no effect] Number of errors within the window required to activate the guard.",
         )
 
         error_guard_window_seconds: int = Field(
             default=600,
-            description="Rolling time-window (in seconds) over which errors are counted for guarding logic.",
+            description="[legacy — no effect] Rolling time-window (in seconds) over which errors are counted for guarding logic.",
         )
 
         # Validators
