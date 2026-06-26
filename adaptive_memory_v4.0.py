@@ -7313,475 +7313,57 @@ class Filter:
     class Valves(BaseModel):
         """Configuration valves for the filter"""
 
-        # Embedding Model Configuration
-        embedding_source: Literal["auto", "owui", "plugin"] = Field(
-            default="auto",
-            description="Embedding source mode: 'auto' prefers Open WebUI's configured embedding function and falls back to the plugin provider, 'owui' uses only Open WebUI embeddings, and 'plugin' uses only the plugin-configured provider.",
-        )
-        embedding_provider_type: Literal["local", "openai_compatible"] = Field(
-            default="local",
-            description="Plugin-side embedding provider type used when embedding_source is 'auto' and Open WebUI embeddings are unavailable, or when embedding_source is 'plugin'.",
-        )
-        embedding_model_name: str = Field(
-            default="all-MiniLM-L6-v2",
-            description="Plugin-side embedding model name used for the fallback/internal provider when embedding_source allows plugin embeddings.",
-        )
-        embedding_api_url: Optional[str] = Field(
-            default=None,
-            description="Plugin-side embedding API endpoint used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
-        )
-        embedding_api_key: Optional[str] = Field(
-            default=None,
-            description="Plugin-side embedding API key used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
-        )
-
-        # Optional Mem0 Mirror Configuration
-        enable_mem0_sync: bool = Field(
-            default=False,
-            description="Optionally mirror local memory CRUD operations to Mem0. Disabled by default so memories stay local unless explicitly enabled.",
-        )
-        mem0_api_base_url: str = Field(
-            default="https://api.mem0.ai",
-            description="Base URL for the Mem0 API when Mem0 mirroring is enabled.",
-        )
-        mem0_api_key: Optional[str] = Field(
-            default=None,
-            description="API key for Mem0. Required only when enable_mem0_sync is enabled.",
-        )
-        mem0_app_id: str = Field(
-            default="openwebui-adaptive-memory",
-            description="Mem0 app_id used to namespace memories mirrored from this plugin.",
-        )
-        mem0_timeout_seconds: int = Field(
-            default=30,
-            description="Timeout in seconds for Mem0 API requests.",
-        )
-        mem0_reconcile_cooldown_seconds: float = Field(
-            default=30.0,
-            description="Minimum seconds between Mem0 delete-reconciliation checks for the same user during inbound requests.",
-        )
-        mem0_sync_strategy: Literal["background", "inline"] = Field(
-            default="background",
-            description="How Mem0 mirroring runs: 'background' queues CRUD changes for batched async syncing, while 'inline' performs Mem0 requests during the request path.",
-        )
-        mem0_sync_batch_size: int = Field(
-            default=10,
-            description="Maximum number of queued Mem0 jobs to process in one background batch.",
-        )
-        mem0_sync_batch_interval_seconds: float = Field(
-            default=7200.0,
-            description="Interval in seconds between scheduled Mem0 background sync runs.",
-        )
-        mem0_sync_retry_delay_seconds: float = Field(
-            default=15.0,
-            description="Delay before retrying a failed queued Mem0 sync job.",
-        )
-        mem0_sync_claim_timeout_seconds: float = Field(
-            default=300.0,
-            description="Seconds after which an in-progress Mem0 background sync job claim is considered stale and can be claimed by another worker.",
-        )
-        mem0_sync_max_retries: int = Field(
-            default=20,
-            description="Maximum number of retries for a failed Mem0 background sync job before it is permanently dropped. Set to 0 to retry indefinitely.",
-        )
-        mem0_user_id_template: str = Field(
-            default="owui:{user_id}",
-            description="Template used to map an Open WebUI user id into a Mem0 user id. May include {user_id} for per-user mapping, or be a fixed string such as 'jefe' to force all mirrored memories into one Mem0 user/entity.",
-        )
-        mem0_user_id_override: str = Field(
-            default="",
-            description="Optional per-user Mem0 mapping table shown in the main valve UI. Use targeted mappings like 'owui_user_id:jefe' (comma, semicolon, or newline separated) to route specific Open WebUI users to specific Mem0 users. Plain values like 'jefe' are ignored.",
-        )
-        mem0_infer_on_create: bool = Field(
-            default=False,
-            description="When true, mirrored Mem0 create requests use infer=true so Mem0 can extract, deduplicate, and resolve conflicts from the provided message. Disabled by default; when false, mirrored text is stored more literally with infer=false.",
-        )
-
-        # Background Task Management Configuration
-        enable_summarization_task: bool = Field(
-            default=True,
-            description="Enable or disable the background memory summarization task",
-        )
-        summarization_interval: int = Field(
-            default=7200,
-            description="Interval in seconds between memory summarization runs",
-        )
-        enable_error_logging_task: bool = Field(
-            default=True,
-            description="Enable or disable the background error counter logging task",
-        )
-        error_logging_interval: int = Field(
-            default=1800,
-            description="Interval in seconds between error counter log entries",
-        )
-
-        enable_vector_cleanup_task: bool = Field(
-            default=True,
-            description="Enable or disable the background vector cleanup task",
-        )
-        vector_cleanup_interval: int = Field(
-            default=7200,
-            description="Interval in seconds between vector cleanup runs (removes orphaned embeddings)",
-        )
-
-        enable_date_update_task: bool = Field(
-            default=True,
-            description="Enable or disable the background date update task",
-        )
-        date_update_interval: int = Field(
-            default=3600,
-            description="Interval in seconds between date information updates",
-        )
-        enable_model_discovery_task: bool = Field(
-            default=True,
-            description="Enable or disable the background model discovery task",
-        )
-        model_discovery_interval: int = Field(
-            default=7200, description="Interval in seconds between model discovery runs"
-        )
-
-        # Summarization Configuration
-        summarization_min_cluster_size: int = Field(
-            default=3,
-            description="Minimum number of memories in a cluster for summarization",
-        )
-        summarization_similarity_threshold: float = Field(
-            default=0.7,
-            description="Threshold for considering memories related when using embedding similarity",
-        )
-        summarization_max_cluster_size: int = Field(
-            default=8,
-            description="Maximum memories to include in one summarization batch",
-        )
-        summarization_min_memory_age_days: int = Field(
-            default=7,
-            description="Minimum age in days for memories to be considered for summarization",
-        )
-        summarization_strategy: Literal["embeddings", "tags", "hybrid"] = Field(
-            default="hybrid",
-            description="Strategy for clustering memories: 'embeddings' (semantic similarity), 'tags' (shared tags), or 'hybrid' (combination)",
-        )
-        summarization_memory_prompt: str = Field(
-            default="""You are a memory summarization assistant. Your task is to combine related memories about a user into a concise, comprehensive summary.
-
-Given a set of related memories about a user, create a single durable memory that:
-1. Captures every important user-specific fact from the individual memories
-2. Resolves any contradictions by preferring newer dated information
-3. Preserves names, quantities, tools, projects, constraints, and strong preferences
-4. Removes redundancy without dropping distinct details
-5. Presents the information in a clear, concise format
-
-Focus on preserving the user's:
-- Explicit preferences
-- Identity details
-- Goals and aspirations
-- Relationships
-- Possessions
-- Behavioral patterns
-
-Your summary should be factual, concise, and maintain the same tone as the original memories. Do not invent details.
-Produce a single paragraph summary of approximately 75-150 words when needed to preserve distinct facts.
-
-Example:
-Individual memories:
-- "User likes to drink coffee in the morning"
-- "User prefers dark roast coffee"
-- "User mentioned drinking 2-3 cups of coffee daily"
-
-Good summary:
-"User is a coffee enthusiast who drinks 2-3 cups daily, particularly enjoying dark roast varieties in the morning."
-
-Analyze the following related memories and provide a concise summary.""",
-            description="System prompt for summarizing clusters of related memories",
-        )
-
-        # Filtering & Saving Configuration
-        enable_json_stripping: bool = Field(
-            default=True,
-            description="Attempt to strip non-JSON text before/after the main JSON object/array from LLM responses.",
-        )
-        enable_fallback_regex: bool = Field(
-            default=True,
-            description="If primary JSON parsing fails, attempt a simple regex fallback to extract at least one memory.",
-        )
-        enable_short_preference_shortcut: bool = Field(
-            default=True,
-            description="If JSON parsing fails for a short message containing preference keywords, directly save the message content.",
-        )
-        short_preference_no_dedupe_length: int = Field(
-            default=100,
-            description="If a NEW memory's content length is below this threshold and contains preference keywords, skip deduplication checks to avoid false positives.",
-        )
-        preference_keywords_no_dedupe: str = Field(
-            default="favorite,love,like,prefer,enjoy",
-            description="Comma-separated keywords indicating user preferences that, when present in a short statement, trigger deduplication bypass.",
-        )
-        blacklist_topics: Optional[str] = Field(
-            default=None,
-            description="Optional: Comma-separated list of topics to ignore during memory extraction",
-        )
-        filter_trivia: bool = Field(
-            default=True,
-            description="Enable filtering of trivia/general knowledge memories after extraction",
-        )
-        whitelist_keywords: Optional[str] = Field(
-            default=None,
-            description="Optional: Comma-separated keywords that force-save a memory even if blacklisted",
-        )
-        max_total_memories: int = Field(
-            default=200,
-            description="Maximum number of memories per user; prune oldest beyond this",
-        )
-        pruning_strategy: Literal["fifo", "least_relevant", "tiered_decay"] = Field(
-            default="fifo",
-            description="Strategy for pruning memories when max_total_memories is exceeded: 'fifo' (oldest first), 'least_relevant' (lowest relevance to current message first), or 'tiered_decay' (stability/importance-aware decay).",
-        )
-        min_memory_length: int = Field(
-            default=8,
-            description="Minimum length of memory content to be saved",
-        )
-        min_confidence_threshold: float = Field(
-            default=0.5,
-            description="Minimum confidence score (0-1) required for an extracted memory to be saved. Scores below this are discarded.",
-        )
-        recent_messages_n: int = Field(
-            default=5,
-            description="Number of recent user messages to include in extraction prompt context",
-        )
-        save_relevance_threshold: float = Field(
-            default=0.8,
-            description="Minimum relevance score (based on relevance calculation method) to save a memory",
-        )
-        max_injected_memory_length: int = Field(
-            default=300,
-            description="Maximum length of each injected memory snippet",
-        )
-
         # Generic LLM Provider Configuration
+
         llm_provider_type: Literal["ollama", "openai_compatible"] = Field(
             default="ollama",
             description="Type of LLM provider ('ollama' or 'openai_compatible')",
         )
+
         llm_model_name: str = Field(
-            default="llama3:latest",
-            description="Name of the LLM model to use (e.g., 'llama3:latest', 'gpt-4o')",
+            default="llama4:latest",
+            description="Name of the LLM model to use (e.g., 'llama4:latest', 'gpt-4o')",
         )
+
         llm_api_endpoint_url: str = Field(
             default="http://host.docker.internal:11434/api/chat",
             description="API endpoint URL for the LLM provider (e.g., 'http://host.docker.internal:11434/api/chat', 'https://api.openai.com/v1/chat/completions')",
         )
+
         llm_api_key: Optional[str] = Field(
             default=None,
             description="API Key for the LLM provider (required if type is 'openai_compatible')",
         )
 
-        # Memory processing settings
-        related_memories_n: int = Field(
-            default=10,
-            description="Number of related memories to consider",
-        )
-        relevance_threshold: float = Field(
-            default=0.35,
-            description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring",
-        )
-        memory_threshold: float = Field(
-            default=0.6,
-            description="Threshold for similarity when comparing memories (0-1)",
-        )
-        vector_similarity_threshold: float = Field(
-            default=0.15,
-            description="Minimum cosine similarity for broad initial vector candidate filtering (0-1)",
-        )
-        llm_skip_relevance_threshold: float = Field(
-            default=0.93,
-            description="If *all* vector-filtered memories have similarity >= this threshold, treat the vector score as final relevance and skip the additional LLM call.",
-        )
-        top_n_memories: int = Field(
-            default=5,
-            description="Number of top vector candidates to pass to LLM relevance ranking",
-        )
-        cache_ttl_seconds: int = Field(
-            default=86400,
-            description="Cache time-to-live in seconds (default 24 hours)",
-        )
-        use_llm_for_relevance: bool = Field(
-            default=False,
-            description="Use one batched LLM call for final relevance scoring after vector candidate filtering (if False, relies solely on vector similarity + relevance_threshold)",
-        )
-        deduplicate_memories: bool = Field(
-            default=True,
-            description="Prevent storing duplicate or very similar memories",
-        )
-        use_embeddings_for_deduplication: bool = Field(
-            default=True,
-            description="Use embedding-based similarity for more accurate semantic duplicate detection (if False, uses text-based similarity)",
-        )
-        embedding_similarity_threshold: float = Field(
-            default=0.75,
-            description="Threshold (0-1) for considering two memories duplicates when using embedding similarity.",
-        )
-        deduplicate_retrieved_memories: bool = Field(
-            default=True,
-            description="Deduplicate retrieved memories before injection, removing near-duplicates (similarity >= embedding_similarity_threshold) from the final context",
-        )
-        outlet_dedup_window_seconds: float = Field(
-            default=10.0,
-            description="Minimum seconds between processing the same user message hash in the outlet. Prevents duplicate memory extraction when streaming triggers multiple outlet calls for the same response.",
-        )
-        similarity_threshold: float = Field(
-            default=0.95,
-            description="Threshold for detecting similar memories (0-1) using text or embeddings",
-        )
-        timezone: str = Field(
-            default="Asia/Dubai",
-            description="Timezone for date/time processing (e.g., 'America/New_York', 'Europe/London')",
-        )
-        show_status: bool = Field(
-            default=True, description="Show memory operations status in chat"
-        )
-        show_memories: bool = Field(
-            default=True, description="Show relevant memories in context"
-        )
-        inject_memories_into_user_message: bool = Field(
-            default=True,
-            description="Inject memories into the last user message instead of the system prompt. "
-            "Preserves a stable prompt prefix for better DeepSeek/OpenCode prompt caching.",
-        )
-        deterministic_memory_ordering: bool = Field(
-            default=True,
-            description="Sort retrieved memories by ID before injection. "
-            "Same memories per request produce identical prompt text, "
-            "improving prompt cache hit rates.",
-        )
-        log_user_id_on_memory_save: bool = Field(
-            default=False,
-            description="Log hashed Open WebUI user_id and memory_id whenever a memory save or update succeeds. Useful for admin debugging without exposing raw identifiers.",
-        )
-        memory_format: Literal["bullet", "paragraph", "numbered"] = Field(
-            default="bullet", description="Format for displaying memories in context"
-        )
-        enable_identity_memories: bool = Field(
-            default=True,
-            description="Enable collecting Basic Identity information (age, gender, location, etc.)",
-        )
-        enable_behavior_memories: bool = Field(
-            default=True,
-            description="Enable collecting Behavior information (interests, habits, etc.)",
-        )
-        enable_preference_memories: bool = Field(
-            default=True,
-            description="Enable collecting Preference information (likes, dislikes, etc.)",
-        )
-        enable_goal_memories: bool = Field(
-            default=True,
-            description="Enable collecting Goal information (aspirations, targets, etc.)",
-        )
-        enable_relationship_memories: bool = Field(
-            default=True,
-            description="Enable collecting Relationship information (friends, family, etc.)",
-        )
-        enable_possession_memories: bool = Field(
-            default=True,
-            description="Enable collecting Possession information (things owned or desired)",
-        )
-        max_retries: int = Field(
-            default=2, description="Maximum number of retries for API calls"
-        )
-        retry_delay: float = Field(
-            default=1.0, description="Delay between retries (seconds)"
+        # Embedding Model Configuration
+
+        embedding_source: Literal["auto", "owui", "plugin"] = Field(
+            default="auto",
+            description="Embedding source mode: 'auto' prefers Open WebUI's configured embedding function and falls back to the plugin provider, 'owui' uses only Open WebUI embeddings, and 'plugin' uses only the plugin-configured provider.",
         )
 
-        # Multi-Signal Memory (Phase 0-5)
-        enable_importance_scoring: bool = Field(
-            default=True,
-            description="Enable importance scoring (1-5) during memory extraction.",
-        )
-        enable_stability_decay: bool = Field(
-            default=True,
-            description="Enable stability-based differential decay for relevance and pruning.",
-        )
-        enable_access_tracking: bool = Field(
-            default=True,
-            description="Enable tracking of memory access counts and last-accessed timestamps.",
-        )
-        recency_boost_weight: float = Field(
-            default=0.10,
-            description="Weight applied to recency boost in relevance scoring (0-1). Higher = recency matters more.",
-        )
-        importance_weight: float = Field(
-            default=0.15,
-            description="Weight applied to importance in relevance scoring (0-1). Higher = importance matters more.",
-        )
-        access_boost_weight: float = Field(
-            default=0.05,
-            description="Weight applied to access count in relevance scoring (0-1).",
-        )
-        access_update_interval: int = Field(
-            default=5,
-            description="Only persist access stat updates every N retrievals per memory (reduces DB writes).",
-        )
-        enable_contradiction_detection: bool = Field(
-            default=True,
-            description="Detect contradictions between new and existing memories and auto-promote NEW to UPDATE when found.",
-        )
-        contradiction_similarity_threshold: float = Field(
-            default=0.65,
-            description="Cosine similarity threshold below which contradiction check is skipped (too dissimilar to contradict).",
-        )
-        enable_conversation_context: bool = Field(
-            default=True,
-            description="Include a brief conversation context summary in the extraction prompt to improve memory extraction quality.",
-        )
-        enable_neighbor_retrieval: bool = Field(
-            default=False,
-            description="When a memory is selected, pull in semantically adjacent memories even if they didn't match the query directly.",
-        )
-        neighbor_hop_similarity: float = Field(
-            default=0.80,
-            description="Cosine similarity threshold for a memory to be considered a neighbor of a selected memory.",
-        )
-        neighbor_penalty: float = Field(
-            default=0.7,
-            description="Multiplier applied to a neighbor's score (0-1). Lower = neighbors ranked lower.",
-        )
-        max_neighbors_per_memory: int = Field(
-            default=2,
-            description="Maximum neighbor memories to pull in per selected memory.",
-        )
-        enable_stale_detection_task: bool = Field(
-            default=True,
-            description="Enable background task that detects stale, low-importance memories for cleanup.",
-        )
-        stale_detection_interval: int = Field(
-            default=86400,
-            description="Interval in seconds between stale memory detection runs.",
-        )
-        stale_threshold_days: int = Field(
-            default=90,
-            description="Days since last access before a memory is considered stale.",
-        )
-        stale_action: Literal["log", "summarize", "delete"] = Field(
-            default="summarize",
-            description="Action to take on stale memories: 'log' (report only), 'summarize' (mark for summarization), or 'delete' (remove).",
-        )
-        enable_memory_acknowledgment: bool = Field(
-            default=True,
-            description="Instruct the LLM to naturally acknowledge relevant memories in its responses.",
-        )
-        enable_memory_commands: bool = Field(
-            default=True,
-            description="Enable /memories, /forget, and /remember slash commands.",
-        )
-        enable_extraction_quality_gate: bool = Field(
-            default=True,
-            description="Run a rule-based quality filter on extracted memories before saving.",
-        )
-        retrieval_scoring_version: str = Field(
-            default="v5",
-            description="Scoring algorithm version. 'v4' = original vector-only, 'v5' = multi-signal with recency/importance/access.",
+        embedding_provider_type: Literal["local", "openai_compatible"] = Field(
+            default="local",
+            description="Plugin-side embedding provider type used when embedding_source is 'auto' and Open WebUI embeddings are unavailable, or when embedding_source is 'plugin'.",
         )
 
-        # Prompts
+        embedding_model_name: str = Field(
+            default="all-MiniLM-L6-v2",
+            description="Plugin-side embedding model name used for the fallback/internal provider when embedding_source allows plugin embeddings.",
+        )
+
+        embedding_api_url: Optional[str] = Field(
+            default=None,
+            description="Plugin-side embedding API endpoint used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
+        )
+
+        embedding_api_key: Optional[str] = Field(
+            default=None,
+            description="Plugin-side embedding API key used when embedding_source allows plugin embeddings and embedding_provider_type is 'openai_compatible'.",
+        )
+
+        # Memory Extraction
+
         memory_identification_prompt: str = Field(
             default="""You are an automated JSON data extraction system. Your ONLY function is to identify user-specific, persistent facts, preferences, goals, relationships, or interests from the user's messages and output them STRICTLY as a JSON array of operations.
 
@@ -7879,6 +7461,183 @@ Analyze the following related memories and provide a concise summary.""",
 Analyze the following user message(s) and provide **ONLY** the JSON array output. Double-check your response starts with `[` and ends with `]` and contains **NO** other text whatsoever.""",
             description="System prompt for memory identification",
         )
+
+        recent_messages_n: int = Field(
+            default=5,
+            description="Number of recent user messages to include in extraction prompt context",
+        )
+
+        enable_json_stripping: bool = Field(
+            default=True,
+            description="Attempt to strip non-JSON text before/after the main JSON object/array from LLM responses.",
+        )
+
+        enable_fallback_regex: bool = Field(
+            default=True,
+            description="If primary JSON parsing fails, attempt a simple regex fallback to extract at least one memory.",
+        )
+
+        enable_short_preference_shortcut: bool = Field(
+            default=True,
+            description="If JSON parsing fails for a short message containing preference keywords, directly save the message content.",
+        )
+
+        enable_conversation_context: bool = Field(
+            default=True,
+            description="Include a brief conversation context summary in the extraction prompt to improve memory extraction quality.",
+        )
+
+        enable_extraction_quality_gate: bool = Field(
+            default=True,
+            description="Run a rule-based quality filter on extracted memories before saving.",
+        )
+
+        # Filtering & Saving
+
+        enable_identity_memories: bool = Field(
+            default=True,
+            description="Enable collecting Basic Identity information (age, gender, location, etc.)",
+        )
+
+        enable_behavior_memories: bool = Field(
+            default=True,
+            description="Enable collecting Behavior information (interests, habits, etc.)",
+        )
+
+        enable_preference_memories: bool = Field(
+            default=True,
+            description="Enable collecting Preference information (likes, dislikes, etc.)",
+        )
+
+        enable_goal_memories: bool = Field(
+            default=True,
+            description="Enable collecting Goal information (aspirations, targets, etc.)",
+        )
+
+        enable_relationship_memories: bool = Field(
+            default=True,
+            description="Enable collecting Relationship information (friends, family, etc.)",
+        )
+
+        enable_possession_memories: bool = Field(
+            default=True,
+            description="Enable collecting Possession information (things owned or desired)",
+        )
+
+        min_memory_length: int = Field(
+            default=8,
+            description="Minimum length of memory content to be saved",
+        )
+
+        min_confidence_threshold: float = Field(
+            default=0.5,
+            description="Minimum confidence score (0-1) required for an extracted memory to be saved. Scores below this are discarded.",
+        )
+
+        filter_trivia: bool = Field(
+            default=True,
+            description="Enable filtering of trivia/general knowledge memories after extraction",
+        )
+
+        blacklist_topics: Optional[str] = Field(
+            default=None,
+            description="Optional: Comma-separated list of topics to ignore during memory extraction",
+        )
+
+        whitelist_keywords: Optional[str] = Field(
+            default=None,
+            description="Optional: Comma-separated keywords that force-save a memory even if blacklisted",
+        )
+
+        short_preference_no_dedupe_length: int = Field(
+            default=100,
+            description="If a NEW memory's content length is below this threshold and contains preference keywords, skip deduplication checks to avoid false positives.",
+        )
+
+        preference_keywords_no_dedupe: str = Field(
+            default="favorite,love,like,prefer,enjoy",
+            description="Comma-separated keywords indicating user preferences that, when present in a short statement, trigger deduplication bypass.",
+        )
+
+        max_total_memories: int = Field(
+            default=200,
+            description="Maximum number of memories per user; prune oldest beyond this",
+        )
+
+        pruning_strategy: Literal["fifo", "least_relevant", "tiered_decay"] = Field(
+            default="fifo",
+            description="Strategy for pruning memories when max_total_memories is exceeded: 'fifo' (oldest first), 'least_relevant' (lowest relevance to current message first), or 'tiered_decay' (stability/importance-aware decay).",
+        )
+
+        # Deduplication & Contradiction
+
+        deduplicate_memories: bool = Field(
+            default=True,
+            description="Prevent storing duplicate or very similar memories",
+        )
+
+        use_embeddings_for_deduplication: bool = Field(
+            default=True,
+            description="Use embedding-based similarity for more accurate semantic duplicate detection (if False, uses text-based similarity)",
+        )
+
+        embedding_similarity_threshold: float = Field(
+            default=0.75,
+            description="Threshold (0-1) for considering two memories duplicates when using embedding similarity.",
+        )
+
+        similarity_threshold: float = Field(
+            default=0.95,
+            description="Threshold for detecting similar memories (0-1) using text or embeddings",
+        )
+
+        enable_contradiction_detection: bool = Field(
+            default=True,
+            description="Detect contradictions between new and existing memories and auto-promote NEW to UPDATE when found.",
+        )
+
+        contradiction_similarity_threshold: float = Field(
+            default=0.65,
+            description="Cosine similarity threshold below which contradiction check is skipped (too dissimilar to contradict).",
+        )
+
+        outlet_dedup_window_seconds: float = Field(
+            default=10.0,
+            description="Minimum seconds between processing the same user message hash in the outlet. Prevents duplicate memory extraction when streaming triggers multiple outlet calls for the same response.",
+        )
+
+        # Memory Retrieval
+
+        vector_similarity_threshold: float = Field(
+            default=0.15,
+            description="Minimum cosine similarity for broad initial vector candidate filtering (0-1)",
+        )
+
+        related_memories_n: int = Field(
+            default=10,
+            description="Number of related memories to consider",
+        )
+
+        top_n_memories: int = Field(
+            default=5,
+            description="Number of top vector candidates to pass to LLM relevance ranking",
+        )
+
+        use_llm_for_relevance: bool = Field(
+            default=False,
+            description="Use one batched LLM call for final relevance scoring after vector candidate filtering (if False, relies solely on vector similarity + relevance_threshold)",
+        )
+
+        llm_skip_relevance_threshold: float = Field(
+            default=0.93,
+            description="If *all* vector-filtered memories have similarity >= this threshold, treat the vector score as final relevance and skip the additional LLM call.",
+        )
+
+        relevance_threshold: float = Field(
+            default=0.35,
+            description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring",
+        )
+
         memory_relevance_prompt: str = Field(
             default="""You are a memory retrieval assistant. Your task is to determine which memories are relevant to the current context of a conversation.
 
@@ -7909,6 +7668,367 @@ Example: [{"memory": "User likes coffee", "id": "123", "relevance": 0.8}]
 Your output must be valid JSON only. No additional text.""",
             description="System prompt for memory relevance assessment",
         )
+
+        deduplicate_retrieved_memories: bool = Field(
+            default=True,
+            description="Deduplicate retrieved memories before injection, removing near-duplicates (similarity >= embedding_similarity_threshold) from the final context",
+        )
+
+        # Multi-Signal Scoring (Phase 0-5)
+
+        retrieval_scoring_version: str = Field(
+            default="v5",
+            description="Scoring algorithm version. 'v4' = original vector-only, 'v5' = multi-signal with recency/importance/access.",
+        )
+
+        enable_importance_scoring: bool = Field(
+            default=True,
+            description="Enable importance scoring (1-5) during memory extraction.",
+        )
+
+        enable_stability_decay: bool = Field(
+            default=True,
+            description="Enable stability-based differential decay for relevance and pruning.",
+        )
+
+        enable_access_tracking: bool = Field(
+            default=True,
+            description="Enable tracking of memory access counts and last-accessed timestamps.",
+        )
+
+        recency_boost_weight: float = Field(
+            default=0.10,
+            description="Weight applied to recency boost in relevance scoring (0-1). Higher = recency matters more.",
+        )
+
+        importance_weight: float = Field(
+            default=0.15,
+            description="Weight applied to importance in relevance scoring (0-1). Higher = importance matters more.",
+        )
+
+        access_boost_weight: float = Field(
+            default=0.05,
+            description="Weight applied to access count in relevance scoring (0-1).",
+        )
+
+        access_update_interval: int = Field(
+            default=5,
+            description="Only persist access stat updates every N retrievals per memory (reduces DB writes).",
+        )
+
+        enable_neighbor_retrieval: bool = Field(
+            default=False,
+            description="When a memory is selected, pull in semantically adjacent memories even if they didn't match the query directly.",
+        )
+
+        neighbor_hop_similarity: float = Field(
+            default=0.80,
+            description="Cosine similarity threshold for a memory to be considered a neighbor of a selected memory.",
+        )
+
+        neighbor_penalty: float = Field(
+            default=0.7,
+            description="Multiplier applied to a neighbor's score (0-1). Lower = neighbors ranked lower.",
+        )
+
+        max_neighbors_per_memory: int = Field(
+            default=2,
+            description="Maximum neighbor memories to pull in per selected memory.",
+        )
+
+        # Prompt Injection & Formatting
+
+        inject_memories_into_user_message: bool = Field(
+            default=True,
+            description="Inject memories into the last user message instead of the system prompt. "
+            "Preserves a stable prompt prefix for better DeepSeek/OpenCode prompt caching.",
+        )
+
+        deterministic_memory_ordering: bool = Field(
+            default=True,
+            description="Sort retrieved memories by ID before injection. "
+            "Same memories per request produce identical prompt text, "
+            "improving prompt cache hit rates.",
+        )
+
+        memory_format: Literal["bullet", "paragraph", "numbered"] = Field(
+            default="bullet", description="Format for displaying memories in context"
+        )
+
+        max_injected_memory_length: int = Field(
+            default=300,
+            description="Maximum length of each injected memory snippet",
+        )
+
+        enable_memory_acknowledgment: bool = Field(
+            default=True,
+            description="Instruct the LLM to naturally acknowledge relevant memories in its responses.",
+        )
+
+        # Memory Bank Config
+
+        allowed_memory_banks: List[str] = Field(
+            default=["General", "Personal", "Work"],
+            description="List of allowed memory bank names for categorization.",
+        )
+
+        default_memory_bank: str = Field(
+            default="General",
+            description="Default memory bank assigned when LLM omits or supplies an invalid bank.",
+        )
+
+        # Summarization Configuration
+
+        enable_summarization_task: bool = Field(
+            default=True,
+            description="Enable or disable the background memory summarization task",
+        )
+
+        summarization_interval: int = Field(
+            default=7200,
+            description="Interval in seconds between memory summarization runs",
+        )
+
+        summarization_min_cluster_size: int = Field(
+            default=3,
+            description="Minimum number of memories in a cluster for summarization",
+        )
+
+        summarization_similarity_threshold: float = Field(
+            default=0.7,
+            description="Threshold for considering memories related when using embedding similarity",
+        )
+
+        summarization_max_cluster_size: int = Field(
+            default=8,
+            description="Maximum memories to include in one summarization batch",
+        )
+
+        summarization_min_memory_age_days: int = Field(
+            default=7,
+            description="Minimum age in days for memories to be considered for summarization",
+        )
+
+        summarization_strategy: Literal["embeddings", "tags", "hybrid"] = Field(
+            default="hybrid",
+            description="Strategy for clustering memories: 'embeddings' (semantic similarity), 'tags' (shared tags), or 'hybrid' (combination)",
+        )
+
+        summarization_memory_prompt: str = Field(
+            default="""You are a memory summarization assistant. Your task is to combine related memories about a user into a concise, comprehensive summary.
+
+Given a set of related memories about a user, create a single durable memory that:
+1. Captures every important user-specific fact from the individual memories
+2. Resolves any contradictions by preferring newer dated information
+3. Preserves names, quantities, tools, projects, constraints, and strong preferences
+4. Removes redundancy without dropping distinct details
+5. Presents the information in a clear, concise format
+
+Focus on preserving the user's:
+- Explicit preferences
+- Identity details
+- Goals and aspirations
+- Relationships
+- Possessions
+- Behavioral patterns
+
+Your summary should be factual, concise, and maintain the same tone as the original memories. Do not invent details.
+Produce a single paragraph summary of approximately 75-150 words when needed to preserve distinct facts.
+
+Example:
+Individual memories:
+- "User likes to drink coffee in the morning"
+- "User prefers dark roast coffee"
+- "User mentioned drinking 2-3 cups of coffee daily"
+
+Good summary:
+"User is a coffee enthusiast who drinks 2-3 cups daily, particularly enjoying dark roast varieties in the morning."
+
+Analyze the following related memories and provide a concise summary.""",
+            description="System prompt for summarizing clusters of related memories",
+        )
+
+        # Background Tasks
+
+        enable_stale_detection_task: bool = Field(
+            default=True,
+            description="Enable background task that detects stale, low-importance memories for cleanup.",
+        )
+
+        stale_detection_interval: int = Field(
+            default=86400,
+            description="Interval in seconds between stale memory detection runs.",
+        )
+
+        stale_threshold_days: int = Field(
+            default=90,
+            description="Days since last access before a memory is considered stale.",
+        )
+
+        stale_action: Literal["log", "summarize", "delete"] = Field(
+            default="summarize",
+            description="Action to take on stale memories: 'log' (report only), 'summarize' (mark for summarization), or 'delete' (remove).",
+        )
+
+        enable_vector_cleanup_task: bool = Field(
+            default=True,
+            description="Enable or disable the background vector cleanup task",
+        )
+
+        vector_cleanup_interval: int = Field(
+            default=7200,
+            description="Interval in seconds between vector cleanup runs (removes orphaned embeddings)",
+        )
+
+        enable_error_logging_task: bool = Field(
+            default=True,
+            description="Enable or disable the background error counter logging task",
+        )
+
+        error_logging_interval: int = Field(
+            default=1800,
+            description="Interval in seconds between error counter log entries",
+        )
+
+        # Optional Mem0 Mirror Configuration
+
+        enable_mem0_sync: bool = Field(
+            default=False,
+            description="Optionally mirror local memory CRUD operations to Mem0. Disabled by default so memories stay local unless explicitly enabled.",
+        )
+
+        mem0_api_base_url: str = Field(
+            default="https://api.mem0.ai",
+            description="Base URL for the Mem0 API when Mem0 mirroring is enabled.",
+        )
+
+        mem0_api_key: Optional[str] = Field(
+            default=None,
+            description="API key for Mem0. Required only when enable_mem0_sync is enabled.",
+        )
+
+        mem0_app_id: str = Field(
+            default="openwebui-adaptive-memory",
+            description="Mem0 app_id used to namespace memories mirrored from this plugin.",
+        )
+
+        mem0_timeout_seconds: int = Field(
+            default=30,
+            description="Timeout in seconds for Mem0 API requests.",
+        )
+
+        mem0_reconcile_cooldown_seconds: float = Field(
+            default=30.0,
+            description="Minimum seconds between Mem0 delete-reconciliation checks for the same user during inbound requests.",
+        )
+
+        mem0_sync_strategy: Literal["background", "inline"] = Field(
+            default="background",
+            description="How Mem0 mirroring runs: 'background' queues CRUD changes for batched async syncing, while 'inline' performs Mem0 requests during the request path.",
+        )
+
+        mem0_sync_batch_size: int = Field(
+            default=10,
+            description="Maximum number of queued Mem0 jobs to process in one background batch.",
+        )
+
+        mem0_sync_batch_interval_seconds: float = Field(
+            default=7200.0,
+            description="Interval in seconds between scheduled Mem0 background sync runs.",
+        )
+
+        mem0_sync_retry_delay_seconds: float = Field(
+            default=15.0,
+            description="Delay before retrying a failed queued Mem0 sync job.",
+        )
+
+        mem0_sync_claim_timeout_seconds: float = Field(
+            default=300.0,
+            description="Seconds after which an in-progress Mem0 background sync job claim is considered stale and can be claimed by another worker.",
+        )
+
+        mem0_sync_max_retries: int = Field(
+            default=20,
+            description="Maximum number of retries for a failed Mem0 background sync job before it is permanently dropped. Set to 0 to retry indefinitely.",
+        )
+
+        mem0_user_id_template: str = Field(
+            default="owui:{user_id}",
+            description="Template used to map an Open WebUI user id into a Mem0 user id. May include {user_id} for per-user mapping, or be a fixed string such as 'jefe' to force all mirrored memories into one Mem0 user/entity.",
+        )
+
+        mem0_user_id_override: str = Field(
+            default="",
+            description="Optional per-user Mem0 mapping table shown in the main valve UI. Use targeted mappings like 'owui_user_id:jefe' (comma, semicolon, or newline separated) to route specific Open WebUI users to specific Mem0 users. Plain values like 'jefe' are ignored.",
+        )
+
+        mem0_infer_on_create: bool = Field(
+            default=False,
+            description="When true, mirrored Mem0 create requests use infer=true so Mem0 can extract, deduplicate, and resolve conflicts from the provided message. Disabled by default; when false, mirrored text is stored more literally with infer=false.",
+        )
+
+        # UI & Commands
+
+        show_status: bool = Field(
+            default=True, description="Show memory operations status in chat"
+        )
+
+        show_memories: bool = Field(
+            default=True, description="Show relevant memories in context"
+        )
+
+        enable_memory_commands: bool = Field(
+            default=True,
+            description="Enable /memories, /forget, and /remember slash commands.",
+        )
+
+        timezone: str = Field(
+            default="America/New_York",
+            description="Timezone for date/time processing (e.g., 'America/New_York', 'Europe/London')",
+        )
+
+        log_user_id_on_memory_save: bool = Field(
+            default=False,
+            description="Log hashed Open WebUI user_id and memory_id whenever a memory save or update succeeds. Useful for admin debugging without exposing raw identifiers.",
+        )
+
+        # Debug & Retry
+
+        max_retries: int = Field(
+            default=2, description="Maximum number of retries for API calls"
+        )
+
+        retry_delay: float = Field(
+            default=1.0, description="Delay between retries (seconds)"
+        )
+
+        enable_debug_logging: bool = Field(
+            default=False,
+            description="Enable DEBUG-level safe breadcrumbs. Logs still hash identifiers and redact content/secrets.",
+        )
+
+        debug_error_counter_logs: bool = Field(
+            default=False,
+            description="Emit detailed error counter logs at DEBUG level (set to True for troubleshooting).",
+        )
+
+        # Legacy / Inactive (kept for backward compatibility)
+
+        save_relevance_threshold: float = Field(
+            default=0.8,
+            description="Minimum relevance score (based on relevance calculation method) to save a memory",
+        )
+
+        memory_threshold: float = Field(
+            default=0.6,
+            description="Threshold for similarity when comparing memories (0-1)",
+        )
+
+        cache_ttl_seconds: int = Field(
+            default=86400,
+            description="Cache time-to-live in seconds (default 24 hours)",
+        )
+
         memory_merge_prompt: str = Field(
             default="""You are a memory consolidation assistant. When given sets of memories, you merge similar or related memories while preserving all important information.
 
@@ -7926,36 +8046,38 @@ Your output must be valid JSON only. No additional text.""",
             description="System prompt for merging memories",
         )
 
-        # Memory Bank Config
-        allowed_memory_banks: List[str] = Field(
-            default=["General", "Personal", "Work"],
-            description="List of allowed memory bank names for categorization.",
-        )
-        default_memory_bank: str = Field(
-            default="General",
-            description="Default memory bank assigned when LLM omits or supplies an invalid bank.",
+        enable_date_update_task: bool = Field(
+            default=True,
+            description="Enable or disable the background date update task",
         )
 
-        # Error Guard Config
+        date_update_interval: int = Field(
+            default=3600,
+            description="Interval in seconds between date information updates",
+        )
+
+        enable_model_discovery_task: bool = Field(
+            default=True,
+            description="Enable or disable the background model discovery task",
+        )
+
+        model_discovery_interval: int = Field(
+            default=7200, description="Interval in seconds between model discovery runs"
+        )
+
         enable_error_counter_guard: bool = Field(
             default=True,
             description="Enable guard to temporarily disable LLM/embedding features if specific error rates spike.",
         )
+
         error_guard_threshold: int = Field(
             default=5,
             description="Number of errors within the window required to activate the guard.",
         )
+
         error_guard_window_seconds: int = Field(
             default=600,
             description="Rolling time-window (in seconds) over which errors are counted for guarding logic.",
-        )
-        debug_error_counter_logs: bool = Field(
-            default=False,
-            description="Emit detailed error counter logs at DEBUG level (set to True for troubleshooting).",
-        )
-        enable_debug_logging: bool = Field(
-            default=False,
-            description="Enable DEBUG-level safe breadcrumbs. Logs still hash identifiers and redact content/secrets.",
         )
 
         # Validators
@@ -8083,6 +8205,8 @@ Your output must be valid JSON only. No additional text.""",
                     )
             return self
 
+
+
     class UserValves(BaseModel):
         enabled: bool = Field(
             default=True, description="Enable or disable the memory function"
@@ -8098,7 +8222,6 @@ Your output must be valid JSON only. No additional text.""",
             default="",
             description="User's timezone (overrides global setting if provided)",
         )
-
     # --------------------------------------------------------------------------
     # Main Filter Initialization
     # --------------------------------------------------------------------------
