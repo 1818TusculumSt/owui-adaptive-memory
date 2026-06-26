@@ -156,7 +156,7 @@ _raw_logger.propagate = False
 
 class AMAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        return f"[AM v4.2.0] {msg}", kwargs
+        return f"[AM v4.2.1] {msg}", kwargs
 
 logger = AMAdapter(_raw_logger, {})
 
@@ -5876,12 +5876,12 @@ class MemoryPipeline:
                     if (
                         self.valves.deduplicate_memories
                         and not skip_deduplication
-                        and not skip_preference_dedupe
                     ):
                         is_dupe, dedup_embedding, near_match = await self._is_duplicate(
                             content,
                             user_id,
                             all_memories_override=all_user_memories,
+                            force_text_only=skip_preference_dedupe,
                         )
                         if is_dupe:
                             logger.info(
@@ -5896,6 +5896,7 @@ class MemoryPipeline:
                             continue
 
                         if (near_match is not None
+                            and not skip_preference_dedupe
                             and getattr(self.valves, "enable_contradiction_detection", True)
                             and query_llm_func):
                             existing_record = self._get_memory_record(near_match)
@@ -6144,15 +6145,13 @@ class MemoryPipeline:
                         skip_preference_dedupe = self._should_skip_dedupe_for_short_preference(
                             new_content
                         )
-                        if (
-                            self.valves.deduplicate_memories
-                            and not skip_preference_dedupe
-                        ):
+                        if self.valves.deduplicate_memories:
                             is_dupe, new_embedding, _ = await self._is_duplicate(
                                 new_content,
                                 user_id,
                                 exclude_id=memory_id,
                                 all_memories_override=all_user_memories,
+                                force_text_only=skip_preference_dedupe,
                             )
                             if is_dupe:
                                 logger.info(
@@ -6379,7 +6378,7 @@ class MemoryPipeline:
 
         return False, None
 
-    async def _is_duplicate(self, text: str, user_id: str, exclude_id: Optional[str] = None, all_memories_override: Optional[List[Any]] = None) -> Tuple[bool, Optional[np.ndarray], Optional[Any]]:
+    async def _is_duplicate(self, text: str, user_id: str, exclude_id: Optional[str] = None, all_memories_override: Optional[List[Any]] = None, force_text_only: bool = False) -> Tuple[bool, Optional[np.ndarray], Optional[Any]]:
         """Check if the given text is a duplicate of existing memories.
 
         Returns:
@@ -6402,7 +6401,7 @@ class MemoryPipeline:
 
             user_obj = await self._get_user_object(user_id)
 
-            if self.valves.use_embeddings_for_deduplication:
+            if self.valves.use_embeddings_for_deduplication and not force_text_only:
                 new_embedding = await self.embedding_manager.get_embedding(
                     text, user=user_obj
                 )
@@ -8227,7 +8226,7 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter v4.2.0")
+        logger.info("Initializing Adaptive Memory Filter v4.2.1")
         self.valves = self.Valves()
         self._apply_logging_level()
         self.error_manager = ErrorManager()
@@ -8247,7 +8246,7 @@ Your output must be valid JSON only. No additional text.""",
         self._llm_session: Optional[aiohttp.ClientSession] = None
         self._outlet_processed_messages: Dict[str, float] = {}  # msg_hash -> timestamp, for outlet dedup
 
-        logger.info("Adaptive Memory Filter v4.2.0 initialized")
+        logger.info("Adaptive Memory Filter v4.2.1 initialized")
 
     def _apply_logging_level(self) -> None:
         _raw_logger.setLevel(
