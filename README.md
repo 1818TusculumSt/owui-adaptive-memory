@@ -30,7 +30,7 @@ User message → inlet()
   ├─ Reconcile Mem0 (if enabled)
   ├─ Select relevant memories via vector search + multi-signal boost (v5)
   │   ├─ Recency/importance/access weight boost
-  │   └─ One-hop neighbor retrieval (semantically adjacent memories)
+  │   └─ Optional one-hop neighbor retrieval (semantically adjacent memories; off by default)
   ├─ Track access stats (throttled DB writes)
   ├─ Inject context into last user message (stable prefix for prompt caching)
   └─ Emit rich status (high-importance count)
@@ -40,7 +40,7 @@ User message → inlet()
   outlet()
   ├─ Ask configured LLM to propose memory operations (NEW / UPDATE / DELETE)
   │   └─ LLM now provides importance (1-5) and stability (stable/fluid/transient)
-  ├─ Run extraction quality gate (reject general knowledge, downgrade transient)
+  ├─ Run extraction quality gate (reject general knowledge, downgrade transient; 30+ transient patterns)
   ├─ Gate UPDATE/DELETE against user's current message intent
   ├─ Check contradiction against near-match memories (auto-promote NEW → UPDATE)
   ├─ Deduplicate, filter secrets, apply quality checks
@@ -57,6 +57,33 @@ Slash commands (inlet):
   ├─ /forget kw   → delete a specific memory by keyword
   └─ /remember ... → save a new memory directly
 ```
+
+## 📊 Importance & Stability Scoring (v4.3.0)
+
+The system uses a **three-layer** approach to assign importance (1–5) and stability (stable/fluid/transient) to every memory:
+
+### Layer 1: LLM Extraction
+The extraction prompt now includes **11 examples** covering all 5 importance levels, distribution guidance (~60% should be 2–3), and negative examples showing what NOT to over-score. The LLM provides initial importance/stability with every memory operation.
+
+### Layer 2: Content-Based Lexical Signals
+Before tag floors apply, the system analyzes the memory content for semantic signals:
+
+| Signal Type | Examples | Effect |
+|-------------|----------|--------|
+| **Boost** | "always", "never", "love", "hate", "favorite", "my name is", "i work as", family terms | +1 importance |
+| **Demote** | "today", "yesterday", "right now", "maybe", "had for dinner", "debugging", "shopping for" | −1 importance |
+
+This ensures a pizza order scores **2** instead of 3, a name scores **5** instead of 4, and a passing location mention scores **1** instead of 4.
+
+### Layer 3: Softened Tag Floors
+Tag floors (e.g. `identity` → minimum 4, `relationship` → minimum 4) are no longer hard overrides:
+- If the LLM's score is **within 1 point** of the tag floor, the LLM is trusted
+- Only if the gap is **≥2 points** does the system bump the score up (to floor−1)
+- If the LLM didn't provide a score at all, the hard floor still applies (backward compatible)
+
+The same approach applies to stability: only upgrades if the LLM is 2+ levels below the tag floor.
+
+**Result:** The old clustering at importance 3–4 and stability fluid–stable is gone. Memories now meaningfully differentiate across all 5 importance levels and all 3 stability classes.
 
 ## ⚙️ Valve Reference
 
@@ -79,7 +106,7 @@ Slash commands (inlet):
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `recent_messages_n` | `5` | Recent user messages included in the extraction prompt |
-| `memory_identification_prompt` | *(long prompt)* | System prompt for the extraction LLM — now requires `importance` (1-5) and `stability` (`stable`/`fluid`/`transient`) |
+| `memory_identification_prompt` | *(long prompt)* | System prompt for the extraction LLM — requires `importance` (1-5) and `stability` (`stable`/`fluid`/`transient`). v4.3.0: 11 examples across all levels, distribution guidance, negative examples. |
 | `enable_json_stripping` | `True` | Strip markdown fences and extra text from LLM JSON response |
 | `enable_fallback_regex` | `True` | Fallback regex extraction if JSON parsing fails |
 | `enable_short_preference_shortcut` | `True` | Bypass the LLM for short preference statements (e.g. "I like X") |
@@ -118,7 +145,7 @@ Slash commands (inlet):
 | `enable_contradiction_detection` | `True` | Detect contradictions between new and existing memories; auto-promote NEW to UPDATE |
 | `contradiction_similarity_threshold` | `0.65` | Min cosine similarity before contradiction check is attempted |
 | `enable_conversation_context` | `True` | Include a brief conversation context summary in the extraction prompt |
-| `enable_neighbor_retrieval` | `True` | Pull in semantically adjacent memories even if they didn't match the query directly |
+| `enable_neighbor_retrieval` | `False` | Pull in semantically adjacent memories even if they didn't match the query directly |
 | `neighbor_hop_similarity` | `0.80` | Cosine similarity threshold for a memory to be considered a neighbor |
 | `neighbor_penalty` | `0.7` | Score multiplier (0-1) applied to neighbor memories |
 | `max_neighbors_per_memory` | `2` | Max neighbor memories to pull in per selected memory |
@@ -204,11 +231,8 @@ Slash commands (inlet):
 
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `enable_summarization_task` | `True` | Run background memory summarization |
-| `enable_stale_detection_task` | `True` | Detect stale, low-importance memories for cleanup |
 | `enable_error_logging_task` | `True` | Periodic error counter snapshots |
 | `enable_vector_cleanup_task` | `True` | Clean up orphaned vectors |
-| `stale_detection_interval` | `86400` | Seconds between stale memory detection runs |
 | `error_logging_interval` | `1800` | Seconds between error counter logs |
 | `vector_cleanup_interval` | `7200` | Seconds between vector cleanup runs |
 | `enable_debug_logging` | `False` | Enable DEBUG-level safe breadcrumbs |
@@ -239,8 +263,8 @@ With multi-signal features enabled, memories include additional fields:
 
 | Field | Range | Description |
 |-------|-------|-------------|
-| `Importance` | 1-5 | 5=core identity, 4=strong preference, 3=moderate, 2=situational, 1=trivia |
-| `Stability` | stable/fluid/transient | `stable`=years, `fluid`=months, `transient`=days/weeks |
+| `Importance` | 1-5 | 5=core identity, 4=strong preference, 3=moderate, 2=situational, 1=trivia. Boosted/demoted by content signals; tag floors are soft gap-based. See *Importance & Stability Scoring* below. |
+| `Stability` | stable/fluid/transient | `stable`=years, `fluid`=months, `transient`=days/weeks. Tag floors only upgrade if the LLM is 2+ levels below. |
 | `LastAccessed` | ISO date | Updated on retrieval (throttled per `access_update_interval`) |
 | `AccessCount` | int | How many times the memory has been retrieved |
 
@@ -255,7 +279,7 @@ With multi-signal features enabled, memories include additional fields:
 | Importance | ignored | 15% weight |
 | Access frequency | ignored | 5% weight |
 | Decay | uniform | stable=0%, fluid=0.003/day, transient=0.015/day |
-| Importance modulation | none | importance slows decay (5=halved, 1=doubled) |
+| Importance modulation | none | importance modulates decay via ×`(importance−3)×0.25`: 5=halved, 1=+50%, 3=no change |
 
 Set `retrieval_scoring_version="v4"` to revert to original behavior.
 
@@ -281,7 +305,7 @@ The check uses a separate LLM call with a focused contradiction-detection prompt
 |----------|----------|
 | `fifo` | Removes oldest memories first |
 | `least_relevant` | Scores by `confidence - (age × 0.01)`, removes lowest scores |
-| `tiered_decay` | Scores by `confidence - (age × decay_rate) + (access × 0.02) + (importance × 0.05)`. Stable/important/frequently-accessed memories are preserved; transient/old/rarely-accessed memories are pruned first |
+| `tiered_decay` | Scores by `confidence - (age × decay_rate) + (access × 0.02) + (importance × 0.05)`. Decay rate is modulated by importance: `decay × (1 − (importance−3) × 0.25)`. Stable/important/frequently-accessed memories are preserved; transient/old/rarely-accessed memories are pruned first |
 
 ## 💬 Slash Commands
 
@@ -311,7 +335,7 @@ The LLM can propose `NEW`, `UPDATE`, and `DELETE` operations. Destructive operat
 | 🤫 **Secret filtering** | Blocks API keys, bearer tokens, passwords, private keys, DB URLs with credentials, SSNs, and Luhn-validated credit card numbers before storage. Heuristic, not full DLP. |
 | 🔏 **Safe logging** | All logged identifiers are hashed. Raw user messages, memory contents, prompts, completions, and API keys are never logged. |
 | 🧱 **Memory injection** | Recalled memories are injected as untrusted factual context, not instructions, reducing prompt-injection blast radius. |
-| ✅ **Extraction quality gate** | Rule-based filter rejects general knowledge statements and downgrades transient content before saving. |
+| ✅ **Extraction quality gate** | Rule-based filter rejects general knowledge statements and downgrades transient content before saving. Detects 30+ transient patterns (temporal, task, consumption). |
 
 ## 📁 Sidecar Files
 
@@ -345,7 +369,7 @@ python -m unittest discover -s tests
 git diff --check
 ```
 
-Current: **109 tests** (up from 70).
+Current: **121 tests** (up from 70).
 
 ## 📄 License
 
