@@ -1387,6 +1387,46 @@ class TestMemoryInjectionSafety(unittest.TestCase):
         self.assertIn("User lives in Florida", messages[0]["content"])
         self.assertNotIn("System Note", messages[0]["content"])
 
+    def test_inject_memories_into_user_message_multimodal(self):
+        """Injection preserves image_url parts when content is a multimodal list."""
+        filter_instance = am.Filter()
+        filter_instance.valves = make_valves(
+            inject_memories_into_user_message=True,
+            show_memories=True,
+        )
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what's in this screenshot?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc123"}},
+            ],
+        }]
+        memory = types.SimpleNamespace(
+            id="memory-id",
+            content=am.format_memory_content(
+                "User is a developer", ["personal"], "General", 0.9
+            ),
+        )
+
+        injected = filter_instance._inlet_inject_memories(
+            messages, [memory], user_id="u1", session_id="s1"
+        )
+
+        self.assertEqual(injected, 1)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        # content is still a list, not a corrupted string
+        content = messages[0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(len(content), 2)
+        # text part has context prepended
+        self.assertEqual(content[0]["type"], "text")
+        self.assertIn("User is a developer", content[0]["text"])
+        self.assertIn("what's in this screenshot?", content[0]["text"])
+        # image_url part is untouched
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertEqual(content[1]["image_url"]["url"], "data:image/png;base64,abc123")
+
     def test_inject_memories_into_user_message_no_user_msg(self):
         filter_instance = am.Filter()
         filter_instance.valves = make_valves(

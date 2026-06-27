@@ -156,7 +156,7 @@ _raw_logger.propagate = False
 
 class AMAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        return f"[AM v4.3.0] {msg}", kwargs
+        return f"[AM v4.3.1] {msg}", kwargs
 
 logger = AMAdapter(_raw_logger, {})
 
@@ -8295,7 +8295,7 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter v4.3.0")
+        logger.info("Initializing Adaptive Memory Filter v4.3.1")
         self.valves = self.Valves()
         self._apply_logging_level()
         self.error_manager = ErrorManager()
@@ -8315,7 +8315,7 @@ Your output must be valid JSON only. No additional text.""",
         self._llm_session: Optional[aiohttp.ClientSession] = None
         self._outlet_processed_messages: Dict[str, float] = {}  # msg_hash -> timestamp, for outlet dedup
 
-        logger.info("Adaptive Memory Filter v4.3.0 initialized")
+        logger.info("Adaptive Memory Filter v4.3.1 initialized")
 
     def _apply_logging_level(self) -> None:
         _raw_logger.setLevel(
@@ -8657,9 +8657,14 @@ Your output must be valid JSON only. No additional text.""",
                 if context_text:
                     for i in range(len(messages) - 1, -1, -1):
                         if messages[i].get("role") == "user":
-                            messages[i]["content"] = (
-                                f"{context_text}\n\n{messages[i]['content']}"
-                            )
+                            content = messages[i]["content"]
+                            if isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        part["text"] = f"{context_text}\n\n{part.get('text', '')}"
+                                        break
+                            else:
+                                messages[i]["content"] = f"{context_text}\n\n{content}"
                             injected_count = len(relevant_memories)
                             break
             logger.info(
