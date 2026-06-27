@@ -521,7 +521,7 @@ class TestMultiSignalMemory(unittest.TestCase):
 
     def test_build_short_preference_operation_has_defaults(self):
         pipeline = make_pipeline()
-        op = pipeline._build_short_preference_operation("I love coffee")
+        op = pipeline._build_short_preference_operation("I enjoy coffee")
         self.assertIsNotNone(op)
         self.assertEqual(op["importance"], 3)
         self.assertEqual(op["stability"], "fluid")

@@ -156,7 +156,7 @@ _raw_logger.propagate = False
 
 class AMAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        return f"[AM v4.2.1] {msg}", kwargs
+        return f"[AM v4.3.0] {msg}", kwargs
 
 logger = AMAdapter(_raw_logger, {})
 
@@ -287,6 +287,49 @@ TRANSIENT_MARKERS = (
     "today i", "right now i", "at the moment", "this morning",
     "currently working on", "just finished", "about to",
     "going to", "gonna", "i'm about to",
+    "this afternoon", "this evening", "tonight",
+    "yesterday i", "last night",
+    "currently ", " right now", "as we speak",
+    "debugging", "figuring out", "trying to",
+    "just had", "just ate", "just watched", "just bought",
+    "had for dinner", "had for lunch", "had for breakfast",
+    "eating ", "watching ", "listening to",
+    "shopping for", "looking for",
+    "need to figure", "need to debug", "need to fix",
+)
+
+# Content signals that boost importance (permanence, identity, strong sentiment)
+IMPORTANCE_BOOST_SIGNALS = (
+    "always ", " never ", "every day", "every time",
+    "my name is", "i am a ", "i'm a ", "i work as",
+    "i work at", "i live in", "i was born",
+    "favorite", " love ", " hate ", "passionate",
+    "diagnosed with", "cannot stand", "can't stand",
+    "i always", "i never", "i refuse",
+    "my wife", "my husband", "my child", "my kid",
+    "my son", "my daughter", "my fianc", "my partner",
+    "my girlfriend", "my boyfriend", "my spouse",
+    "my mother", "my father", "my parent",
+    "my sister", "my brother", "my family",
+    "for years", "my whole life", "since i was",
+)
+
+# Content signals that demote importance (transience, uncertainty, consumption)
+IMPORTANCE_DEMOTE_SIGNALS = (
+    "today", "yesterday", "tonight",
+    "this morning", "this afternoon", "this evening",
+    "this week", "this month",
+    "right now", "currently", "thinking about",
+    "maybe", "perhaps", "i guess", "kind of", "sort of",
+    " ate ", "eating ", "watching ", "listening to",
+    "looking for", "shopping for", "just browsing",
+    "debugging", "figuring out",
+    "just finished", "just started", "just got",
+    "just bought", "just watched", "just ate", "just had",
+    "about to", "going to", "gonna",
+    "need to figure", "trying to",
+    "one-off", "this one time", "occasionally",
+    "a little", "a bit", "slightly",
 )
 
 TAG_IMPORTANCE_FLOOR: Dict[str, int] = {
@@ -4613,30 +4656,52 @@ class MemoryPipeline:
             return None
 
         importance = 3
+        llm_provided_importance = False
         if getattr(self.valves, "enable_importance_scoring", True):
             raw_importance = item.get("importance")
             if raw_importance is not None:
+                llm_provided_importance = True
                 try:
                     importance = max(1, min(5, int(raw_importance)))
                 except (TypeError, ValueError):
                     importance = 3
 
         stability = "fluid"
+        llm_provided_stability = False
         raw_stability = str(item.get("stability", "")).strip().lower()
         if raw_stability in ("stable", "fluid", "transient"):
             stability = raw_stability
+            llm_provided_stability = True
 
+        # Content-based importance adjustment (before tag floors)
+        lowered = content.lower()
+        if llm_provided_importance:
+            boost_count = sum(1 for m in IMPORTANCE_BOOST_SIGNALS if m in lowered)
+            demote_count = sum(1 for m in IMPORTANCE_DEMOTE_SIGNALS if m in lowered)
+            net_adjust = min(boost_count, 2) - min(demote_count, 2)
+            if net_adjust != 0:
+                importance = max(1, min(5, importance + net_adjust))
+
+        # Softened tag floors: only soften if LLM explicitly provided the score
         for tag in tags:
             floor = TAG_IMPORTANCE_FLOOR.get(tag)
             if floor is not None:
-                importance = max(importance, floor)
+                if llm_provided_importance:
+                    if importance < floor - 1:
+                        importance = floor - 1
+                else:
+                    importance = max(importance, floor)
 
             floor_stability = TAG_STABILITY_FLOOR.get(tag)
             if floor_stability is not None:
-                llm_rank = STABILITY_RANK.get(stability, 1)
                 floor_rank = STABILITY_RANK.get(floor_stability, 1)
-                if floor_rank > llm_rank:
-                    stability = floor_stability
+                llm_rank = STABILITY_RANK.get(stability, 1)
+                if llm_provided_stability:
+                    if floor_rank > llm_rank + 1:
+                        stability = floor_stability
+                else:
+                    if floor_rank > llm_rank:
+                        stability = floor_stability
 
         normalized_op = {
             "operation": operation,
@@ -5296,7 +5361,7 @@ class MemoryPipeline:
             importance = memory_record.importance or 3
             decay_rate = decay_rates.get(stability, 0.005)
             if getattr(self.valves, "enable_stability_decay", True):
-                effective_decay = decay_rate * (1 - (importance - 3) * 0.15)
+                effective_decay = decay_rate * (1 - (importance - 3) * 0.25)
             else:
                 effective_decay = 0.003
             recency_boost = max(0, 1 - (age_days * effective_decay))
@@ -6668,7 +6733,7 @@ class MemoryPipeline:
                         age_days = 9999
 
                     decay_rate = decay_rates.get(stability, 0.005)
-                    effective_decay = decay_rate * (1 - (importance - 3) * 0.15)
+                    effective_decay = decay_rate * (1 - (importance - 3) * 0.25)
 
                     pruning_score = (
                         confidence
@@ -7382,31 +7447,75 @@ class Filter:
   - `"importance"`: integer 1-5 (REQUIRED)
   - `"stability"`: "stable" | "fluid" | "transient" (REQUIRED)
 
-* **importance**: You MUST include an importance score (integer 1-5):
-  - 5: Core identity (name, profession, long-term relationships, medical conditions)
-  - 4: Strong preferences, ongoing projects, important goals
-  - 3: Moderate preferences, habits, interests, current tools/workflows
-  - 2: Situational context, current tasks of the day, minor likes
-  - 1: Minor passing mentions, trivia about the user, one-off statements
+* **importance (1-5) — SPREAD YOUR SCORES. Most memories should be 2-3.**
+  Reserve 5 for: the user's name, their profession/career, their permanent home location, long-term relationships (spouse, children, immediate family), medical conditions, fundamental life circumstances that define who they are and won't change.
+  Reserve 4 for: strong preferences stated emphatically ("love", "hate", "favorite"), ongoing major projects, important goals, possessions that are central to their identity, recurring habits that define their routine.
+  Use 3 for: moderate preferences stated neutrally ("I like", "I use", "I prefer"), current tools and workflows, interests they engage with regularly, behaviors that are consistent but not defining.
+  Use 2 for: situational context and current tasks ("working on X today", "debugging Y"), minor likes and dislikes stated in passing, temporary circumstances, routine daily activities (what they ate, watched, did today), shopping interests, one-off errands.
+  Use 1 for: trivial passing mentions, throwaway statements, obvious observations, things that barely qualify as a memory but are still user-specific facts.
 
-* **stability**: You MUST include a stability class:
-  - "stable": Unlikely to change over years (identity, permanent relationships, fundamental traits)
-  - "fluid": May change over months (preferences, projects, goals, tools)
-  - "transient": Likely to change over days/weeks (current task, today's mood, situational context)
+  RULE OF THUMB: if the user mentions what they had for dinner, a movie they watched, a store they visited, or a task they're doing right now — that's importance 2 (or 1). If it's a core part of who they are (name, job, home, family) — that's 5. Most other things fall at 3.
 
-* **confidence**: You MUST include a confidence score (float between 0.0 and 1.0) indicating certainty that the extracted text is a persistent user fact/preference. High confidence (0.8-1.0) for direct statements, lower (0.5-0.7) for inferences.
+* **stability**:
+  "stable": Things that will NOT change for years or ever. The user's name, birthplace, profession (if stated as identity), permanent family relationships, lifelong traits. ASK: "Could this meaningfully change within a year?" If no, it's stable.
+  "fluid": Things that may change over months. Current job/role, current city/neighborhood, active projects, hobbies and interests, tool preferences, moderate opinions. Most memories should be fluid.
+  "transient": Things that change over days or weeks. What the user ate today, their current task, what they're watching/reading right now, today's mood or opinion, a temporary situation they're dealing with. ASK: "Would I be surprised if this is different next week?" If no, it's transient.
 
-* **memory_bank**: You MUST include a `memory_bank` field, choosing from: "General", "Personal", "Work". Default to "General" if unsure.
+* **confidence**: float 0.0-1.0. High confidence (0.85-1.0) when the user directly states something about themselves. Medium (0.7-0.85) for clear inferences. Low (0.5-0.7) for weak inferences or ambiguous statements.
 
-* **tags**: You MUST include a `tags` field with a list of relevant tags from: ["identity", "behavior", "preference", "goal", "relationship", "possession"].
+* **memory_bank**: "General", "Personal", or "Work". Default to "General" if unsure.
 
-**INFORMATION TO EXTRACT (User-Specific ONLY):**
-* Explicit Preferences/Statements: User states "I love X", "My favorite is Y", "I enjoy Z". Extract these verbatim with high confidence.
-* Identity: Name, location, age, profession, etc. (high confidence, importance 4-5)
-* Goals: Aspirations, plans (medium-high confidence, importance 3-4)
-* Relationships: Mentions of family, friends, colleagues (high confidence, importance 4-5)
-* Possessions: Things owned or desired (medium-high confidence, importance 2-3)
-* Behaviors/Interests: Topics the user discusses or asks about (medium confidence, importance 2-3)
+* **tags**: Choose from ["identity", "behavior", "preference", "goal", "relationship", "possession"]. Use MULTIPLE tags when a memory fits more than one category.
+
+**DISTRIBUTION GUIDANCE — CRITICAL FOR SCORING CALIBRATION:**
+A healthy set of memories should have roughly: ~10% at importance 5, ~15% at importance 4, ~40% at importance 3, ~25% at importance 2, ~10% at importance 1.
+Most memories (60-70%) should be in the 2-3 range. DO NOT default to 3 for everything. Be honest about what's truly important and what's just situational context.
+
+**EXAMPLES COVERING THE FULL RANGE:**
+
+importance=5, stable:
+{"operation":"NEW","content":"User is a software engineer named John, lives in Orlando, FL","tags":["identity"],"memory_bank":"Personal","confidence":0.95,"importance":5,"stability":"stable"}
+
+importance=5, stable:
+{"operation":"NEW","content":"User has been married to Jane for 12 years and they have two kids, ages 8 and 10","tags":["identity","relationship"],"memory_bank":"Personal","confidence":0.95,"importance":5,"stability":"stable"}
+
+importance=4, stable:
+{"operation":"NEW","content":"User is a passionate Python developer who prefers backend work","tags":["identity","preference"],"memory_bank":"Work","confidence":0.9,"importance":4,"stability":"stable"}
+
+importance=4, fluid:
+{"operation":"NEW","content":"User's home area zip code is 32810","tags":["identity"],"memory_bank":"Personal","confidence":0.95,"importance":4,"stability":"fluid"}
+
+importance=3, fluid:
+{"operation":"NEW","content":"User prefers VS Code for development","tags":["preference","behavior"],"memory_bank":"Work","confidence":0.85,"importance":3,"stability":"fluid"}
+
+importance=3, fluid:
+{"operation":"NEW","content":"User recently started learning Rust for systems programming","tags":["goal","behavior"],"memory_bank":"Work","confidence":0.85,"importance":3,"stability":"fluid"}
+
+importance=2, transient:
+{"operation":"NEW","content":"User is currently debugging a Kubernetes cluster issue","tags":["behavior"],"memory_bank":"Work","confidence":0.85,"importance":2,"stability":"transient"}
+
+importance=2, fluid:
+{"operation":"NEW","content":"User is interested in shopping options in zip code 32810","tags":["behavior","preference"],"memory_bank":"General","confidence":0.8,"importance":2,"stability":"fluid"}
+
+importance=2, transient:
+{"operation":"NEW","content":"User wants the path to an .env file to set environment variables","tags":["behavior"],"memory_bank":"General","confidence":0.9,"importance":2,"stability":"fluid"}
+
+importance=2, fluid:
+{"operation":"NEW","content":"User had chicken Caesar pizza and pepperoni pizza for dinner","tags":["behavior"],"memory_bank":"Personal","confidence":0.95,"importance":2,"stability":"fluid"}
+
+importance=1, transient:
+{"operation":"NEW","content":"User mentioned seeing a good deal on a laptop at Best Buy","tags":["behavior"],"memory_bank":"General","confidence":0.7,"importance":1,"stability":"transient"}
+
+importance=1, transient:
+{"operation":"NEW","content":"User visited Holmes County, Ohio recently","tags":["behavior"],"memory_bank":"Personal","confidence":0.8,"importance":1,"stability":"transient"}
+
+**WHAT TO AVOID — COMMON MISTAKES:**
+- DON'T give importance 4 to casual shopping interests or food preferences—those are 2
+- DON'T give stability "stable" to a zip code, current town, or job—those can change, use "fluid"
+- DON'T give importance 3 to what someone ate for dinner—that's 2 or even 1
+- DON'T default everything to importance 3—use the full 1-5 scale
+- DON'T tag a passing mention of a place as "identity" with importance 4—it's likely just a behavior
+- DON'T forget to mark temporary/current situations as "transient" stability
 
 **RULES (Reiteration - Critical):**
 +1. JSON ARRAY ONLY: `[`...`]` - Nothing else!
@@ -7416,46 +7525,6 @@ class Filter:
 +5. MEMORY BANK REQUIRED: Every object needs a `"memory_bank": "..."` field.
 +6. TAGS REQUIRED: Every object needs a `"tags": [...]` field.
 +7. USER INFO ONLY: Discard trivia, questions *to* the AI, temporary thoughts.
-
-**GOOD EXAMPLE OUTPUT (Strictly adhere to this):**
-[
-  {
-    "operation": "NEW",
-    "content": "User has been a software engineer for 8 years",
-    "tags": ["identity", "behavior"],
-    "memory_bank": "Work",
-    "confidence": 0.95,
-    "importance": 5,
-    "stability": "stable"
-  },
-  {
-    "operation": "NEW",
-    "content": "User has a cat named Whiskers",
-    "tags": ["relationship", "possession"],
-    "memory_bank": "Personal",
-    "confidence": 0.9,
-    "importance": 4,
-    "stability": "stable"
-  },
-  {
-    "operation": "NEW",
-    "content": "User prefers working remotely",
-    "tags": ["preference", "behavior"],
-    "memory_bank": "Work",
-    "confidence": 0.7,
-    "importance": 4,
-    "stability": "fluid"
-  },
-  {
-    "operation": "NEW",
-    "content": "User is currently debugging the Kubernetes cluster issue",
-    "tags": ["behavior"],
-    "memory_bank": "Work",
-    "confidence": 0.85,
-    "importance": 2,
-    "stability": "transient"
-  }
-]
 
 Analyze the following user message(s) and provide **ONLY** the JSON array output. Double-check your response starts with `[` and ends with `]` and contains **NO** other text whatsoever.""",
             description="System prompt for memory identification",
@@ -8226,7 +8295,7 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter v4.2.1")
+        logger.info("Initializing Adaptive Memory Filter v4.3.0")
         self.valves = self.Valves()
         self._apply_logging_level()
         self.error_manager = ErrorManager()
@@ -8246,7 +8315,7 @@ Your output must be valid JSON only. No additional text.""",
         self._llm_session: Optional[aiohttp.ClientSession] = None
         self._outlet_processed_messages: Dict[str, float] = {}  # msg_hash -> timestamp, for outlet dedup
 
-        logger.info("Adaptive Memory Filter v4.2.1 initialized")
+        logger.info("Adaptive Memory Filter v4.3.0 initialized")
 
     def _apply_logging_level(self) -> None:
         _raw_logger.setLevel(
