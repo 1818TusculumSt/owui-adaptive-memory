@@ -156,7 +156,7 @@ _raw_logger.propagate = False
 
 class AMAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        return f"[AM v4.3.1] {msg}", kwargs
+        return f"[AM v4.4.0] {msg}", kwargs
 
 logger = AMAdapter(_raw_logger, {})
 
@@ -293,9 +293,13 @@ TRANSIENT_MARKERS = (
     "debugging", "figuring out", "trying to",
     "just had", "just ate", "just watched", "just bought",
     "had for dinner", "had for lunch", "had for breakfast",
+    "ate ", "drank ", "ordered ", "cooked ", "made ",
     "eating ", "watching ", "listening to",
-    "shopping for", "looking for",
+    "shopping for", "looking for", "picked up", "bought ",
     "need to figure", "need to debug", "need to fix",
+    "for dinner", "for lunch", "for breakfast",
+    "this weekend", "last weekend", "earlier today",
+    "stopped by", "dropped by", "went to",
 )
 
 # Content signals that boost importance (permanence, identity, strong sentiment)
@@ -318,7 +322,8 @@ IMPORTANCE_BOOST_SIGNALS = (
 IMPORTANCE_DEMOTE_SIGNALS = (
     "today", "yesterday", "tonight",
     "this morning", "this afternoon", "this evening",
-    "this week", "this month",
+    "this week", "this month", "last week", "last month",
+    "earlier today", "earlier this",
     "right now", "currently", "thinking about",
     "maybe", "perhaps", "i guess", "kind of", "sort of",
     " ate ", "eating ", "watching ", "listening to",
@@ -330,6 +335,10 @@ IMPORTANCE_DEMOTE_SIGNALS = (
     "need to figure", "trying to",
     "one-off", "this one time", "occasionally",
     "a little", "a bit", "slightly",
+    "cooked ", "ordered ", "drank ", "made ",
+    "had for", "stopped by", "dropped by", "went to",
+    "picked up", "bought ",
+    "for dinner", "for lunch", "for breakfast",
 )
 
 TAG_IMPORTANCE_FLOOR: Dict[str, int] = {
@@ -482,8 +491,8 @@ class StoredMemoryRecord:
     tags: List[str] = field(default_factory=list)
     memory_bank: str = "General"
     confidence: Optional[float] = None
-    importance: int = 3
-    stability: str = "fluid"
+    importance: int = 2
+    stability: str = "transient"
     last_accessed: Optional[str] = None
     access_count: int = 0
 
@@ -746,7 +755,7 @@ def parse_stored_memory(memory_text: Any) -> StoredMemoryRecord:
     except (TypeError, ValueError):
         confidence = None
 
-    importance = 3
+    importance = 2
     importance_raw = match.group("importance")
     if importance_raw:
         try:
@@ -754,7 +763,7 @@ def parse_stored_memory(memory_text: Any) -> StoredMemoryRecord:
         except (TypeError, ValueError):
             pass
 
-    stability = "fluid"
+    stability = "transient"
     stability_raw = match.group("stability")
     if stability_raw:
         stability_clean = stability_raw.strip().lower()
@@ -4655,7 +4664,7 @@ class MemoryPipeline:
         if item.get("tags") and not tags:
             return None
 
-        importance = 3
+        importance = 2
         llm_provided_importance = False
         if getattr(self.valves, "enable_importance_scoring", True):
             raw_importance = item.get("importance")
@@ -4664,9 +4673,9 @@ class MemoryPipeline:
                 try:
                     importance = max(1, min(5, int(raw_importance)))
                 except (TypeError, ValueError):
-                    importance = 3
+                    importance = 2
 
-        stability = "fluid"
+        stability = "transient"
         llm_provided_stability = False
         raw_stability = str(item.get("stability", "")).strip().lower()
         if raw_stability in ("stable", "fluid", "transient"):
@@ -4675,12 +4684,11 @@ class MemoryPipeline:
 
         # Content-based importance adjustment (before tag floors)
         lowered = content.lower()
-        if llm_provided_importance:
-            boost_count = sum(1 for m in IMPORTANCE_BOOST_SIGNALS if m in lowered)
-            demote_count = sum(1 for m in IMPORTANCE_DEMOTE_SIGNALS if m in lowered)
-            net_adjust = min(boost_count, 2) - min(demote_count, 2)
-            if net_adjust != 0:
-                importance = max(1, min(5, importance + net_adjust))
+        boost_count = sum(1 for m in IMPORTANCE_BOOST_SIGNALS if m in lowered)
+        demote_count = sum(1 for m in IMPORTANCE_DEMOTE_SIGNALS if m in lowered)
+        net_adjust = min(boost_count, 2) - min(demote_count, 2)
+        if net_adjust != 0:
+            importance = max(1, min(5, importance + net_adjust))
 
         # Softened tag floors: only soften if LLM explicitly provided the score
         for tag in tags:
@@ -5151,6 +5159,9 @@ class MemoryPipeline:
         scored_memories.sort(key=lambda x: x[0], reverse=True)
         self._log_retrieval_score_summary(user_id, session_id, scored_memories)
 
+        # Hard recency gate: exclude old transient/fluid memories
+        scored_memories = self._apply_recency_gate(scored_memories)
+
         if (
             getattr(self.valves, "use_llm_for_relevance", False)
             and query_llm_func
@@ -5354,10 +5365,10 @@ class MemoryPipeline:
             age_days = (datetime.now(timezone.utc) - created_at).days
             decay_rates = {
                 "stable": 0.0,
-                "fluid": 0.003,
-                "transient": 0.015,
+                "fluid": 0.01,
+                "transient": 0.05,
             }
-            stability = memory_record.stability or "fluid"
+            stability = memory_record.stability or "transient"
             importance = memory_record.importance or 3
             decay_rate = decay_rates.get(stability, 0.005)
             if getattr(self.valves, "enable_stability_decay", True):
@@ -5383,6 +5394,71 @@ class MemoryPipeline:
         )
 
         return min(1.0, max(0.0, boosted))
+
+    def _apply_recency_gate(
+        self, scored_memories: List[Tuple[float, Any]]
+    ) -> List[Tuple[float, Any]]:
+        """Hard-exclude old transient/fluid memories from retrieval."""
+        if not getattr(self.valves, "enable_age_gate", True):
+            return scored_memories
+
+        transient_max = getattr(self.valves, "transient_age_gate_days", 3)
+        fluid_max = getattr(self.valves, "fluid_age_gate_days", 30)
+        exempt_importance = getattr(self.valves, "age_gate_importance_exempt", 4)
+
+        filtered: List[Tuple[float, Any]] = []
+        for score, memory in scored_memories:
+            try:
+                memory_record = self._get_memory_record(memory)
+            except Exception:
+                filtered.append((score, memory))
+                continue
+
+            imp = memory_record.importance or 2
+            if imp >= exempt_importance:
+                filtered.append((score, memory))
+                continue
+
+            stab = memory_record.stability or "transient"
+            created_at = self._coerce_created_at(
+                get_memory_value(memory, "created_at")
+            )
+            if not created_at:
+                filtered.append((score, memory))
+                continue
+
+            age_days = (datetime.now(timezone.utc) - created_at).days
+
+            if stab == "transient" and age_days >= transient_max and age_days > 0:
+                logger.debug(
+                    "memory_age_gate_excluded %s",
+                    safe_log_context(
+                        memory_id=str(self._get_memory_id(memory) or ""),
+                        operation="RETRIEVE",
+                        reason="transient_age_gate",
+                        age_days=age_days,
+                        max_days=transient_max,
+                        importance=imp,
+                    ),
+                )
+                continue
+            if stab == "fluid" and age_days >= fluid_max and age_days > 0:
+                logger.debug(
+                    "memory_age_gate_excluded %s",
+                    safe_log_context(
+                        memory_id=str(self._get_memory_id(memory) or ""),
+                        operation="RETRIEVE",
+                        reason="fluid_age_gate",
+                        age_days=age_days,
+                        max_days=fluid_max,
+                        importance=imp,
+                    ),
+                )
+                continue
+
+            filtered.append((score, memory))
+
+        return filtered
 
     async def _update_memory_access_stats(
         self, user_id: str, memory_id: str, memory: Any
@@ -7682,7 +7758,7 @@ Analyze the following user message(s) and provide **ONLY** the JSON array output
         )
 
         related_memories_n: int = Field(
-            default=10,
+            default=5,
             description="Number of related memories to consider",
         )
 
@@ -7762,6 +7838,26 @@ Your output must be valid JSON only. No additional text.""",
         enable_access_tracking: bool = Field(
             default=True,
             description="Enable tracking of memory access counts and last-accessed timestamps.",
+        )
+
+        enable_age_gate: bool = Field(
+            default=True,
+            description="Enable hard recency gates that exclude old transient/fluid memories from injection regardless of vector similarity.",
+        )
+
+        transient_age_gate_days: int = Field(
+            default=3,
+            description="Transient memories older than this many days are excluded from retrieval (unless importance >= age_gate_importance_exempt).",
+        )
+
+        fluid_age_gate_days: int = Field(
+            default=30,
+            description="Fluid memories older than this many days are excluded from retrieval (unless importance >= age_gate_importance_exempt).",
+        )
+
+        age_gate_importance_exempt: int = Field(
+            default=4,
+            description="Memories with importance >= this value bypass the age gate entirely.",
         )
 
         recency_boost_weight: float = Field(
@@ -8295,7 +8391,7 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter v4.3.1")
+        logger.info("Initializing Adaptive Memory Filter v4.4.0")
         self.valves = self.Valves()
         self._apply_logging_level()
         self.error_manager = ErrorManager()
@@ -8315,7 +8411,7 @@ Your output must be valid JSON only. No additional text.""",
         self._llm_session: Optional[aiohttp.ClientSession] = None
         self._outlet_processed_messages: Dict[str, float] = {}  # msg_hash -> timestamp, for outlet dedup
 
-        logger.info("Adaptive Memory Filter v4.3.1 initialized")
+        logger.info("Adaptive Memory Filter v4.4.0 initialized")
 
     def _apply_logging_level(self) -> None:
         _raw_logger.setLevel(

@@ -369,7 +369,7 @@ python -m unittest discover -s tests
 git diff --check
 ```
 
-Current: **121 tests** (up from 70).
+Current: **122 tests** (up from 70).
 
 ## 📄 License
 

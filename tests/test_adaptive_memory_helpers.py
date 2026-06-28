@@ -34,7 +34,7 @@ def make_valves(**overrides):
         "embedding_similarity_threshold": 0.75,
         "vector_similarity_threshold": 0.15,
         "relevance_threshold": 0.35,
-        "related_memories_n": 10,
+        "related_memories_n": 5,
         "llm_skip_relevance_threshold": 0.93,
         "top_n_memories": 5,
         "use_llm_for_relevance": True,
@@ -206,11 +206,11 @@ class TestHelpers(unittest.TestCase):
             "[Tags: coding] I like Python [Memory Bank: Work] [Confidence: 0.95]"
         )
         self.assertEqual(record.content, "I like Python")
-        self.assertEqual(record.importance, 3)
-        self.assertEqual(record.stability, "fluid")
+        self.assertEqual(record.importance, 2)
+
+        self.assertEqual(record.stability, "transient")
         self.assertIsNone(record.last_accessed)
         self.assertEqual(record.access_count, 0)
-
     def test_parse_stored_memory_importance_clamp(self):
         record = am.parse_stored_memory(
             "[Tags: x] test [Memory Bank: General] [Confidence: 0.5] [Importance: 99]"
@@ -226,9 +226,12 @@ class TestHelpers(unittest.TestCase):
             record = am.parse_stored_memory(
                 f"[Tags: x] test [Memory Bank: General] [Confidence: 0.5] [Stability: {bad}]"
             )
-            expected = "stable" if bad.lower() == "stable" else "fluid"
-            if bad.lower() in ("stable", "fluid"):
-                expected = bad.lower()
+            if bad.lower() in ("stable",):
+                expected = "stable"
+            elif bad.lower() in ("fluid",):
+                expected = "fluid"
+            else:
+                expected = "transient"
             self.assertEqual(record.stability, expected, f"Failed for stability='{bad}'")
 
     def test_format_memory_content_new_fields(self):
@@ -297,10 +300,10 @@ class TestHelpers(unittest.TestCase):
         migrated = am.migrate_memory_to_new_format(old)
         record = am.parse_stored_memory(migrated)
         self.assertEqual(record.content, "I like Python")
-        self.assertEqual(record.importance, 3)
-        self.assertEqual(record.stability, "fluid")
-        self.assertIn("[Importance: 3]", migrated)
-        self.assertIn("[Stability: fluid]", migrated)
+        self.assertEqual(record.importance, 2)
+        self.assertEqual(record.stability, "transient")
+        self.assertIn("[Importance: 2]", migrated)
+        self.assertIn("[Stability: transient]", migrated)
 
     def test_migrate_memory_to_new_format_already_new(self):
         new = (
