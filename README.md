@@ -22,6 +22,16 @@
 
 > 💡 The function uses Open WebUI's embedding engine when available, falling back to the bundled `all-MiniLM-L6-v2` model. Everything else works on defaults.
 
+### ⚠️ Open WebUI v0.10.0+ Required Setting
+
+**You must disable Open WebUI's built-in Memories feature.** This plugin handles all memory management — leaving OWUI's built-in memory enabled causes double-injection that breaks LLM prompt caching and reduces performance.
+
+**How:** Admin Panel → Settings → General → Features → **Memories = OFF**
+
+Or set the environment variable: `ENABLE_MEMORIES=false`
+
+Why: OWUI v0.10.0 introduced a reworked built-in memory system that injects its own `User Context:` block into the system prompt *after* this plugin's inlet runs. The two systems query the same database independently and inject overlapping memory content at different prompt positions, causing DeepSeek/OpenCode prefix caching to hit only ~384 tokens instead of 80%+ of the full conversation history.
+
 ## 🔄 How It Works
 
 ```
@@ -358,6 +368,7 @@ Located under `DATA_DIR/cache`:
 
 - **Required**: Open WebUI, `numpy`, `aiohttp`, `pydantic`, `pytz`
 - **Optional**: `sentence-transformers` (local embeddings), `prometheus-client` (metrics)
+- ⚠️ **Open WebUI v0.10.0+**: Disable built-in Memories (Admin → Settings → General → Features → Memories OFF)
 
 ## 🧪 Tests
 
