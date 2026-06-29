@@ -8405,6 +8405,7 @@ Your output must be valid JSON only. No additional text.""",
         self.seen_users = set()  # Track active users for background tasks
         self.notification_queue = []  # Queue for background task notifications
         self._session_contexts: Dict[str, str] = {}  # session_id -> context summary
+        self._session_memory_cache: Dict[str, List[Any]] = {}  # session_id -> cached relevant memories
         self._tasks_started = False
         self._valve_hash = None  # Track valve changes
         self._llm_session: Optional[aiohttp.ClientSession] = None
@@ -9122,46 +9123,67 @@ Your output must be valid JSON only. No additional text.""",
             self.mem0_sync_manager,
         )
 
-        # 1. Retrieve all memories
-        all_memories = await self._inlet_get_all_memories(pipeline, user_id)
-
-        # 2. Filter relevant memories
-        relevant_memories = []
-        if all_memories:
-            relevant_memories = await pipeline.get_relevant_memories(
-                last_message,
-                user_id,
-                all_memories,
-                query_llm_func=self._query_llm,
-                session_id=session_id,
-            )
+        # 1. Check session memory cache for stable prompt prefix caching
+        cached_memories = None
+        if session_id and session_id in self._session_memory_cache:
+            cached_memories = self._session_memory_cache[session_id]
+            relevant_memories = cached_memories
             logger.info(
                 "memory_retrieval_completed %s",
                 safe_log_context(
                     user_id=user_id,
                     session_id=session_id,
                     operation="RETRIEVE",
-                    total_memories=len(all_memories),
+                    reason="session_cache_hit",
                     retrieved_count=len(relevant_memories),
-                    reason=(
-                        "retrieval_success"
-                        if relevant_memories
-                        else "retrieval_no_relevant_memories"
-                    ),
                 ),
             )
-        else:
-            logger.info(
-                "memory_retrieval_completed %s",
-                safe_log_context(
-                    user_id=user_id,
+
+        if cached_memories is None:
+            # 2. Retrieve all memories
+            all_memories = await self._inlet_get_all_memories(pipeline, user_id)
+
+            # 3. Filter relevant memories
+            relevant_memories = []
+            if all_memories:
+                relevant_memories = await pipeline.get_relevant_memories(
+                    last_message,
+                    user_id,
+                    all_memories,
+                    query_llm_func=self._query_llm,
                     session_id=session_id,
-                    operation="RETRIEVE",
-                    total_memories=0,
-                    retrieved_count=0,
-                    reason="retrieval_no_memories",
-                ),
-            )
+                )
+                logger.info(
+                    "memory_retrieval_completed %s",
+                    safe_log_context(
+                        user_id=user_id,
+                        session_id=session_id,
+                        operation="RETRIEVE",
+                        total_memories=len(all_memories),
+                        retrieved_count=len(relevant_memories),
+                        reason=(
+                            "retrieval_success"
+                            if relevant_memories
+                            else "retrieval_no_relevant_memories"
+                        ),
+                    ),
+                )
+            else:
+                logger.info(
+                    "memory_retrieval_completed %s",
+                    safe_log_context(
+                        user_id=user_id,
+                        session_id=session_id,
+                        operation="RETRIEVE",
+                        total_memories=0,
+                        retrieved_count=0,
+                        reason="retrieval_no_memories",
+                    ),
+                )
+
+            # Cache for this session (unless empty)
+            if session_id and relevant_memories:
+                self._session_memory_cache[session_id] = relevant_memories
 
         # 3. Inject into system prompt
         injected_count = self._inlet_inject_memories(
