@@ -7915,12 +7915,6 @@ Your output must be valid JSON only. No additional text.""",
 
         # Prompt Injection & Formatting
 
-        inject_memories_into_user_message: bool = Field(
-            default=True,
-            description="Inject memories into the last user message instead of the system prompt. "
-            "Preserves a stable prompt prefix for better DeepSeek/OpenCode prompt caching.",
-        )
-
         deterministic_memory_ordering: bool = Field(
             default=True,
             description="Sort retrieved memories by ID before injection. "
@@ -8748,58 +8742,70 @@ Your output must be valid JSON only. No additional text.""",
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> int:
-        """Inject relevant memories into the system prompt or last user message."""
-        injected_count = 0
+        """Inject relevant memories as a system message before the last user message.
 
-        # Cache-friendly branch: inject into the last user message instead of system prompt
-        if getattr(self.valves, "inject_memories_into_user_message", False):
-            if relevant_memories and self.valves.show_memories:
-                context_text = self._format_relevant_memories(relevant_memories)
-                if context_text:
-                    for i in range(len(messages) - 1, -1, -1):
-                        if messages[i].get("role") == "user":
-                            content = messages[i]["content"]
-                            if isinstance(content, list):
-                                for part in content:
-                                    if isinstance(part, dict) and part.get("type") == "text":
-                                        part["text"] = f"{context_text}\n\n{part.get('text', '')}"
-                                        break
-                            else:
-                                messages[i]["content"] = f"{context_text}\n\n{content}"
-                            injected_count = len(relevant_memories)
-                            break
+        Preserves prompt cacheability: the system prompt and user message content
+        stay untouched, so the LLM can reuse cached prefix computation across turns.
+        """
+        if not relevant_memories or not self.valves.show_memories:
             logger.info(
                 "memory_injection_completed %s",
                 safe_log_context(
                     user_id=user_id,
                     session_id=session_id,
                     operation="INJECT",
-                    injected_count=injected_count,
-                    retrieved_count=len(relevant_memories),
-                    target="user_message",
-                    untrusted_context=injected_count > 0,
+                    injected_count=0,
+                    retrieved_count=len(relevant_memories) if relevant_memories else 0,
+                    target="system_before_user",
+                    untrusted_context=False,
                     show_memories=getattr(self.valves, "show_memories", True),
                 ),
             )
-            return injected_count
+            return 0
 
-        # Legacy branch: inject into the system prompt
-        if relevant_memories and self.valves.show_memories:
-            context_text = self._format_relevant_memories(relevant_memories)
+        context_text = self._format_relevant_memories(relevant_memories)
+        if not context_text:
+            logger.info(
+                "memory_injection_completed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    session_id=session_id,
+                    operation="INJECT",
+                    injected_count=0,
+                    retrieved_count=len(relevant_memories),
+                    target="system_before_user",
+                    untrusted_context=False,
+                    show_memories=True,
+                ),
+            )
+            return 0
 
-            if context_text:
-                first_message = messages[0] if messages else None
-                if (
-                    isinstance(first_message, dict)
-                    and first_message.get("role") == "system"
-                ):
-                    existing_content = extract_message_text(
-                        first_message.get("content")
-                    )
-                    first_message["content"] = f"{existing_content}\n\n{context_text}".strip()
-                else:
-                    messages.insert(0, {"role": "system", "content": context_text})
-                injected_count = len(relevant_memories)
+        # Find the last user message and insert a memory-context system message before it
+        user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                user_idx = i
+                break
+
+        if user_idx is None:
+            logger.info(
+                "memory_injection_completed %s",
+                safe_log_context(
+                    user_id=user_id,
+                    session_id=session_id,
+                    operation="INJECT",
+                    injected_count=0,
+                    retrieved_count=len(relevant_memories),
+                    target="system_before_user",
+                    untrusted_context=False,
+                    show_memories=True,
+                    reason="no_user_message",
+                ),
+            )
+            return 0
+
+        messages.insert(user_idx, {"role": "system", "content": context_text})
+        injected_count = len(relevant_memories)
 
         logger.info(
             "memory_injection_completed %s",
@@ -8809,8 +8815,9 @@ Your output must be valid JSON only. No additional text.""",
                 operation="INJECT",
                 injected_count=injected_count,
                 retrieved_count=len(relevant_memories),
+                target="system_before_user",
                 untrusted_context=injected_count > 0,
-                show_memories=getattr(self.valves, "show_memories", True),
+                show_memories=True,
             ),
         )
         return injected_count
