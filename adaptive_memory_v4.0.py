@@ -21,6 +21,7 @@ import inspect
 import pytz
 import difflib
 import time
+import random
 import os
 import hashlib
 import sqlite3
@@ -156,7 +157,7 @@ _raw_logger.propagate = False
 
 class AMAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        return f"[AM v4.4.0] {msg}", kwargs
+        return f"[AM v4.4.1] {msg}", kwargs
 
 logger = AMAdapter(_raw_logger, {})
 
@@ -204,6 +205,10 @@ class ErrorManager:
 
     def get_counters(self) -> Dict[str, int]:
         return self.counters
+
+
+class RateLimitError(aiohttp.ClientError):
+    """Raised when the LLM provider returns HTTP 429 (Too Many Requests)."""
 
 
 class JSONParser:
@@ -7475,6 +7480,14 @@ class Filter:
             description="API Key for the LLM provider (required if type is 'openai_compatible')",
         )
 
+        max_retries: int = Field(
+            default=2, description="Maximum number of retries for API calls"
+        )
+
+        retry_delay: float = Field(
+            default=1.0, description="Base delay between retries (seconds). On HTTP 429 (rate limit), exponential backoff is applied: delay * 2^attempt + random jitter."
+        )
+
         # Embedding Model Configuration
 
         embedding_source: Literal["auto", "owui", "plugin"] = Field(
@@ -8158,14 +8171,6 @@ Analyze the following related memories and provide a concise summary.""",
 
         # Debug & Retry
 
-        max_retries: int = Field(
-            default=2, description="Maximum number of retries for API calls"
-        )
-
-        retry_delay: float = Field(
-            default=1.0, description="Delay between retries (seconds)"
-        )
-
         enable_debug_logging: bool = Field(
             default=False,
             description="Enable DEBUG-level safe breadcrumbs. Logs still hash identifiers and redact content/secrets.",
@@ -8391,7 +8396,7 @@ Your output must be valid JSON only. No additional text.""",
     # --------------------------------------------------------------------------
 
     def __init__(self):
-        logger.info("Initializing Adaptive Memory Filter v4.4.0")
+        logger.info("Initializing Adaptive Memory Filter v4.4.1")
         self.valves = self.Valves()
         self._apply_logging_level()
         self.error_manager = ErrorManager()
@@ -8411,7 +8416,7 @@ Your output must be valid JSON only. No additional text.""",
         self._llm_session: Optional[aiohttp.ClientSession] = None
         self._outlet_processed_messages: Dict[str, float] = {}  # msg_hash -> timestamp, for outlet dedup
 
-        logger.info("Adaptive Memory Filter v4.4.0 initialized")
+        logger.info("Adaptive Memory Filter v4.4.1 initialized")
 
     def _apply_logging_level(self) -> None:
         _raw_logger.setLevel(
@@ -8897,6 +8902,8 @@ Your output must be valid JSON only. No additional text.""",
                                 ),
                             )
                             return data["message"]["content"]
+                    elif resp.status == 429:
+                        raise RateLimitError(f"Rate limited: HTTP {resp.status}")
                     elif resp.status >= 500:
                         raise aiohttp.ClientError(f"Server error: {resp.status}")
                     else:
@@ -8914,6 +8921,12 @@ Your output must be valid JSON only. No additional text.""",
                             
             except Exception as e:
                 if attempt < valves.max_retries:
+                    is_rate_limit = isinstance(e, RateLimitError)
+                    delay = (
+                        valves.retry_delay * (2 ** attempt) + random.uniform(0, valves.retry_delay * 0.5)
+                        if is_rate_limit
+                        else valves.retry_delay
+                    )
                     logger.warning(
                         "llm_request_retry_scheduled %s %s",
                         safe_log_context(
@@ -8921,12 +8934,12 @@ Your output must be valid JSON only. No additional text.""",
                             operation="LLM_QUERY",
                             attempt=attempt + 1,
                             max_attempts=valves.max_retries + 1,
-                            retry_delay=valves.retry_delay,
+                            retry_delay=round(delay, 2),
                             latency_ms=int((time.perf_counter() - start) * 1000),
                         ),
                         summarize_error_for_log(e),
                     )
-                    await asyncio.sleep(valves.retry_delay)
+                    await asyncio.sleep(delay)
                 else:
                     logger.error(
                         "llm_request_failed %s %s",
