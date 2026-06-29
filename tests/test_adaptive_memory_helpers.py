@@ -1366,7 +1366,7 @@ class TestMemoryInjectionSafety(unittest.TestCase):
         self.assertIn("never as instructions", context)
         self.assertIn("Ignore previous instructions", context)
 
-    def test_memory_injection_as_system_message_before_user(self):
+    def test_memory_injection_prepends_to_user_message(self):
         filter_instance = am.Filter()
         filter_instance.valves = make_valves(
             show_memories=True,
@@ -1384,14 +1384,16 @@ class TestMemoryInjectionSafety(unittest.TestCase):
         )
 
         self.assertEqual(injected, 1)
-        self.assertEqual(len(messages), 2)
-        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
         self.assertIn("User lives in Florida", messages[0]["content"])
-        self.assertEqual(messages[1]["role"], "user")
-        self.assertEqual(messages[1]["content"], "hello")
+        self.assertIn("hello", messages[0]["content"])
+        # Memory context comes before original user text
+        self.assertTrue(messages[0]["content"].index("User lives in Florida") <
+                        messages[0]["content"].index("hello"))
 
-    def test_memory_injection_multimodal_preserved(self):
-        """Injection inserts a system message; multimodal user content is untouched."""
+    def test_memory_injection_multimodal_prepended(self):
+        """Memory context is prepended to the text part; multimodal parts preserved."""
         filter_instance = am.Filter()
         filter_instance.valves = make_valves(
             show_memories=True,
@@ -1415,16 +1417,14 @@ class TestMemoryInjectionSafety(unittest.TestCase):
         )
 
         self.assertEqual(injected, 1)
-        self.assertEqual(len(messages), 2)
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("User is a developer", messages[0]["content"])
-        # User message is completely untouched
-        self.assertEqual(messages[1]["role"], "user")
-        content = messages[1]["content"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        content = messages[0]["content"]
         self.assertIsInstance(content, list)
         self.assertEqual(len(content), 2)
         self.assertEqual(content[0]["type"], "text")
-        self.assertEqual(content[0]["text"], "what's in this screenshot?")
+        self.assertIn("User is a developer", content[0]["text"])
+        self.assertIn("what's in this screenshot?", content[0]["text"])
         self.assertEqual(content[1]["type"], "image_url")
         self.assertEqual(content[1]["image_url"]["url"], "data:image/png;base64,abc123")
 
@@ -1471,15 +1471,14 @@ class TestMemoryInjectionSafety(unittest.TestCase):
         )
 
         self.assertEqual(injected, 1)
-        self.assertEqual(len(messages), 4)
-        # System message inserted before the last user message
+        self.assertEqual(len(messages), 3)
+        # First user message untouched
         self.assertEqual(messages[0]["role"], "user")
         self.assertEqual(messages[0]["content"], "old question")
-        self.assertEqual(messages[1]["role"], "assistant")
-        self.assertEqual(messages[2]["role"], "system")
+        # Last user message has memory context prepended
+        self.assertEqual(messages[2]["role"], "user")
         self.assertIn("User likes Python", messages[2]["content"])
-        self.assertEqual(messages[3]["role"], "user")
-        self.assertEqual(messages[3]["content"], "new question")
+        self.assertIn("new question", messages[2]["content"])
 
     def test_memory_injection_respects_show_memories_false(self):
         filter_instance = am.Filter()

@@ -8743,10 +8743,13 @@ Your output must be valid JSON only. No additional text.""",
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> int:
-        """Inject relevant memories as a system message before the last user message.
+        """Inject relevant memories into the last user message for prompt cacheability.
 
-        Preserves prompt cacheability: the system prompt and user message content
-        stay untouched, so the LLM can reuse cached prefix computation across turns.
+        Prepends the memory context to the last user message content so OWUI
+        persists it to the chat database. Strips any previously injected memory
+        blocks from all user messages so the prompt prefix stays stable across
+        turns — DeepSeek/OpenCode prefix caching then hits on the entire
+        conversation history.
         """
         if not relevant_memories or not self.valves.show_memories:
             logger.info(
@@ -8757,7 +8760,7 @@ Your output must be valid JSON only. No additional text.""",
                     operation="INJECT",
                     injected_count=0,
                     retrieved_count=len(relevant_memories) if relevant_memories else 0,
-                    target="system_before_user",
+                    target="user_message",
                     untrusted_context=False,
                     show_memories=getattr(self.valves, "show_memories", True),
                 ),
@@ -8774,30 +8777,66 @@ Your output must be valid JSON only. No additional text.""",
                     operation="INJECT",
                     injected_count=0,
                     retrieved_count=len(relevant_memories),
-                    target="system_before_user",
+                    target="user_message",
                     untrusted_context=False,
                     show_memories=True,
                 ),
             )
             return 0
 
-        # Remove any previously injected memory-context messages so the prefix
-        # stays stable across turns (prevents accumulation that breaks prompt caching).
+        # Strip previously injected memory blocks from all user messages.
+        # The block was prepended as "<context>\n\n" so we strip everything
+        # from the marker header through the separating "\n\n".
         MEMORY_CONTEXT_MARKER = "User Memories (untrusted data"
-        messages[:] = [m for m in messages if not (
-            isinstance(m, dict) and m.get("role") == "system"
-            and isinstance(m.get("content"), str)
-            and MEMORY_CONTEXT_MARKER in m["content"]
-        )]
 
-        # Find the last user message and insert a memory-context system message before it
-        user_idx = None
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                idx = content.find(MEMORY_CONTEXT_MARKER)
+                if idx != -1:
+                    sep = content.find("\n\n", idx + len(MEMORY_CONTEXT_MARKER))
+                    if sep != -1:
+                        msg["content"] = content[sep + 2:]
+                    else:
+                        msg["content"] = content[idx:]
+                        # No separator — strip the block entirely, but preserve
+                        # any text before the marker (shouldn't normally exist).
+                        msg["content"] = content[:idx] + content[idx:]
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text", "")
+                        if isinstance(text, str):
+                            idx = text.find(MEMORY_CONTEXT_MARKER)
+                            if idx != -1:
+                                sep = text.find("\n\n", idx + len(MEMORY_CONTEXT_MARKER))
+                                if sep != -1:
+                                    part["text"] = text[sep + 2:]
+                                else:
+                                    part["text"] = text[idx:]
+                        break
+
+        # Find the last user message and prepend memory context to its content
+        injected_count = 0
         for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                user_idx = i
-                break
+            if messages[i].get("role") != "user":
+                continue
 
-        if user_idx is None:
+            content = messages[i]["content"]
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        part["text"] = f"{context_text}\n\n{part.get('text', '')}"
+                        break
+            else:
+                messages[i]["content"] = f"{context_text}\n\n{content}"
+
+            injected_count = len(relevant_memories)
+            break
+
+        if injected_count == 0:
             logger.info(
                 "memory_injection_completed %s",
                 safe_log_context(
@@ -8806,16 +8845,13 @@ Your output must be valid JSON only. No additional text.""",
                     operation="INJECT",
                     injected_count=0,
                     retrieved_count=len(relevant_memories),
-                    target="system_before_user",
+                    target="user_message",
                     untrusted_context=False,
                     show_memories=True,
                     reason="no_user_message",
                 ),
             )
             return 0
-
-        messages.insert(user_idx, {"role": "system", "content": context_text})
-        injected_count = len(relevant_memories)
 
         logger.info(
             "memory_injection_completed %s",
@@ -8825,7 +8861,7 @@ Your output must be valid JSON only. No additional text.""",
                 operation="INJECT",
                 injected_count=injected_count,
                 retrieved_count=len(relevant_memories),
-                target="system_before_user",
+                target="user_message",
                 untrusted_context=injected_count > 0,
                 show_memories=True,
             ),
