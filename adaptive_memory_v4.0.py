@@ -8781,6 +8781,15 @@ Your output must be valid JSON only. No additional text.""",
             )
             return 0
 
+        # Remove any previously injected memory-context messages so the prefix
+        # stays stable across turns (prevents accumulation that breaks prompt caching).
+        MEMORY_CONTEXT_MARKER = "User Memories (untrusted data"
+        messages[:] = [m for m in messages if not (
+            isinstance(m, dict) and m.get("role") == "system"
+            and isinstance(m.get("content"), str)
+            and MEMORY_CONTEXT_MARKER in m["content"]
+        )]
+
         # Find the last user message and insert a memory-context system message before it
         user_idx = None
         for i in range(len(messages) - 1, -1, -1):
