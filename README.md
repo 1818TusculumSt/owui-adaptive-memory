@@ -1,6 +1,6 @@
 # 🧠 Adaptive Memory for Open WebUI
 
-> Persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, multi-signal relevance scoring, contradiction detection, and optional Mem0 mirroring.
+> Persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, multi-signal relevance scoring, contradiction detection, optional Mem0 mirroring, and per-turn dynamic injection with temporal awareness.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -37,20 +37,23 @@ Why: OWUI v0.10.0 introduced a reworked built-in memory system that injects its 
 ```
 User message → inlet()
   ├─ Load existing memories
-  ├─ Reconcile Mem0 (if enabled)
   ├─ Select relevant memories via vector search + multi-signal boost (v5)
   │   ├─ Recency/importance/access weight boost
+  │   ├─ Lore tag boost (1.15× for identity/relationship)
+  │   ├─ Lore diversity minimum (≥1 identity/relationship in top-N if available)
   │   └─ Optional one-hop neighbor retrieval (semantically adjacent memories; off by default)
+  ├─ Inject timestamps (absolute dates) into memory context
   ├─ Track access stats (throttled DB writes)
-  ├─ Inject context into last user message (stable prefix for prompt caching)
+  ├─ Inject context into last user message (stripping previous injection for cache-friendly history)
   └─ Emit rich status (high-importance count)
        ↓
     LLM responds
        ↓
   outlet()
   ├─ Ask configured LLM to propose memory operations (NEW / UPDATE / DELETE)
-  │   └─ LLM now provides importance (1-5) and stability (stable/fluid/transient)
+  │   └─ LLM provides importance (1-5) and stability (stable/fluid/transient)
   ├─ Run extraction quality gate (reject general knowledge, downgrade transient; 30+ transient patterns)
+  ├─ Run entity attribution correction ("my wife" → "User's wife")
   ├─ Gate UPDATE/DELETE against user's current message intent
   ├─ Check contradiction against near-match memories (auto-promote NEW → UPDATE)
   ├─ Deduplicate, filter secrets, apply quality checks
@@ -67,6 +70,20 @@ Slash commands (inlet):
   ├─ /forget kw   → delete a specific memory by keyword
   └─ /remember ... → save a new memory directly
 ```
+
+## 🆕 v4.5.0 — Dynamic Injection, Timestamps, Entity Fixes & Lore Boosting (Jun 2026)
+
+### Per-Turn Dynamic Retrieval
+The session memory cache has been removed. Every user message triggers a fresh retrieval against **all memories**, scoring each against the current query. This ensures the injected context adapts to topic pivots — a conversation about coding pulls in technical memories; a shift to family pulls in relationship/identity memories. Prompt caching is preserved because the injection stripping mechanism (`User Memories (` → `\n\n`) still cleans historical messages before each turn, keeping the conversation history byte-identical across turns.
+
+### Timestamp Injection
+Every injected memory now carries its `created_at` date as an absolute timestamp (`Jun 30, 2026`). Absolute dates are deterministic — the same memory always produces the same formatted string — so prompt caching is unaffected. The header was also updated from `"untrusted data"` to `"historical data, may be outdated"` to signal temporal context.
+
+### Entity Attribution Correction
+A new post-extraction quality gate catches misattributed facts. When the LLM outputs a memory starting with `"my wife/husband/kid/etc [verb]"`, it auto-corrects to `"User's [relationship] [verb]"`. The extraction prompt was also updated with explicit entity disambiguation rules and negative examples.
+
+### Lore Scoring & Diversity
+Memories tagged `identity` or `relationship` receive a 1.15× multiplier on their vector score in the multi-signal boost (v5). Additionally, the retrieval step now ensures at least one identity/relationship memory (importance ≥ 3) is included in the top-N if any exists in the candidate pool, preventing technical memories from completely crowding out personal/lore context.
 
 ## 📊 Importance & Stability Scoring (v4.3.0)
 
@@ -173,9 +190,9 @@ The same approach applies to stability: only upgrades if the LLM is 2+ levels be
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `related_memories_n` | `5` | Max relevant memories retrieved |
-| `relevance_threshold` | `0.60` | Minimum relevance score (0-1) for injection |
-| `vector_similarity_threshold` | `0.20` | Minimum cosine similarity for initial vector candidate filter |
-| `use_llm_for_relevance` | `True` | Use an additional LLM call for relevance scoring |
+| `relevance_threshold` | `0.35` | Minimum relevance score (0-1) for injection |
+| `vector_similarity_threshold` | `0.15` | Minimum cosine similarity for initial vector candidate filter |
+| `use_llm_for_relevance` | `False` | Use an additional LLM call for relevance scoring |
 | `top_n_memories` | `5` | Max candidates sent to the LLM relevance scorer |
 | `llm_skip_relevance_threshold` | `0.93` | If all vector scores exceed this, skip the LLM relevance call |
 | `memory_relevance_prompt` | *(prompt)* | System prompt for the relevance-scoring LLM — now includes importance/recency/stability/access metadata |
@@ -344,7 +361,7 @@ The LLM can propose `NEW`, `UPDATE`, and `DELETE` operations. Destructive operat
 |-------|--------|
 | 🤫 **Secret filtering** | Blocks API keys, bearer tokens, passwords, private keys, DB URLs with credentials, SSNs, and Luhn-validated credit card numbers before storage. Heuristic, not full DLP. |
 | 🔏 **Safe logging** | All logged identifiers are hashed. Raw user messages, memory contents, prompts, completions, and API keys are never logged. |
-| 🧱 **Memory injection** | Recalled memories are injected as untrusted factual context, not instructions, reducing prompt-injection blast radius. |
+| 🧱 **Memory injection** | Recalled memories are injected as historical factual context (with absolute dates), not instructions, reducing prompt-injection blast radius. |
 | ✅ **Extraction quality gate** | Rule-based filter rejects general knowledge statements and downgrades transient content before saving. Detects 30+ transient patterns (temporal, task, consumption). |
 
 ## 📁 Sidecar Files
@@ -380,7 +397,7 @@ python -m unittest discover -s tests
 git diff --check
 ```
 
-Current: **122 tests** (up from 70).
+Current: **120 tests** (up from 70).
 
 ## 📄 License
 
