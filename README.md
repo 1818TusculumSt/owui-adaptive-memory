@@ -1,5 +1,16 @@
 # 🧠 Adaptive Memory for Open WebUI
 
+> [!WARNING]
+> ## ⚰️ Archived — No Longer Maintained
+>
+> This project has been **retired**. Open WebUI's native memory implementation has matured to the point where it covers this plugin's functionality, so active development has stopped.
+>
+> The repository is left up for **reference and forking**, but **new features, bug fixes, and issues will not be addressed**.
+>
+> **Recommended alternative:** Open WebUI's built-in **Memories** feature (Admin → Settings → General → Features → Memories).
+>
+> Last release: [`v4.5.0`](https://github.com/1818TusculumSt/owui-adaptive-memory/releases/tag/v4.5.0)
+
 > Persistent, user-specific memory with semantic recall, deduplication, pruning, summarization, multi-signal relevance scoring, contradiction detection, optional Mem0 mirroring, and per-turn dynamic injection with temporal awareness.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
